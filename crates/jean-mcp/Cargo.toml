@@ -1,0 +1,23 @@
+[package]
+name = "jean-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP client and server roles for JEAN, over local stdio only."
+
+[dependencies]
+# JEAN spawns and supervises the MCP server; this crate only speaks over the pipes it is handed.
+jean-process = { workspace = true }
+rmcp = { workspace = true }
+# A blocked pipe read must not idle the single runtime worker, or the request timeout cannot fire.
+blocking = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# `futures` -> `tokio` trait bridge for the pipe halves `blocking` wraps.
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow.workspace = true
