@@ -1,0 +1,15 @@
+[package]
+name = "jean-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic permission decisions, operator approvals and the audit trail for J.E.A.N."
+
+[dependencies]
+jean-protocol.workspace = true
+jean-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
