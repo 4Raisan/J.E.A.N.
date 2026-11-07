@@ -1,0 +1,82 @@
+# cargo-deny policy — enforces PLANNING/07-DECISIONS.md D-022 mechanically.
+#
+# The adopted Phase-0 stack contains no copyleft. This file is the gate that
+# keeps it that way; it is not a substitute for reviewing model-weight licenses,
+# which cargo-deny cannot see (PLANNING/06-RISKS.md R-08).
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "0BSD",
+    "ISC",
+    "Unlicense",
+    "Unicode-3.0",
+    "Zlib",
+    # Mozilla root-cert data bundles (webpki-roots / webpki-root-certs via
+    # ureq/native-tls). Permissive data license, not code copyleft.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+
+# Copyleft and source-available licenses are rejected because they are
+# not in `allow` above. bans.deny keeps the named crates out even if a
+# future version changes license.
+
+# Build-only codegen for headless_chrome (CDP bindings). GPL-3.0-or-later
+# but runs at build time only; generated output is not GPL. Scoped to
+# this exact crate+version so the exception cannot drift.
+[[licenses.exceptions]]
+allow = ["GPL-3.0-or-later"]
+name = "auto_generate_cdp"
+version = "=0.4.6"
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# `warn`, not `deny`: `win32job` 2.0.3 pins `windows` 0.61 while the workspace
+# uses 0.62.2, so the tree legitimately contains two copies of `windows`,
+# `windows-core` and `thiserror` until win32job updates. It compiles because
+# win32job's API is `isize`-opaque — see the boundary comment in
+# crates/jean-process/src/win32.rs (`impl Job`).
+multiple-versions = "warn"
+wildcards = "deny"
+
+deny = [
+    { crate = "winapi", wrappers = ["ntapi"], reason = "frozen since 2020; windows-rs supersedes it (PLANNING/03 §7). Sanctioned only via ntapi<=0.4.3 (sysinfo 0.40.1 edge); direct workspace use denied." },
+    { crate = "tauri", reason = "WebView2 process tree blows the 50 MB idle budget (D-009)" },
+    { crate = "conpty", reason = "unmaintained since 2024-09 (D-016)" },
+    { crate = "portable-pty", reason = "not our pty layer: its DynChild hides the process handle AssignProcessToJobObject needs, so supervision would fork (D-024)" },
+    { crate = "device_query", reason = "upstream repo archived 2026-03-31" },
+]
+
+# `tokio` is deliberately NOT listed above. Phase 0 does not depend on it —
+# nothing in the workspace pulls it, so a ban would guard an absence — but
+# `rmcp` requires it and D-007 accepts MCP support, so tokio arrives in
+# Phase 2+. A permanent ban would make `cargo deny check` fail on an accepted
+# future dependency, which is a policy error, not a safety property.
+# Phase-0 narrowness is enforced by the workspace `[workspace.dependencies]`
+# list, not here. See PLANNING/03-DEPENDENCIES.md §1 (DV-02).
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

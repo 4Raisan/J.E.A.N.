@@ -1,0 +1,218 @@
+# J.E.A.N. — example tool registry
+#
+# Copy this file to `<data_dir>\tools.toml` (by default
+# `%LOCALAPPDATA%\JEAN\tools.toml`) and edit it. Until you do, `jean` uses this
+# file directly, so a fresh checkout works with no setup step.
+#
+# Every tool here is harmless: it reads something and prints it, or it sleeps. None
+# of them writes outside J.E.A.N.'s own artifact directory, and none of them needs
+# elevation.
+#
+# ## Rules the loader enforces
+#
+# * `id`, `kind`, `command` and `verify` are mandatory. `verify` has no default on
+#   purpose: a tool that declares no verification is a tool that cannot prove it
+#   worked, and that decision should be written down rather than omitted.
+# * `command` is an executable name or an absolute path. A shell metacharacter in
+#   it (`| & > < ;`) is rejected, because J.E.A.N. launches executables with an
+#   argument vector and never builds a shell command string.
+# * `args` and `extra_args` are passed through verbatim as the child's argv. They
+#   may contain `|` and friends, because those reach the program as text, not as
+#   shell syntax. The PowerShell scripts below rely on that.
+# * Every `env` key must also appear in `process.env_allowlist`. A registry entry
+#   cannot widen the environment.
+# * `timeout_secs` must be nonzero and at most 36000.
+# * `working_dir`, if set, must exist. Empty means "inherit the caller's".
+# * Duplicate ids are rejected; an invalid entry fails the whole file rather than
+#   loading a registry you cannot trust.
+#
+# ## Argument order at run time
+#
+# `args`, then `extra_args`, then whatever you type after the tool id. A caller
+# argument therefore cannot displace one from the registry, and a registry argument
+# cannot be shadowed by the caller.
+
+config_version = 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only inspections
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "powershell.echo"
+kind = "shell"
+display_name = "PowerShell echo"
+capabilities = ["shell", "diagnostics"]
+command = "powershell.exe"
+args = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  'Write-Output "JEAN_ECHO_OK"; Write-Output ("arguments: " + ($args -join ", "))',
+]
+tier = "read_only"
+timeout_secs = 60
+# The needle is produced by the script itself, so this verifies that PowerShell
+# started, ran the declared script, and its stdout reached J.E.A.N.
+verify = { method = "output_contains", expected = 0, needle = "JEAN_ECHO_OK" }
+
+[[tool]]
+id = "windows.version"
+kind = "cli"
+display_name = "Windows version"
+capabilities = ["system", "diagnostics"]
+command = "cmd.exe"
+# `/c ver` is a fixed, explicit builtin invocation. Nothing the caller types is
+# substituted into it; extra arguments are appended as separate argv entries.
+args = ["/c", "ver"]
+tier = "read_only"
+timeout_secs = 30
+verify = { method = "output_contains", expected = 0, needle = "Windows" }
+
+[[tool]]
+id = "powershell.processes"
+kind = "shell"
+display_name = "Largest processes"
+capabilities = ["system", "processes"]
+command = "powershell.exe"
+args = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  'Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 20 Id, ProcessName, WorkingSet64 | Format-Table -AutoSize | Out-String -Width 200',
+]
+tier = "read_only"
+timeout_secs = 60
+verify = { method = "output_contains", expected = 0, needle = "ProcessName" }
+
+[[tool]]
+id = "powershell.disks"
+kind = "shell"
+display_name = "Filesystem drives"
+capabilities = ["system", "storage"]
+command = "powershell.exe"
+args = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  'Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free, Root | Format-Table -AutoSize | Out-String -Width 200',
+]
+tier = "read_only"
+timeout_secs = 60
+verify = { method = "output_contains", expected = 0, needle = "Root" }
+
+[[tool]]
+id = "powershell.environment"
+kind = "shell"
+display_name = "Child environment"
+capabilities = ["diagnostics", "environment"]
+command = "powershell.exe"
+args = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  'Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize Name, Value | Out-String -Width 4096',
+]
+tier = "read_only"
+timeout_secs = 30
+# WARNING: this tool prints the child's environment into the captured artifact.
+# The environment is allowlisted, so it should contain nothing sensitive, but
+# captured stdout is NOT redacted — redaction is applied to arguments and
+# environment values on the way in, not to whatever a child chooses to print on
+# the way out. That boundary is documented in crates/jean-protocol/src/redact.rs.
+verify = { method = "output_contains", expected = 0, needle = "PATH" }
+
+[[tool]]
+id = "git.status"
+kind = "cli"
+display_name = "Git status"
+capabilities = ["vcs", "read"]
+command = "git.exe"
+args = ["status", "--short", "--branch"]
+tier = "read_only"
+timeout_secs = 60
+# Needs Git installed. If it is not, `jean run git.status` reports that the
+# executable could not be resolved and names the tool — it does not silently do
+# nothing, and it does not create a task row.
+verify = { method = "exit_code", expected = 0 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixtures that demonstrate cancellation, timeout and tree containment
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "examples.sleep"
+kind = "shell"
+display_name = "Sleep (timeout demo)"
+capabilities = ["fixture", "timeout"]
+command = "powershell.exe"
+args = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  'Write-Output "sleeping"; Start-Sleep -Seconds 300; Write-Output "woke up"',
+]
+tier = "normal"
+# Five seconds, against a script that sleeps for three hundred. Running this tool
+# therefore always ends in a timeout, which is the point: it is the cheapest way to
+# see `TerminateJobObject` fire and the task recorded as failed with a reason.
+timeout_secs = 5
+verify = { method = "output_contains", expected = 0, needle = "woke up" }
+
+[[tool]]
+id = "examples.process-tree"
+kind = "shell"
+display_name = "Spawn three children (tree-cancel demo)"
+capabilities = ["fixture", "processes"]
+command = "powershell.exe"
+args = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  'Write-Output "spawning"; 1..3 | ForEach-Object { $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c","ping -n 60 127.0.0.1" -WindowStyle Hidden -PassThru; Write-Output ("child pid " + $p.Id) }; Write-Output "CHILDREN_SPAWNED"; Start-Sleep -Seconds 300',
+]
+tier = "normal"
+timeout_secs = 300
+# The grandchildren are `ping` against the loopback address, which cannot reach
+# another machine and cannot write anything. Their pids are printed so a test or a
+# human can confirm they are gone after a cancel.
+#
+# Cancelling this task must terminate all four processes: the PowerShell child and
+# the three `cmd.exe`/`ping` grandchildren. On Windows 8 and later a process
+# created by a member of a job is placed in the same job automatically, and the job
+# does not permit breakaway, so `TerminateJobObject` reaches all of them.
+verify = { method = "output_contains", expected = 0, needle = "CHILDREN_SPAWNED" }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A tool that needs a console, so the ConPTY path is reachable out of the box
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "windows.version.interactive"
+kind = "shell"
+display_name = "Windows version (console)"
+capabilities = ["system", "console"]
+command = "cmd.exe"
+# `interactive = true` routes this through a pseudo console, so the child gets a real
+# screen: stdout and stderr arrive as one merged stream, captured as `console.log`, and
+# keystrokes are forwarded only when `jean` itself is sitting on a terminal.
+interactive = true
+args = ["/c", "ver"]
+tier = "read_only"
+timeout_secs = 30
+verify = { method = "output_contains", expected = 0, needle = "Windows" }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A disabled entry, so the flag is exercised
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[tool]]
+id = "examples.disabled"
+kind = "cli"
+display_name = "Disabled example"
+capabilities = ["fixture"]
+command = "cmd.exe"
+args = ["/c", "echo this tool is disabled"]
+tier = "read_only"
+enabled = false
+verify = { method = "exit_code", expected = 0 }

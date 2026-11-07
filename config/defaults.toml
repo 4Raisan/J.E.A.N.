@@ -1,0 +1,589 @@
+# J.E.A.N. — default configuration
+#
+# Every key below is the compiled default, written out so it can be read, copied
+# and edited. Nothing here has to be present: `jean` merges this file over the
+# compiled defaults, so a partial file is fine, and a missing file is fine too.
+#
+# Rules enforced by the loader (`jean_protocol::config`):
+#
+#   * `config_version` must equal 1. A different value is a hard error, not a
+#     best-effort interpretation — guessing what a future version meant is how
+#     settings silently stop applying.
+#   * A key with the wrong type is a hard error.
+#   * An unknown key is a warning and is then ignored. It is *not* an error, so
+#     adding a setting ahead of the code that reads it does not break startup.
+#   * A wrong value for a security-relevant key is a hard error. See the notes
+#     marked REFUSED below.
+#
+# Layer order, lowest precedence first:
+#   1. the compiled defaults
+#   2. this file, found by walking up from the executable to `config/`
+#   3. `<data_dir>\jean.toml`
+#   4. `.\jean.toml`
+#
+# Two environment overrides are honoured, and only these two:
+#   JEAN_LOG_LEVEL   a tracing filter, e.g. `info` or `jean_process=debug,info`
+#   JEAN_DATA_DIR    relocates all state
+#
+# An environment variable that could rewrite arbitrary policy would defeat the
+# point of having a file, so no others exist.
+
+config_version = 1
+
+[core]
+name = "J.E.A.N."
+# A tracing filter directive, not just a level.
+log_level = "info"
+# Empty means `<data_dir>\logs`.
+log_dir = ""
+# Rotation granularity. Only "daily" is implemented in Phase 0; the key exists so
+# the setting is not added later as a breaking change.
+log_rotation = "daily"
+# Rotated logs older than this are deleted on startup. 0 disables the age rule.
+log_retention_days = 14
+# At most this many log files are kept, newest first. 0 disables the count rule.
+log_max_files = 30
+# Empty means `%LOCALAPPDATA%\JEAN`. Overridable with JEAN_DATA_DIR.
+data_dir = ""
+
+[store]
+# Empty means `<data_dir>\jean.db`.
+path = ""
+# How long a writer waits for a lock before giving up. A second `jean tasks`
+# reading while a run is writing should never see "database is locked".
+busy_timeout_ms = 5000
+# WAL is what lets a reader and a writer coexist. A filesystem that refuses WAL
+# produces a warning, not a failure: a J.E.A.N. that will not start is worse than
+# one that runs with a slower journal.
+journal_mode = "wal"
+# NORMAL under WAL survives a process crash, which is the failure mode Phase 0
+# cares about. FULL would also survive power loss, at a measurable cost.
+synchronous = "NORMAL"
+migrations_on_start = true
+# Events older than this are pruned. Task rows and tool runs are never pruned.
+retain_events_days = 90
+
+[ipc]
+# REFUSED: anything other than "named_pipe". A local HTTP listener is out of
+# scope for Phase 0 and would be reachable by every process on the machine.
+transport = "named_pipe"
+# Empty means `\\.\pipe\jean.task`. Each task listens on `<prefix>.<task_id>`.
+#
+# Access is controlled by the pipe's DACL, not by the name, which is guessable.
+# The descriptor is `D:P(A;;FA;;;<current-user SID>)`: primary-protected, one ACE,
+# full access for the user J.E.A.N. is running as. The SID is resolved at runtime
+# and substituted — `CO` (Creator Owner) was tried and does not work here, because
+# the trustee of a pipe ACE is evaluated against the *client's* token on some
+# paths, which silently excludes `jean cancel`. The first instance is created with
+# FILE_FLAG_FIRST_PIPE_INSTANCE so nobody else can claim the name first and swallow
+# a cancel request.
+pipe_prefix = ""
+# Not enforced in Phase 0: J.E.A.N. runs at the user's integrity level and does
+# not inspect a peer's token. Recorded here because the setting is documented in
+# PLANNING/04-SETTINGS.md and silently dropping it would be worse than stating it.
+min_client_integrity = "medium"
+auth = "peer_owner"
+# REFUSED: true. There is no HTTP transport.
+http_enabled = false
+
+[orchestrator]
+# Not enforced in Phase 0, which runs one task per invocation. Phase 1 owns the
+# queue.
+max_concurrent_tasks = 4
+# Applied to a tool that does not set its own `timeout_secs`.
+default_timeout_secs = 300
+# Not implemented in Phase 0. Retries are unsafe without per-tool idempotence
+# metadata, which does not exist yet.
+default_retry_max = 2
+# A task is not "succeeded" unless its declared verification passed. With this on,
+# a tool that declares `verify = { method = "none" }` ends in `needs_attention`
+# rather than claiming success. See `jean_core::runner::decide_state`.
+verification_required = true
+bounded_task_queue = 64
+# Read and deliberately NOT honoured in Phase 0. Replaying an interrupted command
+# would repeat side effects that may already have happened. Interrupted tasks are
+# marked `needs_attention` instead. Recorded in IMPLEMENTATION_STATUS.md.
+resume_on_restart = true
+reconcile_on_start = true
+
+[process]
+# REFUSED: false. Without Job Objects a cancelled task leaves its descendants
+# running, which breaks the one guarantee the supervisor exists to provide.
+use_job_objects = true
+# REFUSED: false. Without kill-on-close, closing the job handle would not take the
+# tree with it.
+kill_on_job_close = true
+# Not applied in Phase 0. The job is created with kill-on-close only; an active
+# process limit would need testing against real tools before it is safe to impose.
+job_active_proc_limit = 64
+# REFUSED: true. Blanket inheritance hands every tool every ambient credential.
+inherit_environment = false
+# The complete set of variables a child may see. Anything not listed is dropped,
+# including anything a tool tries to set in its own `env` table.
+#
+# `SystemRoot` is the one that fails silently: without it, PowerShell and most
+# Win32 programs cannot locate system DLLs. `PATHEXT` and `COMSPEC` are needed to
+# resolve and run command interpreters. `TEMP`/`TMP` are needed by anything that
+# writes a temporary file. `PSModulePath` is needed for PowerShell to find its
+# modules.
+env_allowlist = [
+  "PATH",
+  "PATHEXT",
+  "SystemRoot",
+  "windir",
+  "SystemDrive",
+  "COMSPEC",
+  "TEMP",
+  "TMP",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "COMMONPROGRAMFILES",
+  "USERNAME",
+  "COMPUTERNAME",
+  "USERDOMAIN",
+  "OS",
+  "PROCESSOR_ARCHITECTURE",
+  "NUMBER_OF_PROCESSORS",
+  "PSModulePath",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+]
+# Applied to arguments and environment values before they are logged or persisted.
+#
+# ORDER MATTERS. Patterns run in sequence, and the bearer pattern must come first:
+# otherwise `Authorization: Bearer <token>` has `Bearer` treated as the value of
+# the `Authorization` key and the token itself is left in the log.
+#
+# A pattern whose LAST capture group is the secret has only that group replaced, so
+# the key name survives and the log stays diagnosable. A pattern with no capture
+# group has its whole match replaced.
+#
+# BOUNDARY: this is a pattern filter, not a secret detector. It cannot catch a
+# secret that matches no pattern, one passed positionally with no key next to it,
+# one read at runtime by the child, or one the child prints to stdout. Documented
+# in `crates/jean-protocol/src/redact.rs`.
+redact_patterns = [
+  '(?i)(\bbearer\s+)([A-Za-z0-9._\-]+)',
+  '(?i)(token|key|secret|password|passwd|pwd|authorization|cookie|api[-_]?key)(\s*[=:]\s*)(\S+)',
+  # The same keys as command-line flags: `-Password hunter2`, `--api-key sk_…`,
+  # `/secret abc`. The pattern above needs an `=` or a `:` and cannot see these.
+  '(?i)((?:^|\s)[-/][A-Za-z0-9_-]*(?:password|passwd|pwd|token|secret|credential|api[-_]?key)[A-Za-z0-9_-]*[ =])(\S+)',
+  '\b(?:sk-|ghp_|gho_|github_pat_|xox[baprs]-)[A-Za-z0-9._\-]{8,}',
+]
+# Per-stream ceiling on RETAINED output, markers included.
+#
+# This bounds the artifact, not what is read: a child that writes past the cap is
+# still drained to EOF, and the excess is discarded with a truncation marker. Not
+# draining would fill the pipe and deadlock the child until its timeout.
+# REFUSED: 0, which would discard all output silently.
+capture_output_max_bytes = 10485760
+# Not applied in Phase 0. Termination goes through TerminateJobObject followed by
+# a bounded 5 s wait in `jean_process`; this finer-grained setting belongs to the
+# graceful-then-forceful sequence Phase 1 introduces.
+kill_grace_ms = 3000
+
+[terminal]
+# Not implemented in Phase 0. A supervised child has its stdin closed and its
+# stdout/stderr piped, which is correct for one-shot commands and wrong for an
+# interactive session. ConPTY is a Phase 1 deliverable.
+interactive_backend = "conpty"
+pty_rows = 40
+pty_cols = 120
+default_shell = "powershell"
+
+[tools]
+# Empty means `<config_dir>\tools.toml`. If that does not exist, J.E.A.N. also
+# tries `<config_dir>\tools.example.toml`, so a fresh checkout works before any
+# setup step.
+registry_path = ""
+# A tool's recorded health is older than this and gets re-probed on the next CLI
+# invocation that asks. There is no daemon re-checking on a timer in Phase 1: the
+# check runs when something needs its answer.
+health_check_interval_secs = 300
+# A health probe is a bounded `path_exists`, never the tool itself. Starting an
+# application to find out whether it is installed is not a health check, it is a
+# side effect.
+health_check_timeout_ms = 5000
+# Consecutive failed probes before a tool is reported unhealthy.
+mark_unhealthy_after = 3
+# Where `jean apps` and `jean launch` look for installed applications.
+#
+# REFUSED: "mcp" and "acp". The settings document lists them, but the protocols
+# that would fill them are Phase 3; accepting them here would mean a key that
+# looks configured and never returns anything.
+#
+# Discovery never executes what it finds. A `.lnk` is read for its target, not
+# followed by launching it.
+discovery = ["path", "start_menu", "registry"]
+
+[workspace]
+# Empty means "not chosen". Phase 0 does not write into a workspace on the
+# user's behalf; captured output goes under `<data_dir>\artifacts`.
+root = ""
+allow_write_outside_root = false
+delete_mode = "recycle_bin"
+max_file_read_bytes = 52428800
+
+[policy]
+default_tier = "normal"
+approval_timeout_secs = 120
+# REFUSED: anything other than "deny". An approval that times out must not
+# become an approval.
+on_timeout = "deny"
+audit_enabled = true
+audit_path = ""
+audit_redacts_secrets = true
+# REFUSED: true. Phase 0 never elevates, and the orchestrator is not meant to run
+# elevated at all (IMPLEMENTATION_GUIDE.md section 7).
+run_elevated_by_default = false
+block_on_uipi = true
+# Capability names that need the operator's yes for *that invocation*. Matching is
+# on the capability an operation declares, never on the tool's name: a tool called
+# `safe-helper` that writes outside the workspace still matches the first entry.
+require_approval = [
+  "write_outside_workspace",
+  "delete_permanent",
+  "process_kill",
+  "service_control",
+  "registry_write",
+  "install_software",
+  "credential_read",
+  "network_egress_new_domain",
+  "elevated",
+  "modify_security_settings",
+  "bulk_file_change",
+  # Phase 4 names `desktop.act` and `desktop.input`; neither is listed here on purpose. Putting one
+  # here makes every desktop action ask a person at a terminal, and because a prompt nobody can answer
+  # is a denial, that also closes the action to scripts and agent-driven runs. The default boundary is
+  # `[desktop] enabled` plus the audit line, the same shape as `[browser] enabled`.
+]
+# Refused outright: no prompt, and no approval can unlock them. Auto-deny is
+# checked before require_approval, so a capability listed in both is denied.
+auto_deny = [
+  "format_volume",
+  "registry_hive_load",
+  "disable_defender",
+  "modify_uac",
+  "shadow_copy_delete",
+  "disable_audit_logging",
+  "write_to_own_config_from_model",
+  "grant_self_permission",
+]
+allow_remember = true
+# REFUSED: "tool_and_tier", which is what this file said before the requirement
+# was clarified. An approval bound to a tool and a tier would let one accepted
+# `git push` authorise every later git command at that tier, including ones with
+# different arguments. `operation_and_arguments` binds a remembered approval to
+# the operation plus its validated arguments and resolved target.
+approval_scope = "operation_and_arguments"
+approval_remember_secs = 86400
+max_remembered_approvals = 128
+# Named in the refusal shown for an elevated operation. This build ships no such
+# sidecar; the key exists so the refusal can say what would have to exist.
+elevation_helper = "jean-elevated.exe"
+# REFUSED: false. Nothing in this build stores a credential, and a setting that
+# asked for one would be asking for a feature that does not exist.
+never_store_credentials = true
+
+[search]
+# `jean find` bounds. These are limits, not hints: when one is hit the search
+# stops and says which, so asking for `C:\` cannot mean a CLI that never returns.
+max_results = 200
+max_entries = 200000
+deadline_secs = 30
+max_depth = 12
+# REFUSED: true. Following a junction or symlink moves the walk outside the root
+# that was authorised, and a self-referential reparse point cycles.
+follow_reparse_points = false
+ignore_case = true
+# False skips entries with the hidden attribute set. On Windows a leading dot does
+# not hide a file; the attribute does.
+include_hidden = false
+
+[ui]
+# REFUSED: anything other than none|toast. There is no tray, window or taskbar
+# button in Phase 1 — that is D-009.
+#
+# "toast" is opt-in, not the default: a toast is drawn on the operator's desktop,
+# and to be attributed at all its AppUserModelId must be written into HKCU. A
+# completed command does not get to make that per-user change by itself.
+notifications = "none"
+app_user_model_id = "JEAN.Orchestrator"
+
+[model]
+# Phase 2: model-driven planning. The shipped default is `none`, which keeps every
+# deterministic Phase-0 and Phase-1 command working exactly as before and makes
+# `jean plan` / `jean do` refuse with a message naming what to configure.
+#
+# REFUSED: any provider other than none | ollama | openai_compatible. The settings
+# document also lists `anthropic` and `openai`; those are cloud APIs, and this batch
+# was told not to use a paid API without explicit authorization, so a configuration
+# that names one is a load error rather than a request that might spend money.
+provider = "none"
+# HTTP only. This build ships no TLS client — adding one was not necessary for a
+# loopback Ollama or a local llama-server, and a proxy that terminates TLS on localhost
+# reaches the same providers. An https base_url is refused with that reason.
+base_url = "http://127.0.0.1:11434"
+# Required whenever a provider is selected. Never a path, never a URL.
+model = ""
+# The NAME of an environment variable holding a bearer token, never the token. The value
+# is read at request time, is never written to a record, log or audit line, and is
+# scrubbed from text that could echo it. Allowed to be empty only on a loopback endpoint.
+api_key_env = "JEAN_MODEL_API_KEY"
+request_timeout_secs = 120
+max_response_bytes = 1048576
+max_prompt_bytes = 262144
+max_output_tokens = 2048
+# REFUSED: above 0.3. A plan is a decision, and a decision that cannot be reproduced
+# from the record cannot be audited afterwards.
+temperature = 0.0
+# NDJSON for Ollama, SSE for OpenAI-compatible. Off by default: one bounded JSON body is
+# easier to verify than a stream reassembled into it.
+stream = false
+# Transport retries only. Length is the retry count; at most 4 entries of at most 60000
+# ms. A tool is NEVER retried because its response was lost — that is reconciled or
+# reported, because a second side effect is not a recovery.
+retry_backoff_ms = [500, 2000, 8000]
+# Plan length ceiling. May only tighten the compiled ceiling of 32.
+max_plan_steps = 8
+# record | model. Either way the facts (states, verdicts, exit codes) come from the
+# execution record; `model` changes wording and says so on screen.
+summary_wording = "record"
+# Enforced floor, not documentation: removing an entry here is a load error, because
+# each one names a decision that must never be put to a model (D-011).
+never_delegate_to_model = [
+  "permission_checks", "argument_validation", "path_handling",
+  "process_supervision", "task_state_transitions", "verification",
+  "policy_decisions", "secret_handling",
+]
+
+# Phase 3. Delegation to an external coding agent. `enabled = true` says this build may
+# start a worker; it does not authorize a specific agent, a workspace, or a permission the
+# worker asks for mid-session — every one of those still goes through `[policy]`, the
+# approvals ledger and the audit trail exactly as a typed command does.
+[delegation]
+enabled = true
+# Which `[[delegation.workers]]` entry `jean delegate` uses when `--worker` is absent.
+default_worker = "opencode"
+# REFUSED: above 1 in this build. One active delegated task at a time, because the
+# cancellation channel is per task and two workers sharing one terminal cannot both be
+# answered. See IMPLEMENTATION_STATUS.md §36.
+max_parallel = 1
+# The whole session, from spawn to settlement. A worker that has not ended its turn by
+# then is terminated and reported as `timeout`, never as finished.
+session_timeout_secs = 900
+# Silence, measured from the last byte the worker wrote, not from the start of the turn.
+# 0 disables it, which is a way to hang.
+idle_timeout_secs = 180
+# How long one permission request may wait for an answer before the session is abandoned.
+permission_timeout_secs = 120
+shutdown_grace_ms = 2000
+# Progress events buffered before the reader is back-pressured. Bounded on purpose: an
+# agent that emits fifty tool calls must not decide how much memory this process spends.
+max_event_queue = 256
+# One NDJSON frame. The ACP SDK reads lines with an unbounded buffer, so this ceiling is
+# the only thing between a chatty agent and an out-of-memory process.
+max_frame_bytes = 262144
+max_output_bytes = 8388608
+verify_command = ""
+verify_args = []
+verify_timeout_secs = 900
+# REFUSED: false, unless there is a reason. A worktree is what makes "the agent changed
+# files" reviewable instead of already-merged-into-your-tree.
+isolate_in_worktree = true
+# Empty means `<data dir>/worktrees`. A relative path here is refused at load.
+worktree_root = ""
+# With `isolate_in_worktree`, refuse to start when the baseline tree is dirty: a summary
+# of what the agent changed cannot be computed against a tree that was already changed.
+require_clean_baseline = true
+max_changed_files_reported = 200
+
+[[delegation.workers]]
+name = "opencode"
+# Native ACP over stdio: `opencode acp` advertises itself that way on this machine.
+kind = "acp"
+command = "opencode"
+args = ["acp"]
+enabled = true
+model = ""
+env_passthrough = []
+capability = "agent.delegate"
+sandbox = "workspace-write"
+
+[[delegation.workers]]
+name = "codex"
+# Codex 0.160.1 has no `acp` subcommand, so this is the structured CLI fallback:
+# `codex exec --json` writes JSONL events on stdout. It is also the proof that the worker
+# contract is not ACP-only. A one-way stream cannot ask permission, so this worker can
+# never be offered an ask it would have to answer.
+kind = "codex-cli"
+command = "codex"
+args = ["exec"]
+enabled = true
+model = ""
+env_passthrough = []
+capability = "agent.delegate"
+sandbox = "workspace-write"
+
+# Phase 3. MCP, both directions, over pipes J.E.A.N. owns. Nothing here opens a port: the
+# client spawns a configured server, and `jean mcp serve` speaks on this process's own
+# standard input and output.
+[mcp]
+enabled = true
+request_timeout_secs = 120
+max_message_bytes = 262144
+max_result_bytes = 1048576
+shutdown_grace_ms = 2000
+# A server is a process, so it is named: `[[mcp.servers]]` entries carry a command, an
+# allowlist of tools, and the capability a call is decided under. Empty by default.
+servers = []
+# Which registry tools `jean mcp serve` publishes. Empty publishes nothing, which is the
+# safe reading of an unset list: an exposed tool is a door.
+expose = []
+
+# Phase 3. A browser J.E.A.N. starts, owns and closes. Off by default: nothing launches a
+# browser until the operator says so, and turning it on authorizes the *subsystem*, not a
+# page — `allowed_origins` is checked before the process exists, and every workflow is
+# still decided by `[policy]`.
+[browser]
+enabled = false
+# Empty means detect an installed Chrome, Edge or Brave. Detection that finds nothing is a
+# reported blocker: J.E.A.N. does not download a browser, and does not attach to one that
+# is already running, because that browser belongs to a person.
+browser_path = ""
+# A window the operator did not ask for is a surprise. `false` is the choice that needs a
+# reason.
+headless = true
+startup_timeout_secs = 30
+action_timeout_secs = 30
+# What one page may hand back, in bytes. A page decides its own size; this decides how much
+# of it is retained.
+max_page_bytes = 524288
+# `file` plus loopback `http`. Anything else is refused at the intent, not by a rule inside
+# the browser.
+allowed_origins = ["file", "http://127.0.0.1"]
+
+# ─────────────────────────────────────────────────────────────
+# The desktop actuator: windows, accessibility, capture, input.
+#
+# `enabled` gates the *actions*. Reads and diagnostics — `jean desktop windows`,
+# `jean desktop inspect`, `jean desktop diagnose` — stay available either way, because
+# the plan requires a blocked window to be *diagnosed*, and a switch that also turned
+# diagnosis off would remove the only evidence an operator has for deciding whether to
+# turn the actions on.
+# ─────────────────────────────────────────────────────────────
+[desktop]
+enabled = false
+# How long one UI Automation conversation may be waited for before its worker process is terminated.
+# The bound is the whole protection a hung application gets. Five seconds is not generous;
+# the alternative is waiting indefinitely on somebody else's message pump. The worker is ended with its
+# job object, so nothing of it is left running — but a call that was cut off may already have acted, and
+# that uncertainty is reported rather than replayed.
+uia_timeout_secs = 5
+# The same bound for one capture.
+capture_timeout_secs = 10
+# Ceiling on the controls one tree read may return. Hitting it is reported as a truncation,
+# never as a complete tree.
+max_tree_nodes = 2000
+# Ceiling on one capture, in pixels. A larger window is refused rather than resized: there
+# is no scaler in this tree, and a shrunken frame makes every coordinate built from it false.
+max_capture_pixels = 4194304
+# Only consulted when captures are actually kept.
+capture_dir = "%LOCALAPPDATA%/JEAN/captures"
+# `discard_after_task` | `keep_24h` | `keep_until_manual`.
+#
+# All three are now true about the files. `keep_24h` is a real expiry: every kept frame is claimed in an
+# ownership manifest before it is written, and that claim is what authorises its removal at 24 hours and
+# its share of the byte ceiling — so the default is the *privacy* choice, not the only one this build can
+# keep. A frame that cannot be claimed is not written.
+#
+# Retained pixels are not redacted. Text readback masks password-flagged controls; an image shows what the
+# screen showed.
+retention = "discard_after_task"
+# Independent of `enabled`, and off. Switching the actuator on is agreeing to pattern
+# actions, not to synthesised keystrokes: the semantic path is the one that is meant to be
+# used, and this flag is what keeps the fallback a decision rather than a default.
+allow_synthetic_input = false
+# How many desktop worker processes may be alive at once before desktop work is refused.
+# Every call ends its own worker — terminated with its job object, not abandoned — so
+# reaching this means workers are not exiting, which is a fact about the desktop.
+max_concurrent_workers = 4
+
+# Speech is off, and off means no worker, no model and no device. `sherpa_onnx` is the
+# real backend and needs the assets in docs/voice-assets.md plus a worker built with
+# `--features sherpa`; `fixture` is an explicit device-free test backend that pairs with
+# a simulated audio device, so a test can never open the operator's microphone.
+[voice]
+enabled = false
+mode = "push_to_talk"
+backend = "sherpa_onnx"
+startup_timeout_ms = 5000
+request_timeout_ms = 2000
+shutdown_timeout_ms = 2000
+capture_timeout_ms = 30000
+utterance_timeout_ms = 120000
+# Model loading is the one voice request that legitimately takes seconds, so it is
+# timed separately from the 2 s control deadline everything else answers to.
+configure_timeout_ms = 30000
+# Tail-flush budget after push-to-talk release. Must stay below request_timeout_ms:
+# the owner reaps a worker that does not answer a release in time.
+finalize_budget_ms = 1200
+# Ceiling on audio held between the device and the recognizer. Overflow drops the
+# oldest frames and is counted rather than hidden.
+capture_buffer_ms = 2000
+# Rate the engines work at. Whatever the device delivers is resampled to this.
+sample_rate = 16000
+# Endpoint ids from `jean voice devices`; empty means the system default.
+input_device = ""
+output_device = ""
+# Validation seam: a WAV that stands in for the microphone, with a counted sink in
+# place of the speaker. Set, it lets one press-release-transcript cycle run against a
+# real engine while nothing is recorded and nothing is played. Empty means real
+# endpoints — which is all an operator can actually use.
+offline_wav = ""
+# Push-to-talk trigger for the interactive session. A binding always needs Ctrl, Alt
+# or Win so ordinary typing cannot start a capture. This is a trigger, not a mode:
+# nothing is recorded until it is pressed and nothing is submitted until release.
+hotkey = "Ctrl+Alt+Space"
+# Both off by default. An announcement occupies the single utterance slot, and a
+# spoken control intercepts what would otherwise be submitted as a task goal, so
+# each is a decision the operator makes rather than a surprise.
+announce_task_state = false
+spoken_controls = false
+fixture_transcript = "inspect this process"
+# Length of the fixture engine's utterance. The real engine's length comes from the
+# text; the fixture's is a fixed block of silence, and 10 ms is gone before anyone can
+# react. Raise it to test an interrupt landing during playback without a synthesizer.
+# It has no effect on real speech.
+fixture_utterance_ms = 10
+
+[voice.models]
+# Recognition and synthesis are provisioned separately, and the worker treats them that
+# way: a complete set below makes speech work even with every tts_* key empty.
+encoder = ""
+decoder = ""
+joiner = ""
+tokens = ""
+tts_model = ""
+tts_tokens = ""
+tts_lexicon = ""
+# Setting tts_voices is what selects the Kokoro engine instead of VITS — it is a second
+# file in the bundle (the speaker table), and neither engine can infer that from a
+# filename. Leave empty for a VITS/Piper bundle. docs/voice-assets.md §4 lists the only
+# synthesis bundle this build considers redistributable and why.
+tts_voices = ""
+# Text-frontend data directory shipped inside the Kokoro bundle: a directory, not a file.
+tts_dict_dir = ""
+tts_lang = ""
+# Speaker index inside tts_voices. Identity is an index; the bundle decides what 0 is.
+tts_speaker = 0
+# Optional. Without VAD weights recognition still works; silence is not trimmed.
+vad = ""
+# Only for a shared (DLL) link. A static link needs no runtime library directory.
+native_lib_dir = ""

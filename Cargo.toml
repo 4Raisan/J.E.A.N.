@@ -1,0 +1,207 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jean-protocol",
+    "crates/jean-model",
+    "crates/jean-store",
+    "crates/jean-process",
+    "crates/jean-acp",
+    "crates/jean-mcp",
+    "crates/jean-browser",
+    "crates/jean-windows",
+    "crates/jean-core",
+    "crates/jean-tools",
+    "crates/jean-policy",
+    "apps/jean-cli",
+    "apps/jean-tray",
+    "apps/jean-elevated",
+    "workers/voice",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/jean"
+authors = ["J.E.A.N. contributors"]
+
+# Phase 0 keeps the dependency set deliberately narrow.
+# Every entry here is an ADOPT verdict in PLANNING/03-DEPENDENCIES.md.
+# Deviations from that document are recorded in IMPLEMENTATION_STATUS.md.
+[workspace.dependencies]
+# Phase 3 protocol SDKs, pinned exactly because both churn majors within weeks (PLANNING/03 §2):
+# `rmcp` went 3.1 -> 3.8 in ten weeks and ACP went 3.0 -> 5.0 in four. Both are async, so the runtime
+# arrives with them deliberately — `tokio` is used inside `jean-acp` and `jean-mcp` and nowhere else,
+# and every crate above them keeps the synchronous surface Phases 0-2 were built on. Neither SDK's
+# `process` feature is requested, for the same reason `rmcp`'s is not: JEAN spawns and supervises the
+# worker, the SDK speaks over the pipes JEAN handed it. ACP's `stdio` feature is off for the same
+# reason in the other direction — it transports over *this* process's standard streams, which belong
+# to the operator's terminal, not to a child session.
+agent-client-protocol = "=5.0.0"
+anyhow = "1.0.104"
+# `blocking::Unblock` is what turns a pipe this crate owns into an `AsyncRead`/`AsyncWrite` the SDK can
+# use: the read parks on its own thread and wakes the task, so a blocked worker read never occupies a
+# runtime worker. Requested directly because the transport is built here, not by an SDK feature.
+blocking = "1.7.0"
+# The ACP SDK's transport traits are `futures`' (`AsyncRead`/`AsyncWrite`), not tokio's, so the frame
+# caps in `jean-acp::frames` are written against them. Version-matched to what the SDK already pulls.
+futures = "0.3.34"
+# The browser child. `offline` (a default) keeps the CDP schema bundled rather than fetched at build
+# time, and no TLS backend is requested: the debug endpoint is a loopback pipe, not a network.
+headless_chrome = "1.0.22"
+# `transport-child-process` is deliberately NOT requested: it would have rmcp spawn the server with
+# its own process handling, which is a second execution path outside the job object and the audit
+# trail. JEAN spawns and supervises; rmcp is given the pipe halves (`transport-async-rw`).
+rmcp = { version = "=3.8.0", default-features = false, features = [
+    "client",
+    "server",
+    "transport-io",
+    "transport-async-rw",
+    "macros",
+    "base64",
+    "elicitation",
+] }
+# The bridge from `futures`' async traits (which `blocking::Unblock` implements) to tokio's, which is
+# what `rmcp`'s transport asks for. Same version the ACP SDK already pulls, so this adds no new crate
+# to the tree.
+tokio-util = { version = "0.7.20", features = ["compat"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "rt",
+    "macros",
+    "process",
+    "io-util",
+    "io-std",
+    "sync",
+    "time",
+    # Named-pipe servers on Windows: the way a protocol SDK can own an async read/write half while
+    # JEAN still does the spawning and owns the job object.
+    "net",
+] }
+clap = { version = "4.6.7", features = ["derive"] }
+# Test-only, and only ever a dev-dependency: `crates/jean-model/src/tls.rs` needs a TLS *server* to
+# verify a client's certificate checks against. ureq already pulls this crate in at the same
+# version, so on Windows the only thing compiled is the Schannel path that is compiled anyway.
+native-tls = "0.2.18"
+regex = "1"
+# `functions` registers the redactor as a SQLite scalar so the search index redacts
+# at the schema level; `hooks` supplies the progress callback that bounds search
+# work. Both are features of this same crate — no new package, no download.
+rusqlite = { version = "0.41.1", features = ["bundled", "functions", "hooks"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = { version = "=0.40.1", default-features = false, features = ["system"] }
+serde_json = "1.0.154"
+# Phase 5 (D-054, D-055). The speech SDK, adopted as an OPTIONAL dependency so the default
+# build never sees it: `jean-voice` requests it behind `optional = true`, and `optional`
+# dependencies are not compiled unless a feature enables them — measured with
+# `cargo tree -p jean-voice`, which lists no sherpa package at all in the default feature set.
+# `default-features = false` plus `static` asks the linker for `sherpa-onnx-c-api`; the CRT
+# question that name raises was tested rather than assumed (§59), and `-sys`'s build script
+# fetches a 122 MB native archive unless SHERPA_ONNX_LIB_DIR or SHERPA_ONNX_ARCHIVE_DIR
+# declares local provisioning first — both refusal paths were executed, and neither fetched
+# anything. docs/voice-assets.md §1 and §6.
+sherpa-onnx = { version = "=2.0.1", default-features = false, features = ["static"] }
+# The model transport. Blocking client, so no async runtime enters the tree;
+# `native-tls` is the Windows system trust store (Schannel), which avoids the C
+# toolchain and vendored crypto that rustls' default provider would add.
+ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
+thiserror = "2.0.21"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Phase 4 (D-017). The UI Automation wrapper, adopted because UIA is the highest-leverage
+# control surface (D-004) and this is the maintained Rust binding for it: `windows = "0.62.2"`,
+# exactly the version this workspace already pins, so adopting it adds no second copy of the
+# `windows` crate. `default-features = false` is deliberate — `control` and `pattern` are what the
+# inspection and action paths call; `screenshot` would pull `png`, `input` duplicates the SendInput
+# path we drive ourselves, and `process`/`clipboard`/`dialog` are not used. Bus factor is R-04:
+# every UIA call goes through the `AccessibilityProvider` trait in `jean-windows`, so swapping it
+# for the raw `windows`-crate interfaces is a crate-local change rather than a rewrite.
+# reason — and `input` has to be in the list for a reason that is not ours: `uiautomation` 0.25.1's
+# `core.rs:38` imports `crate::inputs::MouseButton` unconditionally while `lib.rs:12` gates the `inputs`
+# module behind `feature = "input"`, so the crate does not compile with `control` and `pattern` alone.
+# Measured, not inferred: the first build of this tree failed with `unresolved import crate::inputs`.
+# Nothing in J.E.A.N. calls the crate's input API (see `jean_windows::input`), so the cost is one extra
+# `windows` feature that this workspace already requests.
+uiautomation = { version = "=0.25.1", default-features = false, features = [
+    "control",
+    "pattern",
+    "input",
+] }
+win32job = "2.0.3"
+
+# Minimal feature set: the compiler names any missing feature verbatim,
+# so this list grows reactively rather than speculatively (PLANNING/03 §1).
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    # Ctrl-C and window-close handling, so a supervised child tree is cancelled
+    # and the task recorded rather than abandoned mid-flight.
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    # Phase 1. Application discovery reads the registry InstallLocations and the
+    # Start Menu .lnk targets; both are inspection, never execution.
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    # Phase 1. The launch intent verifies itself with "a window the operator can see
+    # now belongs to the process we started", which is `EnumWindows` plus the four
+    # style/title queries. Read-only: nothing in this feature set is used to change a
+    # window, and the foreground-setting APIs stay out of Phase 1 entirely.
+    "Win32_UI_WindowsAndMessaging",
+    # Phase 4. The mechanism the roadmap's mitigation lines name directly: per-monitor-v2 DPI
+    # awareness and `GetDpiForWindow` before any coordinate work (R-15), `SendInput` with
+    # `MOUSEEVENTF_VIRTUALDESK` as the bounded input fallback (R-03 — `enigo` normalises absolute
+    # coordinates against the *primary* monitor, which is the exact bug R-15 warns about), the GDI
+    # surfaces a per-window capture needs, and `PrintWindow`, which really does live in
+    # `Win32_Storage_Xps` rather than in Graphics or UI.
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    # Phase 4. "The interactive session is unavailable" is a diagnosis `docs/desktop-control-plan.md`
+    # requires separately from a protection or a hang, and it is only answerable from the session the
+    # console is attached to (`Win32_System_RemoteDesktop`) and the desktop keyboard input is actually
+    # going to (`Win32_System_StationsAndDesktops`). Both are reads.
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    # Phase 1. Toast notifications, requested through the raw-WinRT path the
+    # planning documents specify rather than through a wrapper crate. The WinRT
+    # namespaces are their own features here, not `Win32_*` ones.
+    "UI_Notifications",
+    # `XmlDocument` and its `LoadXml` are in `Data_Xml_Dom`, not the
+    # `Data_Xml` parent that merely re-exports the namespace; naming the sub-feature is
+    # what PLANNING/03 records, and the parent alone does not bind them.
+    "Data_Xml",
+    "Data_Xml_Dom",
+] }
+
+jean-protocol = { path = "crates/jean-protocol", version = "0.1.0" }
+jean-model = { path = "crates/jean-model", version = "0.1.0" }
+jean-store = { path = "crates/jean-store", version = "0.1.0" }
+jean-process = { path = "crates/jean-process", version = "0.1.0" }
+jean-core = { path = "crates/jean-core", version = "0.1.0" }
+jean-tools = { path = "crates/jean-tools", version = "0.1.0" }
+jean-policy = { path = "crates/jean-policy", version = "0.1.0" }
+jean-acp = { path = "crates/jean-acp", version = "0.1.0" }
+jean-mcp = { path = "crates/jean-mcp", version = "0.1.0" }
+jean-browser = { path = "crates/jean-browser", version = "0.1.0" }
+jean-windows = { path = "crates/jean-windows", version = "0.1.0" }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true

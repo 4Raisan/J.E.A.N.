@@ -1,0 +1,28 @@
+# Build artifacts. `Cargo.lock` is deliberately NOT ignored: this workspace
+# ships a binary (`jean`), so the lock file is part of a reproducible build.
+/target
+**/*.rs.bk
+
+# Runtime state. Everything here is created by `jean` at first write, either
+# under %LOCALAPPDATA%\JEAN or wherever `JEAN_DATA_DIR` points. Nothing in this
+# tree is source, and the database may contain redacted-but-still-private
+# command records.
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# Local configuration that overrides the shipped examples. `config/defaults.toml`
+# and `config/tools.example.toml` ARE tracked; a machine-specific copy of either
+# is not.
+/config/jean.toml
+/config/tools.toml
+/config/*.local.toml
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

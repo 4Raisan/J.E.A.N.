@@ -1,0 +1,9 @@
+# Tracks stable, per PLANNING/02-TOOLCHAIN.md.
+# The MSRV floor (1.90) is declared in Cargo.toml [workspace.package].rust-version
+# and is enforced in CI via `cargo +1.90 check`, not by pinning here —
+# pinning an old channel would force a second toolchain download on every machine.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "default"
