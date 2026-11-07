@@ -1,0 +1,20 @@
+[package]
+name = "jean-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider-neutral model access for JEAN: it can obtain a plan and nothing else."
+
+[dependencies]
+jean-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+# The TLS test server. Never a runtime dependency: the client side is ureq's own native-tls.
+native-tls.workspace = true
