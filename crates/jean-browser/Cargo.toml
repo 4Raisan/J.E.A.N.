@@ -1,0 +1,18 @@
+[package]
+name = "jean-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A browser J.E.A.N. starts, owns and closes: loopback CDP, disposable profile, nothing of the operator's."
+
+[dependencies]
+anyhow.workspace = true
+jean-protocol.workspace = true
+jean-process.workspace = true
+headless_chrome.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
