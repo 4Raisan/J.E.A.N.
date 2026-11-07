@@ -1,0 +1,44 @@
+[package]
+name = "jean-windows"
+description = "Native Windows desktop mechanism: window identity, UI Automation inspection and actions, per-window capture, DPI-correct input, and the capability diagnostics that say which of them worked."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jean-desktop-fixture"
+path = "src/bin/jean_desktop_fixture.rs"
+
+# The desktop worker (D-051): the process a UIA or capture call actually runs in, so that a provider
+# which never answers costs a *process* that J.E.A.N. can kill and forget rather than a thread it has to
+# carry for the rest of its life. `crates/jean-windows/src/worker.rs` starts it, and the parent refuses
+# desktop work rather than falling back to in-process provider calls.
+[[bin]]
+name = "jean-desktop-worker"
+path = "src/bin/jean_desktop_worker.rs"
+
+[dependencies]
+jean-protocol = { workspace = true }
+# Phase 1's window-station walk (`desktop::top_level_windows`) already answers "which top-level windows
+# exist and which of them an operator would call a window", with the caps, the title handling and the
+# tool-window rule in one place. Phase 4 adds the actuator half on top of it rather than writing a second
+# enumeration that can disagree with the probe `jean launch` verifies against.
+jean-tools = { workspace = true }
+# The worker child is spawned through the same supervision every other J.E.A.N. child gets: Job Object
+# with `KILL_ON_JOB_CLOSE`, `CREATE_SUSPENDED` so the tree is contained before it runs, and pipe halves
+# the parent owns (`crates/jean-process/src/piped.rs`). Phase 4's isolation requirement is a process-tree
+# kill, and re-implementing `CreateProcessW` to avoid this dependency would be the second supervisor this
+# repository never got around to fixing.
+jean-process = { workspace = true }
+# Only for the worker protocol's own line framing (D-051): a request and a reply are one JSON line each
+# over a pipe J.E.A.N. owns at both ends. The OCR sidecar format in `ocr.rs` stays hand-rolled, because
+# that one is an external contract with other people's implementations in front of it.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The UIA provider wrapper, behind `accessibility::UiAutomation` so it stays swappable (D-017). Its
+# features and the reason `input` is mandatory are recorded at the workspace root.
+uiautomation = { workspace = true }
+windows = { workspace = true }
