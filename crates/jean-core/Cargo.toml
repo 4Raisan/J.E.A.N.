@@ -1,0 +1,76 @@
+[package]
+name = "jean-core"
+description = "J.E.A.N. orchestration core: task lifecycle, tool resolution, cancellation IPC, and crash reconciliation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+jean-protocol = { workspace = true }
+jean-store = { workspace = true }
+jean-process = { workspace = true }
+# Phase 1. `intent` asks `jean-policy` whether an operation may run and audits the
+# answer, and asks `jean-tools` what is installed, what a process is doing and where a
+# file lives. Neither crate can start anything: the decision and the act both stay
+# here, which is the boundary D-011 draws.
+jean-policy = { workspace = true }
+jean-tools = { workspace = true }
+# Phase 2. The planner asks `jean-model` for a proposal and validates it. The direction of that
+# dependency is the point: `jean-model` cannot see this crate, so a provider cannot start a
+# process, read a policy rule or write a record (D-011).
+jean-model = { workspace = true }
+# Phase 3. `delegation` drives an external worker through `jean-acp`'s connector and answers its
+# permission requests. The same direction holds: `jean-acp` cannot see this crate, so a worker
+# protocol has no route to the policy engine, the store, or the operator's prompts — it can only
+# ask, and the ask is decided here.
+jean-acp = { workspace = true }
+# Phase 3. The MCP roles: `mcp` builds the launch spec and the policy decision, `jean-mcp` only speaks
+# the protocol over the pipes it is handed. The crate cannot resolve a command, choose a directory or
+# decide anything, which is why it has no dependency on this one.
+jean-mcp = { workspace = true }
+# Phase 3. The browser: `jean-browser` starts and speaks to a browser this crate resolved, and cannot
+# decide anything, open a task row, or reach the operator's prompts.
+jean-browser = { workspace = true }
+# Phase 4. The desktop: `desktop` decides, records and judges; `jean-windows` only identifies a window,
+# walks its accessibility tree, captures its surface and injects input. The direction is the same one
+# every other crate in this list keeps — the mechanism cannot see this crate, so a UIA provider has no
+# route to the policy engine, the approvals ledger, or the operator's prompts.
+jean-windows = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+# The capture store's ownership manifest is one JSON object per line; `serde` is for the derive on that one
+# record type and `serde_json` for the lines themselves. The reason a cleaner needs a record at all is in
+# `captures.rs`: a file name that merely *looks* like this build's output is not permission to delete it.
+serde_json = { workspace = true }
+# Only for the capture store's ownership manifest (`captures.rs`), whose one record type is the contract
+# between the frame this build writes and the expiry that is allowed to remove it. The wire format is JSON
+# lines for the same reason the audit log is: a record an operator can read is a record an operator can
+# audit, and a cleaner whose authority is a file it cannot explain is not authority.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Only for the cancellation pipe. Everything else in this crate is portable.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+# Used by tests/config_files.rs to compare the shipped `config/defaults.toml`
+# against the compiled defaults key by key. Test-only: the runtime reads
+# configuration through `jean-protocol`, which already depends on `toml`.
+toml = { workspace = true }
+
+# Used by tests/recovery.rs to move `PRAGMA user_version` forward by hand, which
+# is the only way to reproduce "this database was written by a newer build".
+# `Store` deliberately has no public setter: nothing in the product should ever
+# move the version backwards or skip one. Already ADOPTed at workspace level
+# (PLANNING/03-DEPENDENCIES.md) for `jean-store`, so this adds no new crate to
+# the dependency tree.
+rusqlite = { workspace = true }
+
+# No other dev-dependencies: the tests build their own throwaway directories.
+# Adding a crate for that would put a new entry in the dependency tree for no
+# gain, and `PLANNING/03-DEPENDENCIES.md` is the authority on what may be added.
