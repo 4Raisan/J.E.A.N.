@@ -1,0 +1,15 @@
+[package]
+name = "jean-store"
+description = "SQLite persistence for J.E.A.N.: tasks, tool runs, and the append-only event log."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+jean-protocol.workspace = true
+rusqlite = { workspace = true, features = ["functions", "hooks"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
