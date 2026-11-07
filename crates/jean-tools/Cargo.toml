@@ -1,0 +1,24 @@
+[package]
+name = "jean-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Application discovery, process inspection and bounded file search for J.E.A.N."
+
+[dependencies]
+jean-protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Process inspection is a Windows-only capability in this build (see the
+# compile_error in `lib.rs`), so sysinfo is a Windows-only dependency: a crate
+# whose results this build can never report should not sit in its graph.
+[target.'cfg(windows)'.dependencies]
+sysinfo.workspace = true
+windows.workspace = true
+
+# `IShellLinkW` (Win32_UI_Shell) plus `IPersistFile` (Win32_System_Com) is how a
+# Start Menu shortcut's target is read without launching anything. Both features are
+# already declared at the workspace root, so nothing here widens the dependency graph.
