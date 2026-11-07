@@ -1,0 +1,25 @@
+[package]
+name = "jean-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "External coding-agent supervision: one worker contract, several protocol shapes."
+
+[dependencies]
+jean-protocol.workspace = true
+jean-process.workspace = true
+agent-client-protocol.workspace = true
+blocking.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+# Only for tests: an in-memory duplex the scripted ACP peer can be attached to, so the transport,
+# the frame caps and the session flow are exercised over real bytes without spawning anything.
+tokio-util = { version = "0.7.20", features = ["compat"] }
