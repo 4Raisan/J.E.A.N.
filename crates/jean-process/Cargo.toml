@@ -1,0 +1,23 @@
+[package]
+name = "jean-process"
+description = "Supervised child processes: Job Object containment, bounded output capture, whole-tree cancellation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+jean-protocol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Windows-only by design. The whole reason this crate exists is Job Objects:
+# they are the only supported way to guarantee a descendant cannot outlive the
+# supervisor. There is no portable equivalent worth abstracting over in Phase 0,
+# so the platform requirement is stated instead of faked behind a trait.
+[target.'cfg(windows)'.dependencies]
+win32job = { workspace = true }
+windows = { workspace = true }
+
+[dev-dependencies]
+jean-protocol = { workspace = true }
