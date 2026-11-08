@@ -1,0 +1,43 @@
+[package]
+name = "jean-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Native speech. OFF by default, so the shipped build compiles, links and runs with no
+# speech assets and no native library anywhere on the machine.
+#
+# `dep:sherpa-onnx` is the whole gate: with the feature off, Cargo does not build the
+# dependency at all, `sherpa.rs` is not compiled, and the worker reports the absence
+# through `assets::native_unavailable`. Enabling it is a deliberate act, because the
+# dependency's own build script expects to fetch a 122 MB native archive unless
+# SHERPA_ONNX_LIB_DIR or SHERPA_ONNX_ARCHIVE_DIR declares local provisioning first.
+#
+# Provisioned build: `cargo build -p jean-voice --features sherpa` with the variables set.
+# Compile-only conformance check, no binaries: `cargo check -p jean-voice --features sherpa`
+# with DOCS_RS=1 (the crate skips download and link directives in that mode).
+sherpa = ["dep:sherpa-onnx"]
+
+[dependencies]
+jean-protocol.workspace = true
+serde_json.workspace = true
+sherpa-onnx = { workspace = true, optional = true }
+# WASAPI is an operating-system API, not a downloaded native dependency: these
+# are features of the `windows` crate the workspace already pins, so enabling
+# them adds no package and no build script. The audio code lives only here.
+windows = { workspace = true, features = [
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[[bin]]
+name = "jean-voice"
+path = "src/main.rs"
