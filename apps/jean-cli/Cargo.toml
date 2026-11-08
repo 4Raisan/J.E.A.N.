@@ -1,0 +1,28 @@
+[package]
+name = "jean-cli"
+description = "The J.E.A.N. command line: run a registered tool, launch a discovered application, inspect processes and files, and keep an honest record of what happened."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jean"
+path = "src/main.rs"
+
+[dependencies]
+jean-core = { workspace = true }
+jean-policy = { workspace = true }
+jean-protocol = { workspace = true }
+jean-store = { workspace = true }
+jean-tools = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+# The push-to-talk binding polls only its own keys (GetAsyncKeyState). No audio
+# enters the CLI: capture and playback stay in the voice worker process.
+windows = { workspace = true }
+
+[dev-dependencies]
+windows = { workspace = true }
