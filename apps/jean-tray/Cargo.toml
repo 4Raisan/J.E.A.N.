@@ -1,0 +1,15 @@
+[package]
+name = "jean-tray"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "jean-tray"
+path = "src/main.rs"
+
+[dependencies]
+muda = "0.21.2"
+tray-icon = "0.26.1"
+anyhow = "1.0"
