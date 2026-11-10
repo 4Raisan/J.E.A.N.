@@ -76,6 +76,8 @@ impl PermissionHost for Host {
 /// every write would be refused for a reason that has nothing to do with the test.
 struct Wire {
     root: PathBuf,
+    worker_name: &'static str,
+    model: String,
 }
 
 impl Wire {
@@ -83,7 +85,11 @@ impl Wire {
         let root = std::env::temp_dir().join(format!("jean-acp-wire-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a scratch workspace must be creatable");
-        Self { root }
+        Self {
+            root,
+            worker_name: "wire",
+            model: String::new(),
+        }
     }
 
     /// The absolute path a test expects JEAN to have written.
@@ -132,12 +138,13 @@ where
     A: FnOnce(DuplexStream) -> futures::future::BoxFuture<'static, ()> + Send + 'static,
 {
     let worker = WorkerConfig {
-        name: "wire".to_owned(),
+        name: wire.worker_name.to_owned(),
         kind: "acp".to_owned(),
         command: "unused".to_owned(),
         args: Vec::new(),
         enabled: true,
-        model: String::new(),
+        model: wire.model.clone(),
+        free_fallback: false,
         env_passthrough: Vec::new(),
         capability: "agent.delegate".to_owned(),
         sandbox: "workspace-write".to_owned(),
@@ -279,6 +286,13 @@ async fn send(peer: &mut DuplexStream, frame: String) {
 ///
 /// Returns the prompt's id, which is what a well-behaved agent must answer to settle the turn.
 async fn handshake(peer: &mut DuplexStream) -> serde_json::Value {
+    open_session(peer, serde_json::json!({"sessionId":"s-1"})).await;
+    let prompt = recv(peer).await;
+    assert_eq!(prompt["method"], "session/prompt");
+    prompt["id"].clone()
+}
+
+async fn open_session(peer: &mut DuplexStream, result: serde_json::Value) {
     let initialize = recv(peer).await;
     assert_eq!(
         initialize["method"].as_str(),
@@ -304,19 +318,151 @@ async fn handshake(peer: &mut DuplexStream) -> serde_json::Value {
     send(
         peer,
         format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"sessionId\":\"s-1\"}}}}",
-            new_session["id"]
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",
+            new_session["id"],
         ),
     )
     .await;
+}
 
-    let prompt = recv(peer).await;
-    assert_eq!(
-        prompt["method"].as_str(),
-        Some("session/prompt"),
-        "the third frame must carry the delegation's prompt"
-    );
-    prompt["id"].clone()
+#[test]
+fn opencode_model_selection() {
+    use serde_json::json;
+    const MODEL: &str = "opencode/beam-free";
+    for (tag, current) in [
+        ("match", Some(MODEL)),
+        ("different", Some("opencode/other")),
+        ("missing", None),
+        ("rejected", None),
+    ] {
+        let mut wire = Wire::new(tag);
+        wire.worker_name = "opencode";
+        wire.model = MODEL.into();
+        let observed = drive(
+            &wire,
+            Host::Allow,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            64 * 1024,
+            move |mut peer| {
+                Box::pin(async move {
+                    let option = |value| {
+                        json!({
+                            "id":"model","name":"Model","category":"model","type":"select",
+                            "currentValue":value,"options":[{"value":MODEL,"name":"Beam Free"}]
+                        })
+                    };
+                    open_session(
+                        &mut peer,
+                        json!({
+                            "sessionId":"s-1","configOptions":[option("opencode/other")]
+                        }),
+                    )
+                    .await;
+                    let request = recv(&mut peer).await;
+                    assert_eq!(request["method"], "session/set_config_option");
+                    assert_eq!(
+                        request["params"],
+                        json!({
+                            "sessionId":"s-1","configId":"model","value":MODEL
+                        })
+                    );
+                    let mut reply = json!({"jsonrpc":"2.0","id":request["id"]});
+                    if tag == "rejected" {
+                        reply["error"] = json!({"code":-32602,"message":"model rejected"});
+                    } else {
+                        reply["result"] = json!({"configOptions":current.map(option).into_iter().collect::<Vec<_>>()});
+                    }
+                    send(&mut peer, reply.to_string()).await;
+                    // If the client sends a prompt in any case, settle it. A negative
+                    // case would then report success (or expire), failing the assertion below.
+                    let mut line = String::new();
+                    use tokio::io::AsyncBufReadExt;
+                    if tokio::io::BufReader::new(&mut peer)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap()
+                        > 0
+                    {
+                        let prompt: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(prompt["method"], "session/prompt");
+                        send(
+                            &mut peer,
+                            json!({
+                                "jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                        hold(&mut peer).await;
+                    }
+                })
+            },
+            None,
+        );
+        let confirmations: Vec<_> = observed
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                WorkerEvent::ModelConfirmed { model } => Some(model.as_str()),
+                _ => None,
+            })
+            .collect();
+        if tag == "match" {
+            assert_eq!(confirmations, [MODEL]);
+            assert!(observed.outcome.is_ok(), "{:?}", observed.outcome);
+        } else {
+            assert!(confirmations.is_empty(), "{tag}: {confirmations:?}");
+            let Err(SessionEnd::Abnormal(reason)) = observed.outcome else {
+                panic!("{tag}: expected pre-prompt refusal");
+            };
+            assert!(
+                reason.contains(if tag == "rejected" {
+                    "model rejected"
+                } else {
+                    "did not confirm requested model"
+                }),
+                "{tag}: {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn opencode_blank_model_is_refused_without_sending_any_acp_prompt() {
+    for model in ["", " \t "] {
+        let mut wire = Wire::new("blank-opencode-model");
+        wire.worker_name = "opencode";
+        wire.model = model.to_owned();
+        let observed = drive(
+            &wire,
+            Host::Allow,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            64 * 1024,
+            |mut peer| {
+                Box::pin(async move {
+                    let mut line = String::new();
+                    use tokio::io::AsyncBufReadExt;
+                    let bytes = tokio::io::BufReader::new(&mut peer)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        bytes, 0,
+                        "blank model must not start or prompt an ACP worker"
+                    );
+                })
+            },
+            None,
+        );
+        let Err(SessionEnd::Abnormal(reason)) = observed.outcome else {
+            panic!("expected OpenCode model config refusal for {model:?}");
+        };
+        assert!(reason.contains("[delegation.workers].model"), "{reason}");
+    }
 }
 
 /// The agent's streamed message and its `fs/write_text_file` ask, then J.E.A.N.'s answer to it.

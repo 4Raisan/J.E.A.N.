@@ -203,6 +203,8 @@ pub fn play(
         stdout_bytes: script.stdout_bytes,
         output_dir: spec.bounds.output_dir.clone(),
         failure,
+        failure_kind: None,
+        remaining_work: None,
     };
     let _ = sink.emit(WorkerEvent::Settled(outcome.clone()));
     (outcome, answers)
@@ -254,6 +256,7 @@ mod tests {
             args: Vec::new(),
             enabled: true,
             model: String::new(),
+            free_fallback: false,
             env_passthrough: Vec::new(),
             capability: "code-edit".to_owned(),
             sandbox: "workspace-write".to_owned(),

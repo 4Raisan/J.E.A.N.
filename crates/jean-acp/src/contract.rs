@@ -37,6 +37,19 @@ use std::time::{Duration, Instant};
 use jean_protocol::config::WorkerConfig;
 use jean_protocol::event::EventKind;
 
+/// A structured session failure that JEAN may consider for bounded recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerFailureKind {
+    /// The peer returned `data.kind = "quota_exhausted"` with remaining work.
+    QuotaExhausted,
+    /// The peer returned `data.kind = "context_exhausted"` with remaining work.
+    ContextExhausted,
+    /// The peer returned the explicit `data.kind = "sign_in_expired"` marker.
+    SignInExpired,
+    /// The peer returned the explicit `data.kind = "network_unavailable"` marker.
+    NetworkUnavailable,
+}
+
 /// What the worker's session produced, as observed by the connector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOutcome {
@@ -59,6 +72,10 @@ pub struct WorkerOutcome {
     /// A connector-level failure: malformed frames, an unexpected exit, a stalled session. This is
     /// what separates "the agent did the work and it did not pass" from "we never got an answer".
     pub failure: Option<String>,
+    /// Structured recovery classification. Never inferred from `failure` text.
+    pub failure_kind: Option<WorkerFailureKind>,
+    /// Remaining work supplied as structured data with a quota failure.
+    pub remaining_work: Option<String>,
 }
 
 impl WorkerOutcome {
@@ -192,6 +209,8 @@ pub enum WorkerEvent {
         kind: String,
         pid: u32,
     },
+    /// The ACP session confirmed the requested model before prompting.
+    ModelConfirmed { model: String },
     /// Progress. `source` is the worker's own category normalised: `agent_message`, `tool_call`,
     /// `plan`, `status`.
     Progress {
@@ -217,6 +236,7 @@ impl WorkerEvent {
     pub fn kind(&self) -> EventKind {
         match self {
             WorkerEvent::Started { .. } => EventKind::WorkerStarted,
+            WorkerEvent::ModelConfirmed { .. } => EventKind::WorkerModelConfirmed,
             WorkerEvent::Progress { .. } => EventKind::WorkerProgress,
             WorkerEvent::PermissionAsked { .. } => EventKind::PermissionRequested,
             WorkerEvent::Settled(_) => EventKind::WorkerSettled,
@@ -230,6 +250,7 @@ impl WorkerEvent {
             WorkerEvent::Started { worker, kind, pid } => {
                 format!("worker {worker} ({kind}) started as pid {pid}")
             }
+            WorkerEvent::ModelConfirmed { model } => format!("{model:?}"),
             WorkerEvent::Progress { seq, source, text } => format!("#{seq} {source}: {text}"),
             WorkerEvent::PermissionAsked { request, answer } => {
                 let verdict = match answer {
@@ -451,6 +472,8 @@ mod tests {
             stdout_bytes: 900,
             output_dir: None,
             failure: None,
+            failure_kind: None,
+            remaining_work: None,
         };
         assert!(outcome.ended_cleanly());
         // The claim is still only a claim; nothing here decides the task's result.

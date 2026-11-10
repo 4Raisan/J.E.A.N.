@@ -116,6 +116,7 @@ fn a_worker_that_never_answers_is_ended_by_its_deadline_and_leaves_no_descendant
         args: vec![script.display().to_string()],
         enabled: true,
         model: String::new(),
+        free_fallback: false,
         env_passthrough: Vec::new(),
         capability: "agent.delegate".to_owned(),
         sandbox: "workspace-write".to_owned(),

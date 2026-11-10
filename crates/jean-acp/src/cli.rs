@@ -248,6 +248,8 @@ fn settled(
         stdout_bytes: counted.get(),
         output_dir,
         failure,
+        failure_kind: None,
+        remaining_work: None,
     }
 }
 

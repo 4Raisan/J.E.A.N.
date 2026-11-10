@@ -58,8 +58,9 @@ use agent_client_protocol::{Agent, ByteStreams, Client, Dispatch};
 
 use crate::contract::{
     Bounds, EventSink, PermissionAnswer, PermissionHost, PermissionOffer, PermissionRequest,
-    RunSpec, WorkerAction, WorkerEvent, WorkerOutcome, STOP_CANCELLED, STOP_END_TURN, STOP_FAILED,
-    STOP_MAX_TOKENS, STOP_MAX_TURN_REQUESTS, STOP_REFUSED, STOP_TIMEOUT,
+    RunSpec, WorkerAction, WorkerEvent, WorkerFailureKind, WorkerOutcome, STOP_CANCELLED,
+    STOP_END_TURN, STOP_FAILED, STOP_MAX_TOKENS, STOP_MAX_TURN_REQUESTS, STOP_REFUSED,
+    STOP_TIMEOUT,
 };
 use crate::error::{Result, WorkerError};
 use crate::frames::{BoundedRead, BoundedWrite, FrameCount, Heartbeat, SharedPipe, WireTrace};
@@ -100,6 +101,8 @@ pub fn run(
             &counted,
             bounds,
             Some("the event sink closed before the worker started".to_owned()),
+            None,
+            None,
         ));
     }
 
@@ -202,14 +205,22 @@ pub fn run(
         Ok(flow) => flow.events,
         Err(_) => 0,
     };
-    let (stop_reason, claim, failure) = match ended {
-        Ok(flow) => (flow.stop_reason, flow.claim, flow.failure),
+    let (stop_reason, claim, failure, failure_kind, remaining_work) = match ended {
+        Ok(flow) => (
+            flow.stop_reason,
+            flow.claim,
+            flow.failure,
+            flow.failure_kind,
+            flow.remaining_work,
+        ),
         Err(SessionEnd::Abnormal(e)) => (
             // A session that ended abnormally says so. This is what separates "the agent did the work
             // and it did not pass" from "we never got an answer".
             abnormal_stop_reason(&spec.cancel).to_owned(),
             None,
             Some(format!("the ACP session ended abnormally: {e}")),
+            None,
+            None,
         ),
         Err(SessionEnd::Expired) => (
             if spec.cancel.load(Ordering::Relaxed) {
@@ -224,6 +235,8 @@ pub fn run(
                  and nothing about its turn was observed",
                 budget.as_secs().max(1)
             )),
+            None,
+            None,
         ),
     };
 
@@ -235,6 +248,8 @@ pub fn run(
         &counted,
         bounds,
         failure,
+        failure_kind,
+        remaining_work,
     ))
 }
 
@@ -281,6 +296,8 @@ struct Flow {
     claim: Option<String>,
     events: usize,
     failure: Option<String>,
+    failure_kind: Option<WorkerFailureKind>,
+    remaining_work: Option<String>,
 }
 
 /// How a session that never produced a turn-report ended.
@@ -395,6 +412,15 @@ where
     H: PermissionHost + ?Sized,
     S: EventSink + ?Sized,
 {
+    if spec.worker.kind == "acp"
+        && spec.worker.name.eq_ignore_ascii_case("opencode")
+        && spec.worker.model.trim().is_empty()
+    {
+        return Err(refusal(
+            "OpenCode ACP requires an exact model ID before a task prompt can be sent; set [delegation.workers].model in jean.toml (for example, opencode/beam-free).",
+        ));
+    }
+
     let mut initialize = InitializeRequest::new(ProtocolVersion::V1);
     // Built from `Default` and then set, because both capability structs are `#[non_exhaustive]`:
     // a schema field added later is a compile error here rather than a silent omission.
@@ -415,7 +441,33 @@ where
 
     cx.build_session(spec.request.workspace.as_path())
         .block_task()
-        .run_until(async move |SessionSetup { mut session, .. }| {
+        .run_until(async |SessionSetup { mut session, response, .. }| {
+            use agent_client_protocol::v1::schema::{
+                SessionConfigKind, SessionConfigOptionCategory, SetSessionConfigOptionRequest,
+            };
+
+            let requested = spec.worker.model.as_str();
+            if !requested.is_empty() {
+                let option = response.config_options.as_deref().unwrap_or_default().iter()
+                    .find(|option| option.category == Some(SessionConfigOptionCategory::Model))
+                    .ok_or_else(|| refusal("ACP agent does not expose a model selector. Use an agent that supports ACP session configuration."))?;
+                let selected = cx.send_request(SetSessionConfigOptionRequest::new(
+                    session.session_id().clone(), option.id.clone(), requested,
+                )).block_task().await?;
+                let mut matching = selected.config_options.iter()
+                    .filter(|confirmed| confirmed.id == option.id);
+                let confirmed = matching.next().and_then(|confirmed| match &confirmed.kind {
+                    SessionConfigKind::Select(select) => Some(select.current_value.0.as_ref()),
+                    _ => None,
+                });
+                if confirmed != Some(requested) || matching.next().is_some() {
+                    return Err(refusal(&format!(
+                        "ACP did not confirm requested model {requested:?} (reported {confirmed:?}). Check the worker's model ID and ACP support."
+                    )));
+                }
+                state.emit(WorkerEvent::ModelConfirmed { model: requested.to_owned() });
+                tracing::info!(model = requested, "ACP worker confirmed the requested model");
+            }
             session.send_prompt(&spec.request.prompt)?;
             let mut flow = Flow::default();
             loop {
@@ -433,6 +485,10 @@ where
                                 }
                                 Err(error) => {
                                     flow.stop_reason = STOP_FAILED.to_owned();
+                                    let (failure_kind, remaining_work) =
+                                        classify_recovery_error(&error.data);
+                                    flow.failure_kind = failure_kind;
+                                    flow.remaining_work = remaining_work;
                                     flow.failure = Some(format!(
                                         "the agent answered the prompt with an error: {error}"
                                     ));
@@ -1079,6 +1135,8 @@ fn outcome(
     counted: &FrameCount,
     bounds: &Bounds,
     failure: Option<String>,
+    failure_kind: Option<WorkerFailureKind>,
+    remaining_work: Option<String>,
 ) -> WorkerOutcome {
     WorkerOutcome {
         stop_reason,
@@ -1088,6 +1146,8 @@ fn outcome(
         stdout_bytes: counted.get(),
         output_dir: bounds.output_dir.clone(),
         failure,
+        failure_kind,
+        remaining_work,
     }
 }
 
@@ -1098,6 +1158,35 @@ fn clip(text: &str, max_chars: usize) -> String {
     }
     let kept: String = text.chars().take(max_chars).collect();
     format!("{kept}… (+{} chars)", count - max_chars)
+}
+
+fn classify_recovery_error(
+    data: &Option<serde_json::Value>,
+) -> (Option<WorkerFailureKind>, Option<String>) {
+    let Some(data) = data.as_ref() else {
+        return (None, None);
+    };
+    let kind = match data.get("kind").and_then(serde_json::Value::as_str) {
+        Some("quota_exhausted") => WorkerFailureKind::QuotaExhausted,
+        Some("context_exhausted") => WorkerFailureKind::ContextExhausted,
+        Some("sign_in_expired") => WorkerFailureKind::SignInExpired,
+        Some("network_unavailable") => WorkerFailureKind::NetworkUnavailable,
+        _ => return (None, None),
+    };
+    let remaining = data
+        .get("remaining_work")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 16 * 1024)
+        .map(str::to_owned);
+    if matches!(
+        kind,
+        WorkerFailureKind::QuotaExhausted | WorkerFailureKind::ContextExhausted
+    ) && remaining.is_none()
+    {
+        return (None, None);
+    }
+    (Some(kind), remaining)
 }
 
 #[cfg(test)]
@@ -1314,6 +1403,45 @@ mod tests {
             kind_name(PermissionOptionKind::RejectAlways),
             "reject_always"
         );
+    }
+
+    #[test]
+    fn quota_failure_requires_exact_structured_data_not_error_text() {
+        let quota = Some(serde_json::json!({
+            "kind": "quota_exhausted",
+            "remaining_work": "finish the second file"
+        }));
+        assert_eq!(
+            classify_recovery_error(&quota),
+            (
+                Some(WorkerFailureKind::QuotaExhausted),
+                Some("finish the second file".to_owned())
+            )
+        );
+        let context = Some(serde_json::json!({
+            "kind": "context_exhausted",
+            "remaining_work": "finish the second file"
+        }));
+        assert_eq!(
+            classify_recovery_error(&context).0,
+            Some(WorkerFailureKind::ContextExhausted)
+        );
+        let sign_in = Some(serde_json::json!({"kind": "sign_in_expired"}));
+        assert_eq!(
+            classify_recovery_error(&sign_in).0,
+            Some(WorkerFailureKind::SignInExpired)
+        );
+        let network = Some(serde_json::json!({"kind": "network_unavailable"}));
+        assert_eq!(
+            classify_recovery_error(&network).0,
+            Some(WorkerFailureKind::NetworkUnavailable)
+        );
+        let unknown = Some(serde_json::json!({
+            "message": "UnknownError: Unexpected server error"
+        }));
+        assert_eq!(classify_recovery_error(&unknown), (None, None));
+        let missing = Some(serde_json::json!({"kind": "quota_exhausted"}));
+        assert_eq!(classify_recovery_error(&missing), (None, None));
     }
 
     #[test]
