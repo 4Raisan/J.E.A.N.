@@ -5107,3 +5107,678 @@ needs a terminal, and the transcript-only read means a spoken phrase can be *sho
 confirmation before anything is submitted — which is the shape a handoff review wants, and is not
 the same thing as the existing auto-submit path.
 
+## 66. Luna delivery pass — 2026-11-08
+
+This section supersedes the earlier “Milestone 5.5 is next” notes for the work below. It does not
+claim that the remaining delivery plan is complete. Start disk space was **2,952,499,200 bytes**;
+after the focused checks it was **2,367,934,464 bytes**. Tracked files were clean at entry. The
+untracked operator directories `.qoder/` and `tools/voice-tester/config/` were preserved.
+
+### 66.1 Owner handoff and checkpoint path
+
+* Added `jean goal <goal> [--worker NAME]` as the short owner entry point by aliasing the existing
+  `jean delegate` command; it retains the same policy, isolation, baseline check and independent
+  post-check. `cargo check -p jean-cli --locked --offline -j 2` exited **0**.
+* The structured ACP fixture in `crates/jean-core/tests/delegation_live.rs` uses a temporary Git
+  workspace and isolated JEAN data/config directory. Its verification command is configured by the
+  fixture, outside the worker session. The baseline check reports `not_proven`; the fixture asks JEAN
+  to write exactly `JEAN_OWNER_HANDOFF_OK`; the post-check reports `proven`; and the task row keeps
+  `outcome = succeeded`. The test also reads back the saved checkpoint and confirms the verdict and
+  settled state. `cargo test -p jean-core --test delegation_live --locked --offline -j 2` exited **0**
+  (2 passed).
+* An explicit OpenCode CLI probe used `opencode run --pure --format json --model
+  opencode/qwen3.8-flash-free --dir <scratch> ...`. `opencode models` listed that free model, but the
+  actual run returned OpenCode `UnknownError` / “Unexpected server error. Check server logs for details” and
+  exit **1**. Therefore a live OpenCode session and applied-model confirmation remain unproven; no
+  coding prompt was sent through that failed session. The fixture proves JEAN's ACP handoff and
+  independent verification only.
+* Checkpoints are now written before the worker may act and settled after JEAN verifies. Task IDs are
+  validated without lossy filename mapping; fields, result count and total file size are bounded;
+  standard secret patterns are redacted; writes use a flushed same-directory temp file and atomic
+  replacement. `jean checkpoint <task-id>` reads and displays saved state; a child test process
+  independently restored the checkpoint bytes. An uncertain state explicitly requires workspace/task
+  reconciliation before retry. Focused checks: `cargo test -p jean-core owner::tests --lib --locked
+  --offline -j 2` exited **0** (3 passed, including the fresh-process restore), and `cargo check
+  -p jean-cli --locked --offline -j 2` exited **0**. The CLI wrapper itself was compile-checked, not
+  separately invoked against a real task database.
+* Recovery is **partial**. There is no automatic evidence reconciliation, quota/context fallback,
+  free-worker eligibility routing, duplicate-effect simulation, or resumable state for missing sign-in,
+  network loss or low disk. The checkpoint refuses to imply that uncertain work can be replayed.
+
+### 66.2 Personalization
+
+Scoped “quick prototype” and “polished UI” profiles, different generated acceptance checks, repeated-
+feedback preference candidates, and learning controls were **not implemented in this pass**. Existing
+explicit facts/preferences are not evidence of automatic candidate learning. Explicit-instruction
+precedence across those profiles remains unverified.
+
+### 66.3 Native speech comparison
+
+Added `tools/voice-tester/compare-asr.ps1` and documented its input contract in `docs/voice-assets.md`.
+It is a measurement harness for the same manifest recordings across two isolated configurations;
+it records transcript/term matches, command-to-transcript time and sampled peak working set. Its
+PowerShell parser check exited **0**. It does not claim live microphone release-to-text latency.
+
+The comparison is **not runnable yet**: the current voice worker supports the streaming Zipformer
+path but has no Parakeet TDT offline model-family config or recognizer. The operator must provide
+consented owner recordings plus a `wav,expected,terms` CSV, and the code still needs the offline
+Parakeet adapter and its isolated configuration path. No recognizer was promoted. Kokoro output and
+typed/Wispr input were left unchanged.
+
+### 66.4 Decision helpers
+
+No optional selector was benchmarked or adopted. Deterministic quota/context/disk routing, an allowed
+action-ID selector contract, identical-input accuracy/resource measurements, and abstention behavior
+remain open. No model answer was given authority.
+
+### 66.5 Reliability and packaging
+
+* Added `concurrent_first_open_serializes_schema_migrations`, with eight concurrent openers on a new
+  SQLite file. The first run exposed `SQLITE_BUSY` at `PRAGMA journal_mode` before the already-
+  transactional migrations. `from_connection` now retries only `BUSY`/`LOCKED` for the configured
+  connection timeout. The same command then passed: `cargo test -p jean-store --lib
+  concurrent_first_open_serializes_schema_migrations --locked --offline -j 2`, exit **0** (1 passed).
+* `cargo test -p jean-core --test browser_live --locked --offline -j 2` exited **0** (4 passed); the
+  browser fixture asserted no disposable profile remained after teardown.
+* Source inspection found `jean-tray` currently creates menu labels but does not consume menu events;
+  “Quit” is not wired to exit. `jean-elevated` remains a narrow refusal stub. The Inno Setup file
+  requests admin install and copies the three release executables, but no installer execution,
+  elevation exercise, or uninstall rehearsal was run. The tray behavior was not fixed here.
+* Existing dependency/model license notes remain in `PLANNING/03-DEPENDENCIES.md` and
+  `docs/voice-assets.md`; a fresh redistribution audit was not completed. The required clean Windows
+  install/uninstall rehearsal remains pending.
+
+### 66.6 Check ledger and closeout limits
+
+| Check | Result |
+|---|---|
+| `cargo test -p jean-core owner::tests --lib --locked --offline -j 2` | **0**, 3 passed; one child process restored a saved checkpoint |
+| `cargo test -p jean-core --test delegation_live --locked --offline -j 2` | **0**, 2 passed |
+| `cargo test -p jean-store --lib concurrent_first_open_serializes_schema_migrations --locked --offline -j 2` | First attempt **101** (`SQLITE_BUSY` at `journal_mode`); after fix **0**, 1 passed |
+| `cargo test -p jean-core --test browser_live --locked --offline -j 2` | **0**, 4 passed |
+| `cargo check -p jean-cli --locked --offline -j 2` | **0** |
+| Rustfmt check on touched Rust files with `skip_children=true` | **0** |
+| `cargo fmt --check` across the workspace | **1**; reports formatting differences in unrelated existing files including `apps/jean-tray`, `crates/jean-core/src/browser.rs` and `crates/jean-windows/src/ocr.rs`. They were not reformatted as part of this delivery. |
+| `opencode models` | **0**; free-model catalog entry observed |
+| Explicit OpenCode free-model run | **1**; upstream “Unexpected server error” |
+
+No full workspace suite was started: with about **2.21 GiB** free, a broad Windows test/link pass risks
+crossing the disk floor, and no generated artifacts or caches were removed. No commits, pushes or
+publication were made. The remaining work is the recovery/fallback path, observable profiles and
+preference learning, Parakeet recognizer/config and consented corpus measurements, decision routing,
+tray/elevation fixes, and a clean Windows install/uninstall rehearsal.
+
+## 67. Resumable owner handoff — 2026-11-08
+
+This batch implements one recoverable quota handoff through the existing `jean goal` / `jean
+delegate` path. It stops after the two requested workspace outcomes; it does not complete context
+exhaustion recovery, personalization, speech, decision helpers, tray, or packaging.
+
+* ACP quota exhaustion is classified only when the protocol error contains the exact structured
+  shape `data.kind = "quota_exhausted"` and a bounded nonempty `data.remaining_work`. Error text,
+  including `UnknownError` and “Unexpected server error,” is never used as quota evidence.
+* A settled quota checkpoint now records the workspace, remaining work, completed regular-file
+  paths and SHA-256/length snapshots, explicitly configured `free_fallback` workers, attempted
+  workers, and one maximum replacement attempt. Checkpoint task IDs are validated; fields and total
+  size are bounded and redacted; saves use a flushed same-directory temporary file and atomic
+  replacement. `jean checkpoint <id>` displays the remaining work, effect snapshots, worker choices,
+  retry count and JEAN verdict. `jean goal` is an alias of `jean delegate`, and its report exposes
+  the task ID needed by `jean resume <id>`.
+* Resume restores state in a new CLI process and reconciles the actual Git dirty-path set and saved
+  content hashes before selecting a replacement. It accepts only an enabled worker explicitly marked
+  free-eligible and not already attempted, persists the one-attempt reservation before starting that
+  worker, passes only checkpointed remaining work, and runs the delegation's configured independent
+  verification. The fixture captured the beta ACP prompt and confirmed it contained stage two and
+  not the original stage-one goal. Reconciliation failure reports `needs_attention` without
+  starting another worker.
+* Focused Windows evidence used the installed VS 2022 x64 developer environment, `CARGO_INCREMENTAL=0`,
+  `--locked --offline -j 2`, and local Node/Git fixtures. `cargo test -p jean-cli --test owner_resume
+  --locked --offline -j 2` exited **0** (2 passed): one fixture observed a first file written once,
+  a structured quota checkpoint, fresh-process beta continuation and a passing independent check;
+  the other changed the checkpointed file and observed `needs_attention` with no beta start. The
+  report and checkpoint exposed the task verdict and retry evidence.
+* `cargo test -p jean-acp quota_failure_requires_exact_structured_data_not_error_text --lib --locked
+  --offline -j 2` exited **0** (1 passed), including rejection of an error whose text alone says
+  “UnknownError: Unexpected server error.” `cargo test -p jean-core owner::tests --lib --locked
+  --offline -j 2` exited **0** (3 passed; one child process restored saved state).
+  `cargo test -p jean-core --test delegation --locked --offline -j 2` exited **0** (21 passed).
+* The first full fixture compile attempt exited **101** because the new eligibility field was placed
+  in the wrong config struct and SHA-256 formatting assumed `LowerHex`; both were corrected before
+  the passing runs. The first process fixture iterations also exposed missing task-ID/remaining-work
+  CLI visibility; those were added and the final fixture passed.
+
+### 67.1 Recovery gaps and operator requirements
+
+Only this structured quota signal has a replacement path. Context exhaustion, sign-in expiry,
+network loss, low disk, worker crash, and verification infrastructure failure have no automatic
+continuation routing yet. If a process stops after the replacement attempt is reserved, JEAN leaves
+the checkpoint non-resumable/uncertain for human review; it does not guess whether the worker acted.
+The Git reconciliation intentionally fails closed on workspace changes outside the exact saved
+effect set. The local fixture validates JEAN's ACP contract and CLI path, not compatibility with a
+live OpenCode/vendor endpoint; no live endpoint was contacted in this batch. No full workspace suite
+was run because this slice called for focused checks only. No commits or pushes were made.
+
+| Focused command (run from the VS x64 developer environment) | Result |
+|---|---|
+| `cargo test -p jean-cli --test owner_resume --locked --offline -j 2` | **0**, 2 passed |
+| `cargo test -p jean-acp quota_failure_requires_exact_structured_data_not_error_text --lib --locked --offline -j 2` | **0**, 1 passed |
+| `cargo test -p jean-core owner::tests --lib --locked --offline -j 2` | **0**, 3 passed |
+
+## 69. Explicit owner profiles — 2026-11-09
+
+Started the first explicit profile slice. `jean goal`/`jean delegate` now accepts `--profile
+quick-prototype|polished-ui` and optional `--instruction`. The profile is translated into worker-only
+acceptance guidance attached to the task goal, so the existing task status exposes the selected
+profile and effective guidance. An explicit “no animation” instruction replaces the polished
+profile's motion preference. The existing resolved verification command and verdict path are not
+changed by profiles.
+
+Disk at entry was **2,129,682,432 bytes free**. The installed VS 2022 x64 developer environment,
+`CARGO_INCREMENTAL=0`, and locked offline Cargo were used. `cargo check -p jean-cli --locked --offline
+-j 2` exited **0**. Touched Rust files were formatted.
+
+This slice is **not yet demonstrated**: the requested same-workspace structured-worker run for both
+profiles and the explicit override, plus assertions that configured checks still run, has not been
+implemented or executed. The behavior currently has only compile evidence. Do not treat this entry
+as acceptance evidence for profile precedence or task-status display. The next focused action is to
+add process-level profile fixtures to `apps/jean-cli/tests/owner_resume.rs`, capture each worker
+prompt, inspect `jean task <id>`, and prove the configured verifier still controls the verdict; then
+record those command results here. Learned preferences, speech, and packaging remain deferred.
+| `cargo test -p jean-core --test delegation --locked --offline -j 2` | **0**, 21 passed |
+
+## 68. Recovery routing — 2026-11-08
+
+This slice extends the quota handoff without changing its checkpoint, reconciliation, or independent
+verification model. Disk at entry was **2,251,231,232 bytes free**; focused tests ran with the VS 2022
+x64 developer environment, `CARGO_INCREMENTAL=0`, and locked offline Cargo. No live provider was
+used.
+
+* ACP failure classification now accepts only explicit structured `data.kind` markers for
+  `quota_exhausted`, `context_exhausted`, `sign_in_expired`, and `network_unavailable`. Quota and
+  context markers require bounded nonempty `remaining_work`; message text is not classified.
+  Context exhaustion uses the existing fresh-session, remaining-work resume path and retains the
+  single replacement limit.
+* Sign-in and network failures produce distinct checkpoint/CLI statuses and preserve the remaining
+  work and workspace evidence. `jean resume <id>` starts no worker while either blocker remains;
+  after the operator signs in or restores network access, `--condition-cleared` acknowledges that
+  remediation and permits the single eligible replacement attempt.
+* Before reserving a replacement, JEAN now checks available bytes on both the workspace and data
+  volumes with the Windows free-space API against `[delegation] resume_min_free_disk_bytes` (default
+  512 MiB). Low disk returns `blocked_low_disk`, keeps `resumable=true`, and does not consume the
+  attempt. The fixture repeatedly blocked at a deliberately raised threshold, then resumed after
+  lowering it.
+* Interrupted replacement reservations remain `uncertain=true` and non-resumable. `jean resume`
+  returns human review without rewriting that checkpoint, clearing the reservation, or starting a
+  worker. Unknown structured markers and error text remain unclassified.
+* `cargo test -p jean-cli --test owner_resume --locked --offline -j 2` exited **0** (6 passed):
+  context exhaustion after a partial edit resumed in a fresh process with only remaining work and no
+  duplicate edit; quota and conflicting-workspace cases still passed; sign-in, network and low-disk
+  blockers preserved state without starting beta; and an interrupted reservation stayed uncertain.
+* `cargo test -p jean-acp quota_failure_requires_exact_structured_data_not_error_text --lib --locked
+  --offline -j 2` exited **0** (1 passed). `cargo test -p jean-core --test config_files --locked
+  --offline -j 2` exited **0** (12 passed), including exact shipped-default/schema parity.
+  `cargo test -p jean-core --test delegation --locked --offline -j 2` exited **0** (21 passed).
+  `cargo test -p jean-core owner::tests --lib --locked --offline -j 2` exited **0** (3 passed,
+  including fresh-process restore). Touched-file rustfmt and `git diff --check` also passed.
+
+### 68.1 Remaining recovery gaps
+
+Sign-in and network state are external conditions JEAN cannot independently inspect; proceeding
+after remediation relies on the operator's explicit `--condition-cleared` acknowledgement. The
+fixtures exercise structured protocol markers, not provider-specific live responses. Disk free-space
+checking is implemented for Windows; unsupported platforms or an inaccessible volume report
+`blocked_disk_check_unavailable` and do not start a worker. If a process exits after replacement
+reservation, JEAN intentionally stops for human reconciliation; there is not yet an automated command
+to resolve that uncertain state. Other unknown errors remain unclassified and require review. The
+full workspace suite and later personalization, speech, and packaging slices were not run.
+
+| Focused command | Result |
+|---|---|
+| `cargo test -p jean-cli --test owner_resume --locked --offline -j 2` | **0**, 6 passed |
+| `cargo test -p jean-acp quota_failure_requires_exact_structured_data_not_error_text --lib --locked --offline -j 2` | **0**, 1 passed |
+| `cargo test -p jean-core --test config_files --locked --offline -j 2` | **0**, 12 passed |
+| `cargo test -p jean-core --test delegation --locked --offline -j 2` | **0**, 21 passed |
+| `cargo test -p jean-core owner::tests --lib --locked --offline -j 2` | **0**, 3 passed |
+
+
+## 70. Explicit profile verification — 2026-11-09
+
+Completed the profile acceptance fixtures using the existing scratch Git workspace and structured ACP worker. `cargo test -p jean-cli --test owner_resume --locked --offline -j 2` exited **0** (8 passed). The new cases ran the same frontend goal under quick-prototype and polished-ui, captured distinct worker guidance, and inspected `jean task <id>` for the selected profile and effective criteria. The polished-ui `--instruction "no animation"` case showed the explicit override in both task status and worker prompt with no contradictory motion guidance.
+
+The fixture's verifier is configured in the isolated JEAN data directory, outside the Git workspace and worker-controlled project files. Its external run marker showed both baseline and post-worker checks for every successful profile case. A negative case had the worker end cleanly while JEAN's post-worker check failed; CLI reported `failed` and exited **1**. The profile text remains worker guidance and does not change the configured verification command or verdict rule.
+
+The focused command used the VS 2022 x64 developer environment, `CARGO_INCREMENTAL=0`, and locked offline Cargo. Touched Rust formatting and `git diff --check` passed. No learned-preference, personalization, speech, or packaging work was done in this slice.
+
+## 71. Workspace-scoped learned preferences — 2026-11-09
+
+Added the first inspectable learned preference, `no animation`, through `jean preference`:
+
+* `jean preference feedback <workspace> <task-id> no-animation|animation` records explicit
+  operator feedback. Feedback is keyed by the canonical workspace and validated task ID; a worker
+  result cannot create feedback. Repeated positive feedback on two distinct tasks produces a visible
+  candidate with task evidence. `status`, `accept`, `correct`, `forget`, and `learning --enabled
+  true|false` provide inspect, approval, correction, deletion, and per-workspace learning controls.
+* Accepted preferences apply to future `jean goal` guidance in their workspace, including goals without
+  a named profile. Another workspace does not inherit them. Explicit task instructions replace
+  conflicting preference guidance. The configured verifier remains independent and controls success.
+* The structured CLI fixture used one scratch Git workspace and isolated JEAN data directory. It
+  recorded feedback on two distinct recorded task IDs, rejected an unknown task ID, inspected the
+  candidate evidence, accepted it, verified learned guidance in an unprofiled goal and task status,
+  then checked profile guidance and a conflicting explicit `allow animation` instruction. Learning
+  off kept the accepted preference active while rejecting new feedback. The fixture exercised
+  correction, confirmed another workspace received no preference, then
+  forgot the preference and confirmed it stopped applying. The verifier was configured outside the
+  worker-controlled workspace and ran around the goals.
+* Checks ran with the VS 2022 x64 developer environment and `CARGO_INCREMENTAL=0`. `cargo check -p
+  jean-cli --offline -j 2` exited **0** to update the lockfile for the new direct `serde` dependency;
+  the final `cargo test -p jean-cli --test owner_resume --locked --offline -j 2` exited **0** (9
+  passed), including the existing profile, verifier, recovery and blocker fixtures and the new learned
+  preference scenario. `cargo check -p jean-cli --locked --offline -j 2` exited **0**. The first
+  locked test attempt correctly refused the stale lockfile; the local
+  offline check updated dependency metadata before the final locked test. An initial fixture run also
+  exposed Clap's default bool flag parsing; the workspace toggle now takes an explicit
+  `--enabled true|false` value. Touched Rust files were formatted with `rustfmt --edition 2024`.
+* `git diff --check` is currently affected by CRLF whitespace already present in the accumulated
+  `IMPLEMENTATION_STATUS.md` worktree edits. No broad suite was run. No live provider was used.
+
+Remaining gaps: only the `no animation` preference is modeled; there is no generalized preference
+schema or feedback UX in the typed/Wispr interaction surface. The focused fixture verifies the normal
+CLI commands, not a live operator session. Learned preferences remain workspace-local in JEAN data
+state and are not synchronized between machines.
+
+## 72. Offline Parakeet comparison path — 2026-11-09
+
+Implemented an explicit offline Parakeet recognizer alongside the unchanged default Zipformer:
+
+* Added `[voice].recognizer = "zipformer" | "parakeet_tdt_v2_int8"`; the compiled and shipped default remains Zipformer. The separate `[voice.models.parakeet]` encoder/decoder/joiner/tokens keys prevent accidental mixing of bundles. Parakeet configuration requires 16 kHz. `jean voice doctor` now reports the selected recognizer and the selected family's asset keys.
+* The worker's existing `Recognizer` interface and `jean voice transcribe` WAV parser/resampler are reused. Zipformer remains streaming. Parakeet buffers one capture up to `voice.capture_timeout_ms`, then runs pinned sherpa-onnx 2.0.1 `OfflineRecognizer` with the documented Nemo transducer model type on CPU. Kokoro/VITS synthesis and typed/Wispr input paths were not changed. Transcribe output now includes `offline_processing_ms` (engine creation/model load, PCM resampling, inference/finalization after WAV parsing); this is explicitly separate from live release-to-text latency.
+* Missing Parakeet files report the specific `voice.models.parakeet.*` keys. A native model creation failure identifies the selected Parakeet family, bundle compatibility requirement, and `docs/voice-assets.md` §2b.
+* Extended `tools/voice-tester/compare-asr.ps1`: requires an explicit sherpa-enabled `VoiceWorkerExe`; checks each isolated config selects the expected model; accepts one shared manifest corpus; computes word substitutions/deletions/insertions and WER, normalized transcript exact-match, exact phrase-boundary app-name and developer-term matches, worker processing time, command wall time, combined sampled CLI/worker working set, engine confirmation, and errors. `-ValidateOnly` runs config/manifest preflight; `-SelfTest` tests only synthetic scoring and makes no recognition claim.
+* Local assets: the Zipformer bundle exists at `%LOCALAPPDATA%\JEAN\models\sherpa-onnx-streaming-zipformer-en-2023-06-21`; its vendor WAV examples are present (`0.wav`, `1.wav`, `8k.wav`). The Parakeet destination `%LOCALAPPDATA%\JEAN\models\asr\sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8` is absent. No consented operator WAV corpus or manifest was found, so no recognition-quality result or two-model timing is reported. Vendor sample clips were not treated as operator-consented recordings.
+* VS 2022 x64 and `CARGO_INCREMENTAL=0` were used. Disk at the focused build check was about **1.90 GB free**. `cargo test -p jean-protocol --lib parakeet_recognizer_is_explicit_and_requires_its_model_rate --locked --offline -j 2` exited **0** (1 passed); `cargo test -p jean-voice --lib parakeet_reports_its_separate_bundle_and_actionable_missing_keys --locked --offline -j 2` exited **0** (1 passed); `cargo test -p jean-core --test config_files the_shipped_defaults_parse_into_the_configuration_schema --locked --offline -j 2` exited **0** (1 passed). `DOCS_RS=1 cargo check -p jean-voice --features sherpa --locked --offline -j 2` exited **0** and type-checked the adapter against sherpa-onnx 2.0.1; this deliberately skipped native linking and inference.
+* Synthetic harness commands used the temporary fixture directory `C:\Users\4Raisan\AppData\Local\Temp\jean-asr-fixture-49f936b0a6454ebeb1f1b0eb3ad7fb4f`, a one-row fake WAV manifest, and `target\debug\jean.exe` as both executable placeholders. `pwsh -NoProfile -File tools/voice-tester/compare-asr.ps1 -JeanExe target\debug\jean.exe -VoiceWorkerExe target\debug\jean.exe -RecordingsCsv <fixture>\manifest.csv -ZipformerDataDir <fixture>\zip -ParakeetDataDir <fixture>\para -OutputCsv <fixture>\out.csv -SelfTest` exited **0** (synthetic scoring only). The same command with `-ValidateOnly` and matching config selectors exited **0** with no inference. Changing the Parakeet config selector to `zipformer` made `-ValidateOnly` exit **1** with an actionable selector mismatch. No recognition rows were generated.
+* The expanded fixture arguments were: `-JeanExe target\debug\jean.exe -VoiceWorkerExe target\debug\jean.exe -RecordingsCsv C:\Users\4Raisan\AppData\Local\Temp\jean-asr-fixture-49f936b0a6454ebeb1f1b0eb3ad7fb4f\manifest.csv -ZipformerDataDir C:\Users\4Raisan\AppData\Local\Temp\jean-asr-fixture-49f936b0a6454ebeb1f1b0eb3ad7fb4f\zip -ParakeetDataDir C:\Users\4Raisan\AppData\Local\Temp\jean-asr-fixture-49f936b0a6454ebeb1f1b0eb3ad7fb4f\para -OutputCsv C:\Users\4Raisan\AppData\Local\Temp\jean-asr-fixture-49f936b0a6454ebeb1f1b0eb3ad7fb4f\out.csv`. The script invocation was `pwsh -NoProfile -File <absolute workspace path> <arguments> -SelfTest` (exit **0**) and then `... -ValidateOnly` (matching config exit **0**, mismatched Parakeet selector exit **1**).
+* Initial synthetic attempts exposed two fixture-only defects, corrected before the passing runs: the selector test parsed a bare TOML scalar instead of a key/value document, and PowerShell needed parenthesized multidimensional-array indices in the WER dynamic program.
+
+To obtain actual comparison evidence, provide (1) the extracted Parakeet TDT v2 INT8 `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, and `tokens.txt` from one bundle and verify the documented mirror hashes; (2) consented WAV recordings plus a CSV `wav,expected,app_names,developer_terms`; and (3) two isolated `jean.toml` files selecting Zipformer and Parakeet and pointing to each matching bundle. Build a current feature-enabled voice worker against the already provisioned native library (`SHERPA_ONNX_LIB_DIR` and `RUSTFLAGS=-C target-feature=+crt-static`, documented in §6), then run the comparison command in §2b with that worker path. Offline processing figures from that run must remain labeled separately from microphone release-to-text latency.
+
+## 73. Deterministic routing baseline — 2026-11-09
+
+Added a repeatable process-level baseline that drives the production `jean goal` / `jean resume` path against isolated scratch Git workspaces and structured workers. It records the expected action, observed action, match, and local process wall time for each case. Timing is reported separately from decision accuracy; replacement cases include worker execution and the independent verifier, so those numbers are not pure routing-function latency.
+
+| Fixture | Expected action | Observed action | Match | Resume wall time (µs) |
+|---|---|---|---:|---:|
+| Structured quota exhaustion after first edit | Resume once with eligible beta, remaining work only, independent verification passes | Resume once with eligible beta, remaining work only, independent verification passes | yes | 1,646,104 |
+| Structured context exhaustion after first edit | Start fresh beta session, remaining work only, independent verification passes | Start fresh beta session, remaining work only, independent verification passes | yes | 1,710,528 |
+| Sign-in expiry | Pause for sign-in remediation; no replacement | Pause for sign-in remediation; no replacement | yes | 188,620 |
+| Network loss | Pause for network remediation; no replacement | Pause for network remediation; no replacement | yes | 193,594 |
+| Low disk | Pause until disk space is available; preserve retry | Pause until disk space is available; preserve retry | yes | 192,094 |
+| Changed workspace evidence | `needs_attention`; no replacement | `needs_attention`; no replacement | yes | 183,626 |
+| Uncertain replacement reservation | Human review; preserve reservation; no replay | Human review; preserve reservation; no replay | yes | 101,849 |
+| No eligible free worker | Abstain with `needs_attention`; no worker | Abstain with `needs_attention`; no worker | yes | 115,500 |
+| Unknown/unclassified failure | Abstain; no worker | Abstain; no worker | yes | 116,603 |
+
+Decision accuracy was **9/9 (100%)** on these fixed fixtures. The local timings above are individual CLI resume wall times, not selector microbenchmarks. Eligibility, authorization, workspace reconciliation, reservation/replay policy, and verification verdict remain Rust-owned. No optional selector or model dependency was added. This baseline identifies no safe routing decision where a selector is justified; a future selector could only be evaluated as a constrained advisory over legal actions with abstention, while Rust retains all authority and revalidation.
+
+Checks ran through the VS 2022 x64 developer environment with `CARGO_INCREMENTAL=0`, locked offline Cargo, and `-j 2`:
+
+* `cargo test -p jean-cli --test owner_resume production_routing_baseline_records_expected_and_observed_actions --locked --offline -j 2 -- --nocapture` exited **0** (1 passed; baseline 9/9). It printed the per-case timings in the table above.
+* `cargo test -p jean-cli --test owner_resume --locked --offline -j 2` exited **0** (10 passed), retaining the quota/context recovery, sign-in/network/disk blocker, conflict, uncertain reservation, profile, learned preference, and independent-verifier fixtures.
+
+A direct invocation from the initial shell failed because Cargo was not on that shell's PATH (exit 1); rerunning through the installed VS x64 environment and the user Cargo binary succeeded. Disk was checked before compiling and again before the focused binary run; about **1.89 GB** remained free. The only build warning was the pre-existing unused `armed` helper in `crates/jean-core/src/signals.rs`. No live provider was used. Remaining gap: this is a deterministic fixture baseline, not a broad real-world distribution or a comparison against any optional selector.
+
+## 74. Tray Quit lifecycle — 2026-11-09
+
+Wired the native menu's `Quit` item to a stable `muda::MenuEvent` ID and the existing tray event loop. Quit now exits the loop, drops the tray icon/menu, and stops only direct child processes spawned by this tray instance. The task-board action launches the sibling `jean.exe status` directly in a new Windows console and retains its `Child` handle; completed children are reaped during normal event-loop operation. Shutdown does not search for or terminate unrelated JEAN processes. Added a focused test that confirms the rendered menu carries stable Open Task Board and Quit dispatch IDs.
+
+**Build and focused check evidence:** free space was checked before compilation (about **2.62 GB** free). Using the VS 2022 x64 developer environment with `CARGO_INCREMENTAL=0`:
+
+* `cargo test -p jean-tray --locked --offline -j 2` exited **0** (1 passed: stable menu dispatch IDs).
+* `cargo fmt -p jean-tray -- --check` exited **0**.
+* `cargo build -p jean-tray --locked --offline -j 2` exited **0** and produced `target\\debug\\jean-tray.exe`.
+
+**Native menu behavior evidence:** not observed interactively. The desktop helper returned `accessibility window-opened handler did not become ready` when asked to launch this tray-only (no top-level window) executable; a follow-up target-window listing returned no JEAN window, and process inspection found no remaining `jean-tray` process. Therefore the focused build/test demonstrates compilation and stable IDs only; it does not prove a real menu click exits the tray or its child.
+
+**Manual verification still needed:** run `target\\debug\\jean-tray.exe`; locate the JEAN icon in the notification area (including hidden icons), right-click it, and choose **Quit**. Confirm the icon disappears and `jean-tray.exe` exits in Task Manager. To verify child ownership, use **Open task board** to spawn the sibling `jean.exe status`, then select **Quit** while that child is still running and confirm that child exits; also confirm any separately started JEAN process remains running. The ordinary `status` command may finish before the Quit click, in which case its exit is expected and no live child remains to stop. Elevation and installer validation remain separate slices.
+
+## 75. Elevation boundary — 2026-11-09
+
+D-010 and the Phase 6 roadmap describe a future single-operation UAC boundary but specify no supported privileged operation. The existing policy denies elevated operations before approval lookup and now explicitly reports runtime elevation as unsupported. The Inno Setup payload omits the refusal stub. Administrator consent in the installer is for setup.
+
+The reserved helper reads at most 8,193 bytes to enforce an 8 KiB request limit. It returns JSON and exit 5 for unsupported requests, or exit 2 for malformed requests, including unexpected fields. It has no execution or UAC path.
+
+Disk at entry was 2,619,015,168 bytes free. With VS 2022 x64 and CARGO_INCREMENTAL=0, cargo build -p jean-elevated --locked --offline -j 2 and cargo test -p jean-policy --test policy --locked --offline -j 2 both exited 0. All 13 policy tests passed. Direct Windows process probes confirmed exit 5 for a file creation request and format_volume, and exit 2 for a caller-supplied executable field, invalid JSON, and oversized input. The file creation sentinel remained absent in every probe. These checks used ordinary processes. A native UAC test applies only when a supported runtime elevation flow exists. The clean-machine installer rehearsal is pending.
+
+## 76. Windows installer build — 2026-11-09
+
+**Release binaries and installer compilation:** disk was checked before the release build (2,551,996,416 bytes free). VS 2022 Community x64 was found at `C:\Program Files\Microsoft Visual Studio\2022\Community`; the build ran through `Common7\Tools\VsDevCmd.bat -arch=amd64 -host_arch=amd64` with `CARGO_INCREMENTAL=0`. The exact locked/offline command `cargo build --release -p jean-cli -p jean-tray --locked --offline -j 2` exited **0** (release build completed in 20m 04s; an up-to-date rerun exited **0** in 0.61s). Final release outputs:
+
+| Binary | Size (bytes) | Included in installer script |
+|---|---:|---|
+| `target\release\jean.exe` | 16,719,872 | yes |
+| `target\release\jean-tray.exe` | 390,144 | yes |
+| `jean-elevated.exe` | not built for installer | no |
+| `jean-voice.exe` | absent from release output | no |
+| `jean-desktop-worker.exe` | absent from release output | no |
+| `jean-task-worker.exe` | absent from release output | no |
+
+Inno Setup **6.7.3** was found at `C:\Users\4Raisan\AppData\Local\YT-Duo-BuildTools\InnoSetup\ISCC.exe`. `$iscc=C:\Users\4Raisan\AppData\Local\YT-Duo-BuildTools\InnoSetup\ISCC.exe; $out=Join-Path $PWD target\installer; & $iscc "/O$out" /FJEAN-0.1.0-setup tools\install\jean.iss` exited **0**. Compiler output explicitly compressed only the CLI and tray files listed above; the script and compiler log contain no elevation stub or optional worker/model payload. Artifact: `target\installer\JEAN-0.1.0-setup.exe`, **6,954,980 bytes**, SHA-256 `3D265FE23844765AC8CF0A3FD83296F6F9F4CC40FD4B3030CB11002D4B7091CF`. Inno emitted its standard warning that `PrivilegesRequired=admin` is combined with an HKCU registry value; this remains to be checked in a real install context.
+
+**Optional components and build-host availability:** the installer script packages only the two binaries. `target\release\jean.exe voice doctor` reported `the voice worker was not built alongside jean; run cargo build -p jean-voice`; `target\release\jean-voice.exe` and the desktop/task worker sidecars are absent. The local model store has the Zipformer encoder, decoder, joiner, tokens, and sample WAVs; the Parakeet model directory is absent. Kokoro's `model.onnx`, `voices.bin`, `tokens.txt`, and documented lexicon exist locally; VAD does not. These model/native assets are on the development host and are **not in the installer**. `opencode` and `codex` command shims are installed on the build host but are external operator tools, not installer payload. No voice recognition/synthesis capability is claimed for a fresh installer install without building/provisioning its worker and assets.
+
+The built local release CLI (not an installed copy) was exercised with an isolated `JEAN_DATA_DIR` containing a fixture `tier = "elevated"` tool: `target\release\jean.exe exec demo.elevated` exited **5**, reported “Elevation is unsupported in this build,” and said `child never started`. This confirms the release CLI's policy response, not an installed-location run.
+
+**Native install/uninstall rehearsal:** not run. No clean disposable Windows VM could be confirmed: Hyper-V `Get-VM` returned “You do not have the required permission to complete this task”; querying Windows Sandbox feature state also required elevation. No VMware/VirtualBox installation was found in the registered-app inventory. I did not install this admin-requiring setup on the operator's normal machine. Thus there is no observed installed CLI/tray menu/quit, shortcut removal, binary removal, or uninstall-retention result.
+
+**Remaining rehearsal steps:** on a clean disposable Windows VM, run `target\installer\JEAN-0.1.0-setup.exe` and accept its setup UAC prompt; confirm the default `{autopf}\JEAN` install contains `jean.exe` and `jean-tray.exe` only; run `& "$env:ProgramFiles\JEAN\jean.exe" status`; start `& "$env:ProgramFiles\JEAN\jean-tray.exe"`, right-click its notification-area icon, select **Quit**, and confirm its process exits (and any still-running child it launched exits, while a separately launched JEAN process remains). Add an isolated elevated-tier tool to that VM's test `tools.toml`, run `jean exec demo.elevated`, and confirm exit **5**, the unsupported-elevation message, and no child-side sentinel. Uninstall using the installed JEAN uninstaller; confirm installed binaries and Start Menu shortcut are removed. Confirm user data under `%APPDATA%\JEAN` and `%LOCALAPPDATA%\JEAN` remains: `tools/install/jean.iss` has no user-data deletion directive, the settings plan puts config/state outside `{app}`, and `docs/voice-assets.md` §5.2 says `%LOCALAPPDATA%\JEAN` stays as left. Check the HKCU AUMID value in the intended installing user's hive in light of the compiler warning. Native setup/uninstall outcomes remain pending.
+
+## 77. Installer HKCU warning correction — 2026-11-09
+
+### Static findings
+
+The prior installer output directory had no saved compiler log; §76 records the warning from the earlier compiler output. This slice captured the new compiler output in the log listed below.
+
+The compiler warning was caused by the combination of `[Setup] PrivilegesRequired=admin` and the `[Registry]` entry with `Root: HKCU` for `Software\Classes\AppUserModelId\JEAN.Orchestrator`, value `DisplayName=J.E.A.N.`. Inno's `PrivilegesRequired=admin` documentation says that if a standard user supplies a different administrator's credentials, Setup runs under that administrator account. Since HKCU is the account of the running process, the installer wrote the AUMID under the credential-supplying administrator's hive, not necessarily the signed-in user's hive. This is the exact mismatch identified by the warning.
+
+JEAN uses this registry value only to attribute Windows toast notifications to the AUMID. It is not used by the tray menu, CLI startup, or runtime elevation. Shipped `[ui].notifications` defaults to `none`; the user-triggered `jean notify register` path writes the AUMID to the hive of the JEAN process that invoked it and reports the account. The smallest fix removes the installer `[Registry]` entry and updates its comment to say registration remains opt-in through `jean notify register`. `PrivilegesRequired=admin` remains because the install directory is `{autopf}\JEAN`. A manually registered per-user AUMID is outside installer ownership; setup/uninstall do not write or remove it.
+
+### Rebuild evidence
+
+Recompiled against the existing `target\release\jean.exe` and `target\release\jean-tray.exe`; no Cargo build was run. The exact command was `$iscc='C:\Users\4Raisan\AppData\Local\YT-Duo-BuildTools\InnoSetup\ISCC.exe'; $out=Join-Path $PWD 'target\installer'; $log=Join-Path $out 'JEAN-0.1.0-setup.compiler.log'; & $iscc "/O$out" '/FJEAN-0.1.0-setup' 'tools\install\jean.iss' 2>&1 | Tee-Object -FilePath $log`. Exit **0**, “Successful compile”; the previous HKCU/admin warning is absent. Compiler output names only `target\release\jean.exe` and `target\release\jean-tray.exe` as compressed payload. Runtime elevation stub and optional voice/desktop/task workers remain excluded.
+
+New local artifact: `target\installer\JEAN-0.1.0-setup.exe`, **6,954,910 bytes**, SHA-256 `27E44F66FECBCE893D4355CA1FAF88931C9DD338954B55E51EAC03B205DFB82E`. Captured compiler output is at `target\installer\JEAN-0.1.0-setup.compiler.log`. The installer remains local and unpublished.
+
+### Clean-VM checklist — still pending
+
+1. On a disposable clean Windows VM, run the setup and accept the setup UAC prompt. Confirm the installer does not create `HKCU\Software\Classes\AppUserModelId\JEAN.Orchestrator` under either account. Expected: no installer-owned AUMID; an explicit `jean notify register` run later writes only to the account running JEAN.
+2. Confirm `{autopf}\JEAN\jean.exe` and `jean-tray.exe` are installed. Launch the CLI from that directory and run `jean status`.
+3. Launch `jean-tray.exe` from the installed directory, open its notification-area menu, choose **Quit**, and confirm the icon/process exits. Verify only a child the tray itself launched is stopped; a separate JEAN process remains.
+4. Add a test `tier = "elevated"` tool in the VM's isolated JEAN data, run installed `jean exec demo.elevated`, and confirm exit **5**, the runtime-elevation-unsupported message, and no child sentinel.
+5. Uninstall JEAN. Confirm installed binaries and the Start Menu shortcut are removed. Confirm `%APPDATA%\JEAN` configuration and `%LOCALAPPDATA%\JEAN` operator state/models remain. Confirm any AUMID explicitly registered by the user remains, because it was not created or owned by Setup.
+
+### Observed Windows behavior
+
+No install, tray menu, UAC credential substitution, or uninstall was run: there is still no confirmed disposable VM, and the earlier Hyper-V/Sandbox inventory required permissions unavailable in this session. Therefore the account-routing explanation and checklist expectations above are based on script/source inspection and Inno Setup documentation, not a live account-switch observation. Native rehearsal remains pending.
+
+## 78. OpenCode ACP model selection gate — 2026-11-09
+
+Checked free disk first: **458,436,608 bytes** at entry (about 437 MiB); later spot check **457,445,376 bytes**. No build or live provider request was started.
+
+Installed OpenCode is **1.19.5**. `opencode models` exited **0** and listed `opencode/beam-free` (as well as other `-free` catalog entries). This confirms a catalog label only, not account eligibility or the active ACP session model. `opencode run --help` exposes `--model provider/model`, but `opencode acp --help` has no model option; JEAN configures its worker as `command="opencode"`, `args=["acp"]` and the configured `WorkerConfig.model` is not passed to session creation. In `crates/jean-acp/src/acp.rs`, session startup sends ACP `initialize`, ignores its returned `Implementation` as `_agent_info`, builds a workspace session, then sends the prompt. No response or protocol field confirms the selected model. Therefore a JEAN `model="opencode/beam-free"` setting currently does not prove or enforce the active ACP model.
+
+**Result:** stopped before any coding prompt, as required. There is no verified selected model, no confirmed free eligibility for this account, no worker result, file edit, verifier verdict, or task status to report. No provider error occurred because no live request was made. The available free catalog entry alone is insufficient to proceed.
+
+**Implementation/testing gap:** the smallest safe next change is to add a pre-prompt model negotiation/confirmation step in the OpenCode adapter using a supported ACP/OpenCode mechanism; fail closed if the request is rejected, absent, or resolves to a different model. Add local ACP fixtures that assert confirmation permits prompt dispatch and rejected/unconfirmed/mismatched selection prevents dispatch. Do not infer model selection from JEAN config, the catalog, or worker prose. A focused locked offline test was not attempted: at roughly 437 MiB free it is not safe to risk a fresh link/build. After freeing disk, run from the VS 2022 x64 developer environment with `CARGO_INCREMENTAL=0`: `cargo test -p jean-acp --lib opencode_model_selection --locked --offline -j 2` (expected: model-confirmed fixture prompts; rejected, unconfirmed and mismatched fixtures stop before prompt). Then run one small verified scratch-workspace handoff only after both model confirmation and account-specific free eligibility are evidenced.
+
+## 79. Explicit OpenCode ACP model selection — 2026-11-09
+
+JEAN now reads a nonempty ACP worker model setting before dispatching a prompt. It finds the model selector in the session creation response, sends `session/set_config_option` on that same session, and requires the returned selector to confirm the exact requested ID. Rejection, a missing selector or confirmation, and a different ID stop the session before the prompt. Empty model settings retain the existing agent-default behavior.
+
+A prompt-free scratch Git session against installed OpenCode **1.19.5** advertised the `model` selector in `session/new`. It reported `opencode/big-pickle` initially and confirmed `opencode/beam-free` after `session/set_config_option`. The verbose OpenCode catalog reported zero input, output, cache read, and cache write prices for Beam Free.
+
+Disk before the focused build was **451,870,720 bytes** free. With VS 2022 x64 and `CARGO_INCREMENTAL=0`, `cargo test -p jean-acp --lib opencode_model_selection --locked --offline -j 2` exited **0** (1 test, four wire scenarios). A match reached `session/prompt`. RPC rejection, a different model, and missing confirmation stopped before the prompt. Earlier attempts exposed SDK import paths and a non-exhaustive destructure, both fixed before the passing run.
+
+The live JEAN handoff remains pending. The provider's catalog prices and prompt-free session response establish advertised price and selection. Account-specific free inference eligibility was not established, and only **452,067,328 bytes** remained for rebuilding the CLI with the patched adapter. The existing CLI binaries predate the gate. No coding prompt, edit, or verifier run occurred. After freeing disk and confirming account eligibility, build the debug CLI with `cargo build -p jean-cli --bin jean --locked --offline -j 2` and use the isolated scratch Git workspace and independent verifier from the owner handoff setup.
+
+## 80. OpenCode live handoff eligibility gate — 2026-11-09
+
+Checked disk before rebuilding: **14,269,997,056 bytes free**. Using the installed VS 2022 x64 developer environment and `CARGO_INCREMENTAL=0`, ran `cargo build -p jean-cli --bin jean --locked --offline -j 2`; exit **0**. This rebuilt only the `jean` debug CLI with the ACP model-confirmation change. `target\debug\jean.exe --version` exited **0** and reported `jean 0.1.0`.
+
+OpenCode reports version **1.19.5**. `opencode models opencode --verbose` exited **0** and advertises `opencode/beam-free` with input, output, cache-read and cache-write catalog prices all `0`. `opencode auth list` exited **0** and reports configured **OpenCode API** and **OpenCode Go API** credentials, plus Anthropic and Google environment-variable credential slots. It does not identify the signed-in account's Beam Free entitlement, show account-specific billing/usage controls, or establish a free-only account/configuration. No account-side billing or entitlement evidence was available in the local CLI output. Therefore the zero-price model catalog and previous prompt-free ACP selection confirmation still do not prove that inference for this account cannot incur a charge.
+
+**Live handoff result:** stopped before invoking `jean goal`; no task prompt was sent. No scratch workspace was modified, and there is no live worker result, file change, independent verifier verdict, task ID/status, or provider error to report. The specific blocker is missing account-side evidence or an explicitly free-only OpenCode account/configuration proving that `opencode/beam-free` inference is no-charge for this account. Once that evidence is available, use the rebuilt `target\debug\jean.exe` in a clean scratch Git workspace, configure the independent verifier outside the workspace/worker, and perform the requested one-file handoff; record ACP's exact model confirmation before the prompt and the final task status.
+
+## 81. Beam Free account-specific handoff gate — 2026-11-09
+
+Rechecked the latest status (§80), the owner-workflow scratch fixture/config shape in `apps/jean-cli/tests/owner_resume.rs`, and the existing rebuilt `target\debug\jean.exe`. No source relevant to that binary changed, so no rebuild was needed. `opencode --version` reported **1.19.5**. `opencode auth list` exited **0** and shows both **OpenCode API** and **OpenCode Go API** credentials; it does not expose the account/workspace's billing entitlement or usage policy. The installed catalog had previously shown `opencode/beam-free` with zero listed input/output/cache prices, and ACP model selection was confirmed prompt-free in §79.
+
+Current OpenCode documentation says Beam Free is free on OpenCode for a limited time and defines free models as OpenCode/OpenCode Go models with no input price: `https://opencode.ai/docs/console/models` and `https://opencode.ai/docs/models`. This is product/catalog evidence, not a readout of this account's billing status. The current configuration is also not demonstrably free-only because both OpenCode API and OpenCode Go credential entries are present. No authenticated OpenCode Console account/usage page was open in the browser inventory; a read-only account-tab inventory attempt timed out. I therefore cannot satisfy the requested account-specific proof that this account's use of `opencode/beam-free` cannot incur a charge.
+
+**Live handoff result:** stopped before invoking `jean goal`; no prompt was sent. No scratch workspace was created or changed, and there is no live ACP confirmation for this invocation, file edit, independent verifier verdict, CLI exit code, or `jean task` output. No provider request or error occurred. The precise missing evidence is an account/workspace billing or entitlement view showing Beam Free inference is no-charge for the authenticated OpenCode account, or a demonstrably free-only OpenCode configuration that cannot route usage to paid/Go models. After that evidence is available, use the existing `target\debug\jean.exe` and scratch verifier setup for the one-file handoff.
+
+## 82. Credential-isolated live OpenCode handoff — 2026-11-09
+
+### Free-access and isolation evidence
+
+Installed OpenCode is **1.19.5**. Official OpenCode documentation currently says free models need no account, defines them as OpenCode/OpenCode Go models with no input price, and lists Beam Free as free on OpenCode for a limited time: `https://opencode.ai/`, `https://opencode.ai/docs/models`, and `https://opencode.ai/docs/console/models`. The local no-auth catalog command `opencode --pure models opencode --verbose` exited **0** in the isolated profile and listed `opencode/beam-free` with input, output, cache-read and cache-write prices all **0**.
+
+The isolated profile used the documented XDG data/config/cache/state roots plus `OPENCODE_DB`, `OPENCODE_CONFIG`, and `OPENCODE_CONFIG_DIR`. `opencode --pure debug paths` confirmed the config, data, cache and state paths resolved under `C:\Users\4Raisan\AppData\Local\Temp\jean-opencode-isolated-free-7109566c4bec4521af6fea69ed713d01`; `opencode --pure auth list` exited **0** and reported **0 saved credentials** at that temporary profile's auth path. OpenCode API/Go key variables and other provider secret/key variables were absent or removed from the JEAN process environment for this run. The user's normal `%USERPROFILE%` config, OpenCode database and stored credentials were not changed. OpenCode's installed native executable was used directly with `acp --pure`, avoiding the Volta `.cmd`/shell shims.
+
+This establishes a no-account, zero-catalog-price route for this specific model and isolates the handoff from stored OpenCode API and Go credentials. No account credentials were used for the live run.
+
+### Live JEAN goal
+
+Used the existing `target\debug\jean.exe`; no source relevant to it changed, so no rebuild was needed. Created and committed a clean scratch Git baseline at `C:\Users\4Raisan\AppData\Local\Temp\jean-live-handoff-04ccc600401a4bf98ded58630d017faf\workspace`. JEAN state/config and verifier lived separately at `...\jean-data`, outside the worker workspace.
+
+The isolated JEAN config selected worker `opencode`, command `C:\Users\4Raisan\AppData\Local\Volta\tools\image\packages\opencode-ai\node_modules\opencode-ai\bin\opencode.exe`, args `acp --pure`, and exact model `opencode/beam-free`. The user goal was: `Create live-handoff.txt containing exactly the single line JEAN_LIVE_OPENCODE_OK followed by one newline. Do not change any other file.` JEAN's ACP log at `jean-data\logs\jean.log.2026-11-08` records `ACP worker confirmed the requested model model="opencode/beam-free"` at **2026-11-08T21:47:35.781043Z**. The adapter performs this confirmation before `session.send_prompt`.
+
+The independent verifier was configured in JEAN's isolated `jean.toml`, outside the worker workspace. Its baseline accepted the absent target; its post-run check required the exact bytes `JEAN_LIVE_OPENCODE_OK\n`. It exited **0** for both baseline and final verification; `jean-data\verification.log` records `baseline: file absent` and `post: exact=true`.
+
+**Result:** `target\debug\jean.exe goal "Create live-handoff.txt containing exactly the single line JEAN_LIVE_OPENCODE_OK followed by one newline. Do not change any other file." --workspace "C:\Users\4Raisan\AppData\Local\Temp\jean-live-handoff-04ccc600401a4bf98ded58630d017faf\workspace" --worker opencode` exited **0**. The one changed file is `workspace\live-handoff.txt`, with exact contents `JEAN_LIVE_OPENCODE_OK` and one trailing newline. JEAN reported `verification: passed`, `result: succeeded`, and `0 covered, 0 asked, 18 event(s)`. `target\debug\jean.exe task t-18e63027fe18eae8-60ec-0` exited **0** and showed `state succeeded`, `verdict succeeded`, and `the verification passed after the delegation`. Scratch `git status --short` showed only `?? live-handoff.txt`.
+
+The earlier “account-specific evidence missing” stop in §81 is superseded for this run by the official no-account free-model terms, zero-price isolated catalog, and observed zero-credential isolated profile. The scratch workspace and evidence remain in `%TEMP%` for inspection; the operator's normal OpenCode setup was left intact.
+
+## 83. OpenCode ACP blank-model guard — 2026-11-09
+
+The ACP dispatch path now refuses OpenCode workers whose configured model is empty or whitespace-only, with an actionable error directing the operator to `[delegation.workers].model` in `jean.toml` and giving `opencode/beam-free` as an example. The check runs in the shared ACP turn path, so initial delegation and resume both use it. Other ACP worker names retain their intentional agent-default behavior. The shipped OpenCode default remains blank, so attempting it now fails clearly before ACP initialization or task prompt delivery; operators must set a model explicitly. The configured-model exact-ID gate is unchanged.
+
+Added a wire fixture for both an empty string and whitespace-only model. Its peer confirms it receives no ACP bytes, and the returned error names the configuration field. Re-ran the existing four model-selection scenarios: exact match permits prompt dispatch; mismatch, missing confirmation, and RPC rejection stop before prompt dispatch.
+
+Focused check, using VS 2022 x64, `CARGO_INCREMENTAL=0`, locked offline Cargo: `cargo test -p jean-acp --lib opencode_ --locked --offline -j 2` exited **0** (2 tests passed; the model-selection test covers its four wire scenarios and the blank-model test covers empty and whitespace values). The first compile attempt exposed a test-fixture reference to a nonexistent `Wire.tag`; corrected the fixture to identify OpenCode via its blank model and reran successfully. No release rebuild, full suite, live prompt, or change to §82's explicitly configured successful live smoke evidence was made.
+
+The clean Windows installer rehearsal remains pending (§76); no disposable VM run is recorded. The Parakeet corpus comparison remains pending (§72); required model assets and consented WAV corpus were unavailable, and no recognition rows were generated.
+
+## 84. Installer candidate 83 — 2026-11-09
+
+Prepared a new local installer candidate without overwriting the prior `target\installer\JEAN-0.1.0-setup.exe`. Before compiling, `Get-PSDrive C | Select-Object Used,Free` reported about **14,195,535,872 bytes free**. Built the required release payload with the installed VS 2022 x64 developer environment and `CARGO_INCREMENTAL=0`:
+
+* `cargo build --release -p jean-cli -p jean-tray --locked --offline -j 2` — exit **0** (release profile completed in 3m19s). The compiler emitted the existing unused `armed` warning in `crates/jean-core/src/signals.rs`.
+* Compiled `tools\install\jean.iss` with Inno Setup **6.7.3**, directing output to `target\installer-candidate-83` and naming it `JEAN-0.1.0-setup-candidate-83.exe` — exit **0** (“Successful compile”, 9.125 sec; no compiler warnings). Log: `target\installer-candidate-83\JEAN-0.1.0-setup-candidate-83.compiler.log`.
+
+Candidate: `target\installer-candidate-83\JEAN-0.1.0-setup-candidate-83.exe`, **6,960,341 bytes**, SHA-256 **3C5C6C04C8AE8E65ED5EEE23F59DB2161529BE3095B44C1E81FA487C5A398235**. The compiler log confirms the payload compresses `target\release\jean.exe` (**16,738,816 bytes**) and `target\release\jean-tray.exe` (**390,144 bytes**). The script/log contain no runtime elevation stub, voice/model assets, or worker sidecars; the CLI and tray are included. Optional voice recognizer/model assets and external worker executables remain separately provisioned and are not installer payload.
+
+The blank OpenCode model guard was revalidated against the rebuilt workspace source (no prompt was sent): `cargo test -p jean-acp --lib opencode_ --locked --offline -j 2` — exit **0**, 2 passed. The blank/whitespace fixture asserts zero ACP bytes are received and the error names `[delegation.workers].model`; the configured-model selection fixture covers exact confirmation plus mismatch, rejection, and missing confirmation. This is the focused adapter proof that the shipped blank OpenCode default fails before task prompt delivery; no live provider was contacted.
+
+**Clean Windows rehearsal: pending.** No disposable Windows VM was available: `Get-Command vmrun,VBoxManage` found neither tool, and `Get-VM` failed because this account lacks the required permission. No install/uninstall or native tray behavior is claimed. Test this exact candidate on a disposable Windows VM: `target\installer-candidate-83\JEAN-0.1.0-setup-candidate-83.exe`. Checklist: install; launch CLI and tray from installed paths; invoke native tray Quit and confirm the tray and only tray-owned child exit; request runtime elevation and confirm the installed CLI reports it unsupported; uninstall; confirm installed binaries and shortcuts are removed while operator data remains per the documented retention behavior. Expected registry behavior: the installer does not need an HKCU AUMID entry for the CLI or tray; verify the documented uninstall/retention behavior on the VM. Keep the Windows observation distinct from this compile and static payload evidence.
+
+The Parakeet corpus comparison remains pending as recorded in §72; no corpus inference or quality claim was produced in this installer slice.
+
+## 85. Candidate 83 Windows rehearsal availability check — 2026-11-09
+
+Verified the requested existing installer before any launch: `Get-FileHash -LiteralPath target/installer-candidate-83/JEAN-0.1.0-setup-candidate-83.exe -Algorithm SHA256` returned **3C5C6C04C8AE8E65ED5EEE23F59DB2161529BE3095B44C1E81FA487C5A398235**, matching §84; `Get-Item` reported **6,960,341 bytes**.
+
+Read the §84 candidate checklist and checked for a disposable Windows environment. `Get-Command vmrun,VBoxManage,virsh,qemu-system-x86_64 -ErrorAction SilentlyContinue` found no commands. `Get-VM -ErrorAction Stop` failed with “You do not have the required permission to complete this task” (PowerShell command error; no VM inventory available). Per the instruction, **the installer was not run** on the operator host.
+
+**Rehearsal remains pending, all steps unobserved:** Windows version inside the target VM; install; launch `jean.exe` and `jean-tray.exe` from installed paths; native tray Quit and owned-child exit; installed CLI refusal of an elevated request; uninstall; removal of installed binaries and shortcut; retention of `%APPDATA%\\JEAN` and `%LOCALAPPDATA%\\JEAN` operator data. No install, launch, tray, elevation, or uninstall exit codes/results are claimed. Use the exact verified candidate `target/installer-candidate-83/JEAN-0.1.0-setup-candidate-83.exe` when a clean disposable Windows VM is available.
+
+## 86. Parakeet versus Zipformer corpus comparison attempt — 2026-11-09
+
+No recognition inference was run. The existing Zipformer bundle is present at `%LOCALAPPDATA%\\JEAN\\models\\sherpa-onnx-streaming-zipformer-en-2023-06-21`. The required Parakeet directory `%LOCALAPPDATA%\\JEAN\\models\\asr\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8` is absent, so its four files (`encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, `tokens.txt`) could not be bundle-verified against the Hugging Face mirror LFS hashes specified in `docs/voice-assets.md` §2b. The documentation says the release archive does not publish a checksum; verification must use those per-file mirror hashes.
+
+No consented WAV corpus or manifest was found in the workspace. The expected private manifest `C:\\private\\jean-asr\\recordings.csv` is absent; vendor model sample WAVs are not used as consented operator recordings. The focused harness preflight was attempted without inference:
+
+`pwsh -NoProfile -File <workspace>\\tools\\voice-tester\\compare-asr.ps1 -JeanExe target\\debug\\jean.exe -VoiceWorkerExe target\\debug\\jean-voice.exe -RecordingsCsv C:\\private\\jean-asr\\recordings.csv -ZipformerDataDir %LOCALAPPDATA%\\JEAN\\models\\sherpa-onnx-streaming-zipformer-en-2023-06-21 -ParakeetDataDir %LOCALAPPDATA%\\JEAN\\models\\asr\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8 -OutputCsv C:\\private\\jean-asr\\comparison.csv -ValidateOnly`
+
+The harness exited **1** at its required-input check, identifying the missing manifest `C:/private/jean-asr/recordings.csv`; it did not invoke either recognizer. `target/debug/jean.exe` and `target/debug/jean-voice.exe` exist, and the documented sherpa native library directory exists. No WER, exact app-name/developer-term scores, processing times, or failed-clip results can be reported. Zipformer remains the default.
+
+To run the comparison, supply (1) the Parakeet TDT v2 INT8 bundle extracted into the documented directory, with all four files checked against the mirror LFS hashes in §2b; (2) consented WAV clips plus a UTF-8 `wav,expected,app_names,developer_terms` manifest; and (3) matching isolated Zipformer/Parakeet `jean.toml` configurations. Rerun the documented `-ValidateOnly` harness command and require success before removing that switch for inference.
+
+### Recheck requested to close §86 — 2026-11-09
+
+Checked disk before any work: `Get-PSDrive C | Select-Object Name,Used,Free` reported **13,981,958,144 bytes free**. Zipformer files remain present in the documented local directory. The Parakeet destination directory is **absent**: `%LOCALAPPDATA%\\JEAN\\models\\asr\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8`; therefore none of its required extracted files could be hashed. Per §2b, verify `encoder.int8.onnx` (652,282,309 bytes; LFS SHA-256 prefix/suffix `92a10bd9…57ca8b`), `decoder.int8.onnx` (7,257,753 bytes; `4d097bae…020f41`), `joiner.int8.onnx` (1,739,080 bytes; `77a29f3e…56f428`), and `tokens.txt` (9,384 bytes) against the Hugging Face mirror; the release itself publishes no checksum.
+
+The private manifest `C:\\private\\jean-asr\\recordings.csv` is **absent**, so its required `wav,expected,app_names,developer_terms` header and referenced WAV clips could not be validated. Ran the harness preflight once, without inference:
+
+`pwsh -NoProfile -File (Resolve-Path tools/voice-tester/compare-asr.ps1).Path -JeanExe (Resolve-Path target/debug/jean.exe).Path -VoiceWorkerExe (Resolve-Path target/debug/jean-voice.exe).Path -RecordingsCsv C:\private\jean-asr\recordings.csv -ZipformerDataDir (Join-Path $env:LOCALAPPDATA 'JEAN\models\sherpa-onnx-streaming-zipformer-en-2023-06-21') -ParakeetDataDir (Join-Path $env:LOCALAPPDATA 'JEAN\models\asr\sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8') -OutputCsv C:\private\jean-asr\comparison.csv -ValidateOnly`
+
+Preflight exited **1** with `Required comparison input is missing: C:\\private\\jean-asr\\recordings.csv`. It did not reach recognizer configuration validation or invoke inference. No WER, exact-term match, offline processing-time, or failed-clip result exists. Do **not** promote Parakeet to a live microphone trial based on this run; there is no comparative corpus evidence. Keep Zipformer as the default. To resume, provide the verified Parakeet bundle and a valid private consented WAV corpus/manifest, then rerun preflight before inference. Private audio and transcripts were not copied into the repository.
+
+## 87. Isolated Voice Lab: Moonshine first runnable slice — 2026-11-09
+
+Added an independent Tkinter WAV runner and double-click launcher under `tools/voice-lab/`. It does not load JEAN config, open the JEAN database, start JEAN workers, use a microphone, or submit tasks. The GUI chooses a WAV, runs inference on a background thread, displays runtime output/errors, and labels elapsed time as CLI process wall time (including startup). Production voice defaults and output were not changed.
+
+**Pinned artifacts and verification:**
+
+* Official Moonshine Voice Windows x64 runtime v0.0.45, `runtime/moonshine-voice-windows-x86_64-v0.0.45.tar.gz`: 24,673,139 bytes; SHA-256 `9686f351b5dfeb2cfb166490bf72076a7c46ee11f1dc2ee7dd33073a91a44e4c`, matching GitHub release API digest.
+* Official Moonshine Windows CLI/sample release v0.1.6, `runtime/windows-cli-transcriber-v0.1.6.tar.gz`: 413,783,036 bytes; SHA-256 `efc59ebf20dc4e78552e1f1b57a0547a7f33bb4859db763b91fc8dc6e377d778`, matching GitHub release API digest. This self-contained archive includes the x64 CLI, ONNX Runtime DLL, Medium Streaming English model, and public `beckett.wav` sample.
+* The extracted model is Medium Streaming English, architecture 5. Per-file SHA-256 values are pinned in `tools/voice-lab/models/SHA256SUMS.txt`; those hashes were computed from files in the verified upstream archive.
+* Extracted package footprint is **606,041,115 bytes** (CLI, libraries, model, and bundled public sample). Including both compressed source archives and the Voice Lab code, the lab remains well under 5 GB. No model cache was created outside `tools/voice-lab`.
+
+**Real runtime smoke:** `cli-transcriber.exe --wav-path beckett.wav --model-path models/medium-streaming-en --model-arch 5` exited **0** on CPU. Observed CLI process wall time was **3,186 ms**. Transcript output converged to: “Ever tried. Ever failed. No matter. Try again. Fail again. Fail better.” This is a public upstream sample, not a consented operator recording.
+
+**GUI smoke:** launched the GUI, used **Open WAV** to select that same `beckett.wav`, then clicked **Transcribe**. The window remained responsive and showed the live segment updates, final transcript, and **4.770 s** process wall time. Result matched the direct CLI run. The launcher was also invoked through `cmd.exe /c start` and opened the same Voice Lab window (a second GUI process appeared). No GUI inference error was observed.
+
+Launcher: `tools/voice-lab/JEAN Voice Lab.cmd`. GUI source: `tools/voice-lab/voice-lab.py`. Runtime invocation uses the upstream documented `--wav-path`, `--model-path`, and `--model-arch 5` flags. This slice stops at Moonshine; Whisper and Nemotron are not integrated or tested here.
+
+## 88. Voice Lab Whisper download and Compare smoke — 2026-11-09
+
+The existing Whisper model file was in the GUI-expected path `tools/voice-lab/models/whisper/ggml-large-v3-turbo-q5_0.bin`. Checked the folder was writable before transfer. Ran from that folder:
+
+`curl.exe -fL -C - --retry 2 -o "ggml-large-v3-turbo-q5_0.bin" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"`
+
+Curl exited **0** and reported resuming at byte **574,041,195** (the partial was already complete); the final redirected response transferred 1,205 bytes, without changing the model. The model remains at the GUI-expected path, is exactly **574,041,195 bytes**, and SHA-256 is **394221709CD5AD1F40C46E6031CA61BCE88931E6E088C188294C6D5A55FFA7E2**, matching the requested hash. No fallback filename or move was needed.
+
+Ran `tools/voice-lab/runtime/whisper/extracted/Release/whisper-cli.exe -m tools/voice-lab/models/whisper/ggml-large-v3-turbo-q5_0.bin -f tools/voice-lab/runtime/cli-transcriber/beckett.wav -nt -np -ng -t 4` in CPU mode; exit **0**, direct CLI process wall time **44,386 ms**. Transcript: “Ever tried. Ever failed. No matter. Try again. Fail again. Fail better.”
+
+Launched `tools/voice-lab/JEAN Voice Lab.cmd`, selected the bundled `tools/voice-lab/runtime/cli-transcriber/beckett.wav` through **Open WAV**, and clicked **Compare**. The GUI ran Moonshine then Whisper sequentially. Both panes populated independently and the status reached **Comparison complete**. GUI process wall times were **4.081 s Moonshine** and **38.168 s Whisper**. Whisper pane transcript: “Ever tried. Ever failed. No matter. Try again. Fail again. Fail better.” Moonshine rendered its streaming CLI updates in its pane; final recognized chunks read “Ever tried? Ever failed. No matter. Try again. Fail again. Fail better.” The GUI measures each backend's process wall time including startup; this is an offline WAV test, not live microphone latency.
+
+Measured Voice Lab recursive file footprint, including both runtime archives, extracted runtimes/models, sample audio, Whisper weights, and code: **1,664,139,829 bytes (about 1.55 GiB)**, below the 5,000,000,000-byte cap. The focused model/footprint verification command exited **0** after asserting exact model bytes and SHA-256. C: free space after the run was **7,370,125,312 bytes**. No private recordings or transcripts were added. Production JEAN voice settings and task execution remain untouched.
+
+No code changes were required for this smoke. The only Voice Lab UI limitation observed is Moonshine's pane displays streaming CLI progress text alongside the final per-chunk recognized text rather than a single normalized aggregate transcript; the successful comparison and its elapsed times are visible. No Parakeet corpus results are inferred from this public sample.
+
+## 89. Voice Lab Nemotron 3.5 streaming comparison — 2026-11-09
+
+Added Nemotron as the third isolated local engine in `tools/voice-lab/voice-lab.py`. **Compare** now runs Moonshine, Whisper, and Nemotron sequentially on the selected WAV, displays a final transcript and per-process wall time in each pane, and reports engine-specific errors without suppressing the other panes. The Nemotron command selects the explicit model path with `--stream --device cpu`; it never uses a hosted service. **Transcribe** remains a Moonshine-only action. The launcher remains `tools/voice-lab/JEAN Voice Lab.cmd`; missing Nemotron artifacts show in its pane without disabling the other engines.
+
+Moonshine progress cleanup now groups updates after each `[Started]` marker, keeps only the final hypothesis in each finalized chunk, and joins each final chunk once. An in-memory Python fixture with interim updates, repeated partials, terminal-clear whitespace, and six chunks passed; the resulting final text was `Ever tried? Ever failed. No matter. Try again. Fail again. Fail better.` No progress or interim hypothesis appeared in the fixture output. Updated `tools/voice-lab/README.md` and `tools/voice-lab/models/SHA256SUMS.txt` with the lab scope, runtimes, model pins, license notes, and filtering behavior.
+
+**Pinned runtime and model:**
+
+* NVIDIA NeMo-Speech.cpp **v0.3.0**, Windows x86_64 CPU: `runtime/nemo-speech/v0.3.0/nemo-speech-0.3.0-windows-x86_64-cpu.zip`, **8,694,509 bytes**, SHA-256 `4ed9740e361e4653f56c3dce7d1e81883a1c8b831c1bd7d01567fff1130b5b05`. This is the official release asset and its digest matches the GitHub release API.
+* The extracted CLI reported `nemo-speech 0.3.0`; `nemo-speech.exe --version` exited **0**. `nemo-speech.exe transcribe --help` exited **0** and confirms `--stream` feeds recorded WAV audio through the streaming recognizer and `--device cpu` selects CPU execution.
+* The runtime's own `share/nemo-speech/model-index.json` pins the matching `nvidia/nemotron-3.5-asr-streaming-0.6b` Q8_0 artifact to HF revision `1c8deaecc64b91f034d73e08dd8b64625eb3395d`, **741,548,352 bytes**, SHA-256 `a5c435f294eea8f88ce68dd27b8c3bfea7f777cb2fbba04fcd30eaa555f429ae`. The final model file at `models/nemotron/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf` matches both exact byte count and SHA-256 before inference. The model uses NVIDIA OpenMDW 1.1 terms; the runtime code is Apache-2.0 and its archive includes third-party notices.
+* During pin inspection, the current HF revision differed from the version pinned by the v0.3.0 runtime index. That nonmatching transfer was stopped before inference and its **125,947,904-byte** partial was preserved with `.unpinned-partial` suffix. The subsequent download used the runtime-pinned revision. It first failed with curl exit **56** (`schannel: server closed abruptly (missing close_notify)`) after retaining **379,999,889 bytes**; `curl.exe -fL -C - --retry 2 -o "tools/voice-lab/models/nemotron/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf" "https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b/resolve/1c8deaecc64b91f034d73e08dd8b64625eb3395d/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"` resumed from that byte offset, completed with exit **0**, and passed the exact size/hash check. No unverified model was loaded.
+
+**Direct streaming CPU smoke:** after hash verification, ran `tools/voice-lab/runtime/nemo-speech/v0.3.0/nemo-speech-0.3.0-windows-x86_64-cpu/bin/nemo-speech.exe transcribe tools/voice-lab/runtime/cli-transcriber/beckett.wav --model tools/voice-lab/models/nemotron/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf --stream --device cpu --quiet`. Exit **0**, process wall time **6,757 ms**; transcript: `Ever tried, ever failed, no matter try again, fail again fail better`.
+
+**GUI Compare smoke:** launched through `JEAN Voice Lab.cmd`, selected the bundled public `beckett.wav` using **Open WAV**, and clicked **Compare**. The UI remained available and finished with all three transcript panes populated and status `Comparison complete · each wall time includes process startup`. Observed sequential process times and final pane text:
+
+* Moonshine — **3.592 s** — `Ever tried? Ever failed. No matter. Try again. Fail again. Fail better.` The pane showed only final chunk text; no interim progress/hypotheses.
+* Whisper — **33.787 s** — `Ever tried. Ever failed. No matter. Try again. Fail again. Fail better.`
+* Nemotron 3.5 ASR Streaming Q8_0 — **7.067 s** — `Ever tried, ever failed, no matter try again, fail again fail better`.
+
+No GUI engine pane showed an error. These are offline sample timings, not live microphone latency or an accuracy comparison on a consented corpus.
+
+Final recursive Voice Lab footprint (runtime archives and extracted binaries, all models including Whisper and Nemotron, bundled samples, code, and local cache/partial files): **2,573,420,664 bytes (about 2.40 GiB)**, under the **5,000,000,000-byte** cap. Free C: space before work was **7,394,230,272 bytes**; after model provisioning and inference it was **6,456,569,856 bytes**. The focused Python syntax/in-memory chunk-finalization fixture exited **0**. Production JEAN voice configuration/output and JEAN task execution were not changed. Parakeet corpus comparison remains pending under §86; this public single-clip integration smoke is not corpus-quality evidence.
+
+## 90. Wispr-input Talk to JEAN and Kokoro Voice Lab playback — 2026-11-09
+
+Added a separate `Talk to JEAN` Tk window and launcher at `tools/voice-lab/Talk to JEAN.cmd`. It uses the normal `jean chat` command for read-only conversation, passing prior conversation turns as context, and keeps `Run as task` as a separate explicit `jean goal` action. The editable draft is retained when chat/task submission fails and clears only after success. Assistant replies are synthesized through JEAN's Kokoro worker; `Stop Speaking` stops synthesis and playback. Talk subprocesses set `JEAN_NO_VOICE=1`, so conversation does not start local microphone ASR. Enter submits; Shift+Enter inserts a newline. Shift+Caps Lock is registered as the requested push-to-talk handoff: it focuses the editable draft, then forwards a plain Caps Lock keypress to Wispr Flow. It does not auto-submit; the user reviews and presses Enter. No alternate shortcut is substituted.
+
+Extended `tools/voice-lab/voice-lab.py` with an editable Kokoro text field, `Speak`, and `Stop Playback`, using the current JEAN voice config/assets and `JEAN_NO_VOICE=1`. Moonshine compare and microphone-test paths remain available. The Voice Lab README documents both launchers and the handoff behavior. Updated the lab to use the current debug voice worker when present, avoiding the stale packaged worker schema.
+
+### Focused checks and observed Windows behavior
+
+* VS 2022 x64 environment, locked/offline CLI build and process fixtures:
+  `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && "C:\Users\4Raisan\.cargo\bin\cargo.exe" test -p jean-cli --test cli_phase2 --locked --offline -j 2'` — exit **0**, 4 passed. Includes a local HTTP fixture proving follow-up context reaches the conversation request. Earlier focused exact test `chat_is_read_only_and_includes_prior_turn_context_for_followups -- --exact --nocapture` also exited **0**.
+* Voice worker build with locked offline Cargo in VS 2022 x64, `CARGO_INCREMENTAL=0`, and Sherpa library path ending in `sherpa-onnx-v2.0.1-win-x64-static-MT-Release-lib\lib`:
+  `cargo build -p jean-voice --features sherpa --locked --offline -j 2` — exit **0** (10.83 s; existing LNK4098 warning).
+* Direct Kokoro checks with isolated `JEAN_DATA_DIR=target\p5o-data`, `JEAN_VOICE_WORKER=target\debug\jean-voice.exe`, and `JEAN_NO_VOICE=1`: `jean.exe voice doctor` — exit **0**, Kokoro assets/engine available while voice reports disabled; `jean.exe voice synthesize "$env:TEMP\jean-kokoro-smoke.wav" "Hi, I’m JEAN. I can open Spotify and check your OpenCode session."` — exit **0**, non-silent 24 kHz mono WAV, 128,654 bytes, 2,679 ms duration. Sherpa reports the existing deprecated Kokoro-language option and skipped OOV terms `I’m`, `Spotify`, `OpenCode`; synthesis still completed.
+* Voice Lab Kokoro GUI callback smoke used the same sample phrase; the GUI status reached `Speaking with Kokoro… use Stop Playback to interrupt.` and Stop Playback was invoked. Exit **0**.
+* Talk window launched through `tools/voice-lab/Talk to JEAN.cmd` and was observed open. With the normal config's `model.provider = "none"`, submitting a pasted Wispr-style draft produced the explicit no-provider error and retained the complete draft for retry. This is the actual GUI failure-retention check; no conversation was sent to a provider.
+* Moonshine remained usable: the bundled CPU `cli-transcriber.exe` on `tools/voice-lab/runtime/cli-transcriber/beckett.wav` with model `medium-streaming-en`, architecture 5, exited **0** and returned the known final Beckett transcript.
+* Python syntax compilation of `talk-to-jean.py` and `voice-lab.py` exited **0**. The Cargo process fixture verifies prior-turn context; the live Talk window could not produce a real assistant follow-up because the normal model provider is unset.
+
+### Storage and remaining live checks
+
+Before cleanup, the C: volume had **729,686,016 bytes free**. Removed only the confirmed unreferenced, wrong-revision download fragment `tools/voice-lab/models/nemotron/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf.unpinned-partial` (**125,947,904 bytes**); the file was confirmed at that exact size and had no code/harness reference. After cleanup C: had **861,306,880 bytes free**. **Bytes moved: 0.** No existing `Universal Trash` directory was found under the checked user profile/Desktop/Documents/Downloads/AppData paths, and no retired bundle was moved. Kokoro, Moonshine, Whisper and Nemotron assets/runtimes, source, configs, public sample, and results remain. The three ASR engines are actively referenced by `tools/voice-lab/voice-lab.py`; moving them would break the lab. No private audio/transcripts or operator settings were added or removed. No ambiguous sheet/storage item was found in the Voice Lab inventory; other operator/untracked files were preserved.
+
+**Pending Windows integration:** Wispr Flow was observed installed/running and the Talk window opened, but this session did not complete a physical Wispr dictation/hotkey cycle. Still verify manually that (1) plain Caps Lock continues to work in Wispr, (2) Shift+Caps Lock focuses JEAN and starts exactly one Wispr capture, (3) releasing the combination leaves editable text, and (4) Enter submits exactly once. Automatic submission remains off because this integration does not expose a reliable transcript-finalization event. To verify successful real follow-up replies and Kokoro playback in Talk, configure a model provider in the normal JEAN config first; current `model.provider = "none"` makes chat fail before sending. Existing task/verifier behavior was not altered by conversation code; task execution remains a distinct button/action.
+
+## 91. Talk to JEAN Windows hotkey and reply blocker follow-up — 2026-11-09
+
+Updated `tools/voice-lab/talk-to-jean.py` so Shift+Caps Lock uses a short-lived Windows `RegisterHotKey` probe to report registered-shortcut conflicts, then a low-level keyboard hook observes the original physical Caps Lock event. For a physical shifted Caps Lock key-down, the hook asks Tk to focus the editable draft, verifies the JEAN window and draft own foreground/focus, then lets that same key event continue to Wispr; failed focus swallows the chord and reports that capture did not start. The hook ignores injected keys. Ordinary Caps Lock and all other keys are passed through. Enter remains the manual submit action. The status line is now visible at the top of the maximized window. **This is implementation evidence only; no synthetic key event is counted as proof of Wispr capture.**
+
+**Actual Windows app checks:** opened `tools/voice-lab/Talk to JEAN.cmd`; the Talk window started and reported `Shift+Caps Lock ready · registered-shortcut conflict check passed`. Clicked **Test Voice** in Talk. The real JEAN CLI/Kokoro synthesis path generated `%TEMP%\jean-talk-kokoro.wav`; inspected output is a non-silent mono 24 kHz WAV, **128,676 bytes / 64,316 frames**. The Talk status advanced to `Speaking through configured Kokoro output with local ASR disabled.`; clicked **Stop Speaking** and observed `Speech stopped.` This proves synthesis, the playback call path and the stop command were exercised in the Windows app; whether sound was audible from the selected output device still needs operator confirmation. Moonshine remains in Voice Lab and was not changed by this slice.
+
+Pasted `Can you reply with a short greeting?` in the actual Talk draft and pressed Enter. JEAN returned the explicit no-provider setup error, showed `Submission failed. Your draft is still here.`, and left the complete draft editable. The draft was then restored to the prior text, `Jean, can you hear me?`, without submitting again. No request reached a model provider. Effective config is repo `config/defaults.toml` (`model.provider = "none"`, empty model); source config layering is repo defaults, `%LOCALAPPDATA%\JEAN\jean.toml`, then the launch working-directory `jean.toml`. Checked both user config paths and the repo-root override: all absent. `ollama` is not installed (`Get-Command ollama` returned no command) and `Test-NetConnection 127.0.0.1 -Port 11434 -InformationLevel Quiet` returned **False**. No authorized reply provider is available or verified here. No key values were read or displayed.
+
+**Focused checks:** `py -3 -m py_compile tools/voice-lab/talk-to-jean.py` — exit **0** after the HTTPS guidance correction. `py -3 -c "import wave,pathlib,os; p=pathlib.Path(os.environ['TEMP'])/'jean-talk-kokoro.wav'; w=wave.open(str(p),'rb'); d=w.readframes(w.getnframes()); assert w.getnchannels()==1 and w.getframerate()==24000 and any(d); print(f'path={p}; bytes={p.stat().st_size}; channels={w.getnchannels()}; rate={w.getframerate()}; frames={w.getnframes()}; nonzero=yes')"` — exit **0**. Default `git diff --check -- IMPLEMENTATION_STATUS.md` exited **2**, flagging CRLF line endings across accumulated Windows status additions; `git -c core.whitespace=cr-at-eol diff --check -- IMPLEMENTATION_STATUS.md` exited **0**. No Cargo build was needed for this Python UI/hotkey change; none was run.
+
+**Still pending live Windows checks:** operator must physically hold Shift, press/hold Caps Lock, speak one short phrase, and release Caps Lock; confirm the exact original press starts Wispr, its release finalizes into the editable JEAN draft, and plain Caps Lock still dictates normally in another app. The registered-shortcut probe passed but does not prove there is no conflict with Wispr's own low-level hook. This test requires physical dictation and is not replaced by a simulated key. Operator must also listen to **Test Voice** and confirm audio output. For actual JEAN replies, configure an authorized local provider (for example, install/start Ollama, pull a model, and set `[model] provider = "ollama"`, its exact installed `model` tag, loopback `base_url`, and empty `api_key_env` in `%LOCALAPPDATA%\JEAN\jean.toml`) or an authorized compatible endpoint as described in `tools/voice-lab/README.md`; do not add a key to the file. HTTPS endpoints use certificate validation; only loopback may use plain HTTP. Then submit two conversational turns, confirm both real replies appear and each is spoken, and click **Stop Speaking** during one reply. Provider-backed reply, follow-up, and automatic Kokoro playback are unverified because no provider is configured. `Run as task` remains separate and was not invoked.
+
+## 92. Stage 1 upstream comparison and recovery baseline — 2026-11-09
+
+Checked **55,681,699,840 bytes** free on C: before compiling. Read `crates/jean-core/src/owner.rs`, `crates/jean-core/src/delegation.rs`, `crates/jean-acp/src/acp.rs`, and the existing `apps/jean-cli/tests/owner_resume.rs` before editing. No production recovery or ACP code needed a port: JEAN already reconciles recorded file paths and SHA-256 values before resume, reserves one replacement durably before launch, starts only the configured remaining-work prompt, checks the independent workspace verifier, and blocks uncertain reservations. OpenCode's exact ACP model confirmation still occurs before `session.send_prompt`.
+
+**Upstream comparison / provenance:**
+
+* Dodaios pinned to `b78c216d81c3d543cb671edcb95f2bd87d585b9f` (`main`, read with `git ls-remote`). The pinned `dodaios/agent_chat/runner_cli.py` fetched from that commit has SHA-256 `E60D8D0BB2195A315D1AB718BAFFAECE02E4D7042A45B33F4BF26E97D429FB9F`, matching the sibling `Dodaios--Dodaios-review/runner_cli.py` byte for byte. Its root `LICENSE` at the same commit is Apache-2.0 and its `NOTICE` is present. Its ACP cancel path sends `session/cancel`, waits a bounded grace period and then kills; its stall watcher also cancels before kill. JEAN already sends ACP `CancelNotification` before the configured shutdown-grace/job termination and has idle/session watchdog limits, so no reproducible cancellation or stall gap justified a code port.
+* Hearth pinned to sibling Git HEAD `137dceacda41a7a00e2009cc6bc777850d83e14f`; `hearth/acp_brain.py` SHA-256 is `8D015A50003FA7AA7E26AFEBC1C4CA4B4987587A381AAD9DF434FAB507DD0DD6`. Its root `LICENSE` at that commit is MIT. Its `_use_model` reports the requested ID after a successful setter call without checking the active model ID returned by ACP. JEAN's existing ACP code validates the exact returned selector value and refuses on reject, mismatch, or missing confirmation before the prompt. No upstream source was copied; no new third-party license or notice obligation was introduced.
+
+**Concrete reproduced evidence gap and smallest fix:** the previous uncertain-reservation integration fixture manufactured a post-reservation checkpoint by editing its JSON, so it did not exercise a JEAN process interruption after a replacement had actually acted. Replaced that setup in `uncertain_replacement_reservation_is_never_cleared_after_process_exit` with a real scratch-Git process fixture: the first worker writes `stage-one.txt` then returns structured quota exhaustion; a fresh `jean resume` reserves beta, passes it only the remaining stage-two prompt, beta writes the exact second file and waits without returning; the test kills that JEAN process and starts another fresh `jean resume`. It observes `needs_attention`, confirms the first edit is exact and the second effect is visible, and asserts beta's start marker remains exactly one—no work is replayed. The helper also asserts JEAN's configured verifier says `baseline check: did not pass` before the initial worker edit. The existing completion test proves it passes on final verified success, while `worker_success_claim_does_not_override_failing_workspace_verification` proves a clean worker claim still fails when the independent check fails. This was a test/evidence gap; no runtime gap was reproduced, so no redundant upstream code was imported.
+
+**Focused Windows checks (fixture evidence only; no live provider used):**
+
+* Before strengthening the crash fixture, the baseline command below exited **0**, **10 passed**. It printed decision routing **9/9 expected actions matched observed actions**. The `quota_after_known_edit...` case kept `stage-one.txt` exact, passed only stage-two work to beta in a fresh CLI process, and ended with JEAN's verifier success. The uncertainty case reported human review and launched no replacement. The worker-claim negative case failed JEAN verification as expected.
+* Focused new crash fixture command exited **0**, **1 passed**:
+  `cargo test -p jean-cli --test owner_resume --locked --offline -j 2 uncertain_replacement_reservation_is_never_cleared_after_process_exit -- --exact --nocapture`
+* Re-ran the complete focused process target after the fixture change; command exited **0**, **10 passed**, **0 failed** in **42.08 s**, with routing accuracy **9/9**. This includes quota/context recovery, changed workspace, real uncertain process interruption, verifier-negative behavior, and the existing owner process cases.
+* ACP exact model boundary command exited **0**, **2 passed**: `cargo test -p jean-acp --lib opencode_ --locked --offline -j 2 -- --nocapture`. `opencode_model_selection` covered exact match, different returned ID, missing confirmation, and server rejection; `opencode_blank_model_is_refused_without_sending_any_acp_prompt` covered empty and whitespace-only models. No rejected case sent a prompt.
+* Rust formatting check exited **0**: `rustfmt.exe --check --edition 2024 apps/jean-cli/tests/owner_resume.rs`.
+
+Exact locked/offline cargo invocations (each used the VS 2022 x64 environment bootstrap):
+
+* `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && "C:\Users\4Raisan\.cargo\bin\cargo.exe" test -p jean-cli --test owner_resume --locked --offline -j 2 -- --nocapture'` — baseline before and full target after the test change; both exited **0**.
+* `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && "C:\Users\4Raisan\.cargo\bin\cargo.exe" test -p jean-cli --test owner_resume --locked --offline -j 2 uncertain_replacement_reservation_is_never_cleared_after_process_exit -- --exact --nocapture'` — exited **0**, **1 passed**.
+* `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && "C:\Users\4Raisan\.cargo\bin\cargo.exe" test -p jean-acp --lib opencode_ --locked --offline -j 2 -- --nocapture'` — exited **0**, **2 passed**.
+* `C:\Users\4Raisan\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustfmt.exe --check --edition 2024 apps/jean-cli/tests/owner_resume.rs` — exit **0**.
+
+No full suite or live provider was run. Changed files for this stage: `apps/jean-cli/tests/owner_resume.rs` (stronger process interruption fixture) and this status record. Existing local changes and operator/untracked files were preserved. No remaining stage-1 recovery or model-confirmation blocker was found.
+
+## 93. Stage 2 UI Automation targeting and observable outcomes — 2026-11-09
+
+Read the Stage 2 desktop-actions requirements in `PLANNING/10-UPSTREAM-REUSE.md`, the existing JEAN UIA inspection/action path (`crates/jean-core/src/desktop.rs`, `crates/jean-windows/src/accessibility.rs`, `crates/jean-windows/src/uia.rs`, `crates/jean-windows/src/worker.rs`), and `crates/jean-windows/tests/native_desktop.rs` before editing. Disk check before compiling: C: had **50,079,920,128 bytes free**.
+
+**Baseline and smallest change:** JEAN's production path already resolves one target or refuses ambiguity, re-resolves the locator inside its isolated UIA call before acting, and uses an independent post-action witness plus a stated expectation for `Proven`. A missing/changed locator is stale; a successful pattern call with unchanged or mismatching witness is `NotProven`, not success. No production targeting or verification defect reproduced, so no third-party code or production action change was made.
+
+The missing evidence was test coverage: the fixture's two `Continue` buttons were siblings, and its ancestry test addressed the button by its own ID. Changed the disposable Win32 fixture to put identical `Continue` buttons under UIA `Workspace A` and `Workspace B` Group controls, then exercise both ancestor paths. The fixture's groupbox parent does not forward a nested button notification to its root status label; the target resolves to the correct button, but the action has no visible effect. The fixture asserts that JEAN does not treat that successful Invoke/no-op as a verified result. Added a focused `jean-core` verdict test proving a successful action response with unchanged `idle` witness fails the stated `clicked:1` expectation. Existing native tests cover a unique target with an independent status change and a target removed after inspection; the subsequent action is refused as stale.
+
+**Fixture evidence on Windows (no external provider/model):**
+
+* Unique `Send` target: **1 correct verified action**, **0 wrong actions**. Independent status changed from `idle` to `clicked:1`. Measured one action from dispatch through status readback at **2,225 ms** (fixture startup and the later repeat are outside this measurement).
+* Duplicate `Continue` name: flat lookup found **2** controls and refused the action; **1 abstention**, no click. Parent path A resolved AutomationId `1008`; parent path B resolved `1009`, demonstrating the two scoped targets. The current fixture produces no observable effect from either nested Invoke, and JEAN does not call either result verified. The measured no-op dispatch/readback was **3,503 ms**; it is not counted as a correct action.
+* Changed target after inspection: the fixture removes the inspected status control; a subsequent action is refused as `StaleElement` before a replacement is touched; **1 abstention**, **0 wrong actions**.
+* Success-return/no-expected-result: unchanged independent witness yields `Verdict::NotProven`; the CLI/core cannot report success based on Invoke's return alone. **1 unverified no-op**, not a successful action.
+
+The two elapsed values are fixture request-to-observation times for the focused UIA call plus independent read, not general desktop latency. These are real Windows UIA calls against JEAN's disposable Win32 fixture windows, not evidence from a third-party app. No live provider was used. A separate third-party application workflow remains unobserved; no port is proposed because the baseline passed after the coverage fixture was corrected.
+
+**Upstream comparison, pinned to the sibling checkouts (no source copied):**
+
+* JARVIS for Windows checkout HEAD `c4af27490f9d53ae2f3c349fa9d01bb96ad880ce`. Compared `jarvis-studio-backend/actions/computer.py` (SHA-256 `13C8B5710A5467DBEB21E3D6A4BB8041097526E1B0E3C06AA88488DBCA55F453`), `actions/browser.py` (`A40D036AD289158B182D9DA7B885C13C44E0A8AB1808B41E15619636AFAA84A1`), and `test_desktop_interventions.py` (`BFA62DC16D378D59523CDD58974C1B50058F51ADECB9C963A3263A2178DC1585`). Its root license at this pinned checkout is MIT. Its correction/focus-intervention tests are useful scenarios; JEAN's per-call target resolution, ambiguity refusal, cancellation, and stale-target fixture already cover the relevant boundary.
+* TheJarvis-App checkout HEAD `7d06964126c02422351fe014b4b736cf4e365a78`. `screen_windows.py` SHA-256 `261B6EDEB08D5D4D4C275E8E630621D6E6944312E23377A1A84B22BC3BBFA02C`; root license is MIT. Its observation walk bounds visited controls, emitted elements, and time. JEAN's UIA tree is capped at 2,000 nodes and calls have a configured deadline; no screenshot fallback was justified by this run.
+* Ari checkout HEAD `766807a68e6552000dc15df3abc0ed67830e3ddf`. `VoiceCommand/agent/real_verifier.py` SHA-256 `D8E02B8F57B981D98B5F6184D84FDB1389554C1A3FCF7474430A1A0B917B9116`; root license is MIT. Its post-action verifier combines heuristics, OCR/code checks, and an LLM fallback. JEAN already keeps the deterministic, independently read witness as the authority for the expected UI change; no model judgment or source port was needed.
+
+**Focused locked/offline Windows checks:** commands ran through the VS 2022 x64 developer environment (`VsDevCmd.bat -arch=x64 -host_arch=x64`). Each Cargo invocation used `--locked --offline -j 2`.
+
+* `cargo test -p jean-windows --test native_desktop --locked --offline -j 2 an_ambiguous_locator_is_refused_rather_than_resolved_by_enumeration_order -- --exact --nocapture` — exit **0**, 1 passed; duplicate labels under different parents were refused globally and scoped paths resolved to distinct target IDs, without reporting their no-op as verified.
+* `cargo test -p jean-windows --test native_desktop --locked --offline -j 2 invoke_is_performed_and_the_resulting_change_is_visible -- --exact --nocapture` — exit **0**, 1 passed; output measured **2,225 ms** request-to-verified result.
+* `cargo test -p jean-windows --test native_desktop --locked --offline -j 2 a_control_destroyed_by_an_action_is_stale_rather_than_merely_absent -- --exact --nocapture` — exit **0**, 1 passed; stale target refusal.
+* `cargo test -p jean-core --lib --locked --offline -j 2 a_successful_pattern_call_without_the_expected_observation_is_not_success -- --nocapture` — exit **0**, 1 passed; unchanged witness verdict.
+* `rustfmt.exe --check --edition 2024 crates/jean-windows/src/bin/jean_desktop_fixture.rs crates/jean-windows/tests/native_desktop.rs crates/jean-core/src/desktop.rs` — exit **1** because rustfmt proposes broad reformatting of pre-existing code in these already locally modified files, beyond this slice. `git -c core.whitespace=cr-at-eol diff --check` for those files exited **0**. No repository-wide formatter rewrite was applied.
+
+An exploratory first version of the hierarchical fixture failed its assertion because the Win32 groupbox does not forward the child button's notification; this was retained as the no-op case, not misclassified as a JEAN targeting failure. The first compile of the new core assertion failed because its test-local `Locator` import was missing; added it and reran successfully. No full test suite was run. Files changed for this slice: `crates/jean-windows/src/bin/jean_desktop_fixture.rs`, `crates/jean-windows/tests/native_desktop.rs`, `crates/jean-core/src/desktop.rs` (test only), and this status entry. Existing operator/local changes were preserved.
+
+**Non-fixture app attempt:** tried to inspect a newly launched Notepad process using the isolated temporary config/data directory. Exact command: `target/debug/jean.exe desktop inspect --pid 34324 --json` — exit **1**, `no visible window matches pid=34324 among 24 top-level windows`. The launched packaged-app process had no visible top-level window (Notepad reused/forwarded to another process); JEAN correctly refused to guess. Only the new launcher process was stopped. I did not inspect or act on the already-open Notepad window and did not complete a third-party app action workflow. This remains a live desktop evidence gap; no upstream port is proposed from fixture results.
+
+## 94. Task activity and workspace feedback evidence
+
+`jean task <id>` now displays the recorded worker, confirmed ACP model when available, latest recorded worker progress, independent post-worker verifier verdict, and checkpoint status. A completed resume links the replacement task ID so the original verifier and replacement verifier remain attributable to their own tasks. Historical tasks without a model-confirmation event report that confirmation was not recorded. The ACP event is emitted only after the requested ID is confirmed by the session, before prompt dispatch.
+
+The existing `jean preference status <workspace>` view already displays accepted state, learning state, candidate, and evidence IDs. Feedback now requires a completed delegation whose recorded workspace matches the requested canonical workspace. The process fixture tries to use a real task from workspace A as evidence in workspace B and expects refusal. Existing tests cover accepted preference application, explicit override, learning off, correction, and forgetting.
+
+**Native third-party check:** Opened a uniquely named scratch file in Notepad. Windows routed the document to existing Notepad PID 39116, so launch PID was the wrong identifier. `desktop inspect --hwnd 0x7f028e --json` returned a populated tree and a single Text editor control with Value. `desktop act` scoped to the unique title changed only the scratch document's editor value. Independent UIA readback matched the stated expectation (task `t-18e66a954836d41c-6734-0`, `proven`, exit 0). A second scoped action restored the original text and also verified. The scratch file on disk retained its original contents. The scratch tab remains open.
+
+Review/apply/discard remains gated on proof that an isolated diff can be applied against the exact reviewed baseline. The Notepad action used existing functionality, so no new desktop tool was needed. No upstream code or speech assets were added.
+
+**Final Windows validation:** `cargo test --workspace --all-targets --locked --offline -j 2 --no-fail-fast` exited **0** with **1,080 passed, 0 failed, 1 ignored** across 53 test result blocks. Log: `target/p94-workspace-final.log`. The first workspace run exposed a generic ACP fixture accidentally labeled OpenCode and a completed-delegation fixture attempting resume reconciliation. Both fixture corrections passed focused reruns and the final workspace suite. No new live vendor run or installer rehearsal was performed.
