@@ -111,8 +111,8 @@ impl fmt::Display for DenyReason {
             Self::ElevationRequired { helper } => write!(
                 f,
                 "this operation needs an administrator token and J.E.A.N. runs at your own \
-                 integrity level by design (D-010); the sidecar that would perform a single \
-                 scoped elevated operation is `{helper}`, and it is not part of this build"
+                 integrity level by design (D-010). Elevation is unsupported in this build. \
+                 The reserved helper `{helper}` cannot perform elevated operations"
             ),
             Self::Declined => write!(f, "the operator declined"),
             Self::Unanswerable(why) => write!(f, "the question was not answered: {why}"),

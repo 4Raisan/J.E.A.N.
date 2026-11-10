@@ -1,21 +1,42 @@
-//! Narrow elevation helper. One op per invocation, launched via UAC (`runas`).
-//! stdin: {"operation": "...", "target": "..."} — exactly what JEAN approved.
-//! stdout: JSON result. No shell, no password storage, no retries.
-//! Pipe ACL + integrity check live in the caller (jean-core policy layer).
+//! Refusal stub for the reserved elevation helper.
 
-use anyhow::Result;
+use std::io::{self, Read};
+use std::process::ExitCode;
 
-fn main() -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let n = std::io::Read::read(&mut std::io::stdin(), &mut buf)?;
-    let req: serde_json::Value = serde_json::from_slice(&buf[..n])?;
-    let op = req.get("operation").and_then(|v| v.as_str()).unwrap_or("");
-    // Stub: elevated surface is intentionally tiny. Real ops are added per
-    // runbook; an unknown op is a refusal, not a guess.
-    let out = match op {
-        "format_volume" => serde_json::json!({"ok": false, "reason": "auto-deny, never elevated"}),
-        _ => serde_json::json!({"ok": false, "reason": format!("unknown operation: {op}")}),
-    };
-    println!("{}", out);
-    Ok(())
+use serde_json::{json, Value};
+
+const MAX_REQUEST_BYTES: usize = 8192;
+
+fn main() -> ExitCode {
+    let mut input = Vec::new();
+    let read = io::stdin()
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut input);
+    let valid = read.is_ok()
+        && input.len() <= MAX_REQUEST_BYTES
+        && serde_json::from_slice::<Value>(&input)
+            .ok()
+            .and_then(|request| {
+                request.as_object().map(|fields| {
+                    fields.len() == 2
+                        && ["operation", "target"].iter().all(|key| {
+                            fields
+                                .get(*key)
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.trim().is_empty())
+                        })
+                })
+            })
+            .unwrap_or(false);
+
+    if !valid {
+        println!("{}", json!({"ok": false, "reason": "malformed_request"}));
+        return ExitCode::from(2);
+    }
+
+    println!(
+        "{}",
+        json!({"ok": false, "reason": "elevation_unsupported"})
+    );
+    ExitCode::from(5)
 }
