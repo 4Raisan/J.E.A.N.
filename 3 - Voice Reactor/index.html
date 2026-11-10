@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Reactor</title>
+  <style>
+    html, body, #root { margin: 0; height: 100%; overflow: hidden; background: #01060c; }
+    body { color-scheme: dark; color: #d5f9ff; font: 14px system-ui; }
+    .scene { position: fixed !important; inset: 0; }
+    body::after { content: ''; position: fixed; inset: 0; pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 30%, #0008),
+        repeating-linear-gradient(0deg, #00e5ff07 0 1px, transparent 1px 3px); }
+    .controls { position: fixed; bottom: 16px; left: 16px; z-index: 2; display: flex;
+      flex-wrap: wrap; gap: 10px; align-items: center; background: #071820e8; padding: 10px; border-radius: 12px; }
+    button, .file { font: inherit; color: inherit; cursor: pointer; padding: 6px 10px;
+      background: #10303e; border: 1px solid #236073; border-radius: 8px; }
+    input[type=file] { max-width: 220px; }
+  </style>
+  <div id="root"></div>
+  <script type="module" src="./main.tsx"></script>
+</html>
