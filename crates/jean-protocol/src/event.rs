@@ -58,6 +58,7 @@ pub enum EventKind {
     WorkerStarted,
     /// Progress from a worker: an agent message, a tool call it made, a plan update it published.
     /// Phase 3. Detail carries the summarised text, never the raw frame.
+    WorkerModelConfirmed,
     WorkerProgress,
     /// The worker asked for permission to do something. Phase 3. The answer is a `PolicyDecision`,
     /// recorded next to this — a request with no recorded answer is a bug in this build.
@@ -118,6 +119,7 @@ impl EventKind {
         EventKind::StepFinished,
         EventKind::StepSkipped,
         EventKind::WorkerStarted,
+        EventKind::WorkerModelConfirmed,
         EventKind::WorkerProgress,
         EventKind::PermissionRequested,
         EventKind::WorkerSettled,
@@ -151,6 +153,7 @@ impl EventKind {
             EventKind::StepFinished => "step_finished",
             EventKind::StepSkipped => "step_skipped",
             EventKind::WorkerStarted => "worker_started",
+            EventKind::WorkerModelConfirmed => "worker_model_confirmed",
             EventKind::WorkerProgress => "worker_progress",
             EventKind::PermissionRequested => "permission_requested",
             EventKind::WorkerSettled => "worker_settled",

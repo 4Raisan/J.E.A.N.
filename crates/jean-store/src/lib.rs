@@ -24,7 +24,7 @@
 //! crate's tests run without touching the Win32 API.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // `Termination` and `StreamSummary` are defined in `jean-protocol` because
 // `jean-process` produces them and this crate persists them. Re-exported so
@@ -505,9 +505,32 @@ impl Store {
             // failing: a read-only or network filesystem may refuse WAL, and a
             // J.E.A.N. that will not start because it could not get WAL is worse
             // than one that runs with a slower journal.
-            let applied: String = conn
-                .pragma_update_and_check(None, "journal_mode", mode, |row| row.get(0))
-                .map_err(StoreError::sqlite("journal_mode"))?;
+            let started = Instant::now();
+            let applied: String = loop {
+                match conn.pragma_update_and_check(None, "journal_mode", mode, |row| row.get(0)) {
+                    Ok(applied) => break applied,
+                    Err(rusqlite::Error::SqliteFailure(code, _))
+                        if matches!(
+                            code.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) && started.elapsed() < busy_timeout =>
+                    {
+                        // SQLite's busy handler does not consistently wait for this mode-changing
+                        // pragma. Retry it within the same configured connection budget, before
+                        // migrations, so simultaneous first opens do not fail at setup.
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(busy_timeout.saturating_sub(started.elapsed())),
+                        );
+                    }
+                    Err(source) => {
+                        return Err(StoreError::Sqlite {
+                            context: "journal_mode",
+                            source,
+                        })
+                    }
+                }
+            };
             if !applied.eq_ignore_ascii_case(mode) {
                 tracing::warn!(
                     requested = mode,
@@ -1975,6 +1998,23 @@ impl Store {
             .map_err(StoreError::sqlite("list worker events"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::sqlite("read worker event rows"))
+    }
+
+    /// The latest recorded detail of a given kind for one delegation.
+    pub fn latest_worker_detail(
+        &self,
+        delegation_id: &str,
+        kind: EventKind,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT detail FROM worker_events WHERE delegation_id = ?1 AND kind = ?2
+             ORDER BY seq DESC LIMIT 1",
+                params![delegation_id, kind.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::sqlite("read latest worker detail"))
     }
 
     /// Delegations that were still running when this process started, for reconciliation.

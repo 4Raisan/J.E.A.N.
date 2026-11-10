@@ -75,6 +75,31 @@ fn opening_twice_does_not_reapply_migrations() {
 }
 
 #[test]
+fn concurrent_first_open_serializes_schema_migrations() {
+    let path = temp_db("concurrent-first-open");
+    cleanup(&path);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Store::open(&path, "wal", Duration::from_secs(10)).expect(
+                    "every simultaneous first opener must wait for the migration transaction",
+                )
+            })
+        })
+        .collect();
+    for thread in threads {
+        let store = thread.join().expect("opener thread must not panic");
+        assert_eq!(store.count("tasks").unwrap(), 0);
+    }
+    drop(Store::open(&path, "wal", Duration::from_secs(5)).unwrap());
+    cleanup(&path);
+}
+
+#[test]
 fn a_file_backed_database_uses_wal() {
     let path = temp_db("wal");
     let store = Store::open(&path, "wal", Duration::from_secs(5)).expect("open");
