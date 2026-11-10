@@ -80,6 +80,7 @@ use jean_store::{format_ms, EventRecord, TaskFilter, ToolRunRecord};
 use jean_tools::SortKey;
 
 mod memory;
+mod owner_preferences;
 mod phase1;
 mod phase2;
 mod phase3;
@@ -115,6 +116,11 @@ enum Command {
         #[command(subcommand)]
         command: memory::Preferences,
     },
+    /// Manage inspectable workspace-scoped learned preferences.
+    Preference {
+        #[command(subcommand)]
+        command: owner_preferences::Command,
+    },
     /// Run the owner-operated control session with independent voice and task workers.
     ///
     /// JSON-lines on stdin and stdout by default; `--tty` replaces that with typed
@@ -123,6 +129,14 @@ enum Command {
         /// Read commands instead of JSON frames, and answer in lines instead of frames.
         #[arg(long)]
         tty: bool,
+    },
+    /// Have a read-only conversation turn with the configured model. This never runs a task.
+    Chat {
+        /// The operator's message.
+        message: String,
+        /// Prior turns from the current conversation, serialized as readable text.
+        #[arg(long, default_value = "")]
+        context: String,
     },
     /// Audio endpoints, voice diagnostics and hotkey push-to-talk.
     Voice {
@@ -410,9 +424,18 @@ enum Command {
     ///
     /// The delegation is itself gated: starting an agent with a working directory is an operation, so
     /// `auto_deny`, the elevation boundary and your own approval all apply before a process exists.
+    #[command(alias = "goal")]
     Delegate {
         /// The outcome you want, in your own words. Passed to the worker verbatim.
         goal: String,
+
+        /// Workspace-scoped quality profile for frontend goals.
+        #[arg(long, value_parser = ["quick-prototype", "polished-ui"])]
+        profile: Option<String>,
+
+        /// Task-specific quality instruction; takes precedence over profile guidance.
+        #[arg(long)]
+        instruction: Option<String>,
 
         /// The directory the worker works in. Defaults to `[workspace] root`.
         #[arg(long)]
@@ -425,6 +448,21 @@ enum Command {
         /// Print the observed report as JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Restore and inspect a durable owner-workflow checkpoint.
+    Checkpoint {
+        /// Task id printed by `jean delegate` or `jean goal`.
+        id: String,
+    },
+
+    /// Reconcile and resume one interrupted owner handoff.
+    Resume {
+        /// Original task id printed by `jean goal`.
+        id: String,
+        /// Confirm sign-in or network remediation for a checkpoint with that blocker.
+        #[arg(long)]
+        condition_cleared: bool,
     },
 
     /// Phase 3. Which external agents are configured, and what this build can speak to them.
@@ -911,7 +949,12 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::History { command } => memory::history(&mut ctx, command),
         Command::Memory { command } => memory::facts(&mut ctx, command),
         Command::Preferences { command } => memory::preferences(&mut ctx, command),
+        Command::Preference { command } => {
+            owner_preferences::command(&ctx.paths.data_dir, &ctx.store, command)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Interact { tty } => phase5::interact(&mut ctx, tty),
+        Command::Chat { message, context } => phase2::cmd_chat(&ctx, message, context),
         Command::Voice { action } => phase5::voice(&mut ctx, action),
         Command::Run { tool, args, goal } => cmd_run(&mut ctx, tool, args, goal),
         Command::Tasks {
@@ -1035,6 +1078,8 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         // `agent` reads configuration and resolves names, and starts nothing.
         Command::Delegate {
             goal,
+            profile,
+            instruction,
             workspace,
             worker,
             json,
@@ -1042,11 +1087,92 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             &mut ctx,
             phase3::DelegateOptions {
                 goal,
+                profile,
+                instruction,
                 workspace,
                 worker,
                 json,
             },
         ),
+        Command::Checkpoint { id } => {
+            let checkpoint = jean_core::owner::read_checkpoint(&ctx.paths.data_dir, &id)?;
+            println!("task: {}", checkpoint.task_id);
+            println!("goal: {}", checkpoint.goal);
+            println!("scope: {}", checkpoint.resolved_scope);
+            println!("uncertain effects: {}", checkpoint.uncertain);
+            println!("resumable: {}", checkpoint.resumable);
+            if let Some(blocker) = checkpoint.blocked_on {
+                println!("blocked on: {}", blocker.status());
+            }
+            println!(
+                "resume attempts: {}/{}",
+                checkpoint.attempts, checkpoint.max_attempts
+            );
+            if !checkpoint.remaining_work.is_empty() {
+                println!("remaining work: {}", checkpoint.remaining_work);
+            }
+            for effect in &checkpoint.completed_effects {
+                println!(
+                    "completed effect: {} ({} bytes, sha256 {})",
+                    effect.path, effect.bytes, effect.sha256
+                );
+            }
+            if !checkpoint.eligible_free_workers.is_empty() {
+                println!(
+                    "eligible free workers: {}",
+                    checkpoint.eligible_free_workers.join(", ")
+                );
+            }
+            for result in checkpoint.results {
+                println!("result: {result}");
+            }
+            println!("next action: {}", checkpoint.next_action);
+            if checkpoint.uncertain {
+                println!(
+                    "resume: reconcile task and workspace evidence before retrying; no effect was replayed"
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Resume {
+            id,
+            condition_cleared,
+        } => {
+            let mut prompter = jean_policy::ConsolePrompt::new(&ctx.config.policy);
+            let resumed = if condition_cleared {
+                jean_core::delegation::resume_checkpoint_after_condition_cleared(
+                    &mut ctx,
+                    &id,
+                    &mut prompter,
+                )?
+            } else {
+                jean_core::delegation::resume_checkpoint(&mut ctx, &id, &mut prompter)?
+            };
+            match resumed {
+                jean_core::delegation::ResumeOutcome::Completed(report) => {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
+                    Ok(ExitCode::from(report.result.exit_status() as u16 as u8))
+                }
+                jean_core::delegation::ResumeOutcome::NeedsAttention { task_id, reason } => {
+                    println!("task: {task_id}");
+                    println!("result: needs_attention");
+                    println!("reason: {reason}");
+                    Ok(ExitCode::from(4))
+                }
+                jean_core::delegation::ResumeOutcome::Blocked {
+                    task_id,
+                    status,
+                    reason,
+                } => {
+                    println!("task: {task_id}");
+                    println!("result: {status}");
+                    println!("reason: {reason}");
+                    Ok(ExitCode::from(4))
+                }
+            }
+        }
         Command::Agent => phase3::cmd_agent(&ctx.config.delegation),
         Command::Mcp { action } => phase3::cmd_mcp(&mut ctx, action.into()),
         Command::Browser { action } => phase3::cmd_browser(&mut ctx, action.into()),
@@ -1368,6 +1494,75 @@ fn render_request_json(raw: &str) -> String {
     out
 }
 
+fn print_delegation_activity(
+    out: &mut impl std::io::Write,
+    ctx: &Context,
+    id: &str,
+) -> anyhow::Result<()> {
+    use jean_protocol::EventKind;
+
+    let delegations = ctx.store.delegations_for_task(id)?;
+    let Some(delegation) = delegations.last() else {
+        return Ok(());
+    };
+    let model = ctx
+        .store
+        .latest_worker_detail(&delegation.id, EventKind::WorkerModelConfirmed)?;
+    let progress = ctx
+        .store
+        .latest_worker_detail(&delegation.id, EventKind::WorkerProgress)?;
+    let verifier = delegation
+        .verification_verdict
+        .as_deref()
+        .unwrap_or("not recorded");
+    writeln!(
+        out,
+        "worker      {} ({})",
+        delegation.worker, delegation.kind
+    )?;
+    writeln!(
+        out,
+        "model       {}",
+        model.as_deref().unwrap_or("confirmation not recorded")
+    )?;
+    writeln!(
+        out,
+        "latest step {}",
+        progress
+            .as_deref()
+            .unwrap_or("no worker progress recorded")
+            .escape_default()
+    )?;
+    writeln!(out, "verifier    {verifier}")?;
+
+    let path = jean_core::owner::checkpoint_path(&ctx.paths.data_dir, id)?;
+    match path.try_exists() {
+        Ok(false) => writeln!(out, "checkpoint  absent")?,
+        Ok(true) => match jean_core::owner::read_checkpoint(&ctx.paths.data_dir, id) {
+            Ok(checkpoint) => {
+                let state = if checkpoint.uncertain {
+                    "uncertain; review required before replay"
+                } else if checkpoint.resumed_task_id.is_some() {
+                    "resumed"
+                } else if checkpoint.blocked_on.is_some() {
+                    "blocked"
+                } else if checkpoint.resumable {
+                    "resumable"
+                } else {
+                    "recorded"
+                };
+                writeln!(out, "checkpoint  {state}")?;
+                if let Some(resumed) = checkpoint.resumed_task_id {
+                    writeln!(out, "resumed as  {resumed}")?;
+                }
+            }
+            Err(_) => writeln!(out, "checkpoint  unreadable")?,
+        },
+        Err(_) => writeln!(out, "checkpoint  inaccessible")?,
+    }
+    Ok(())
+}
+
 fn cmd_task(
     ctx: &Context,
     id: String,
@@ -1433,6 +1628,7 @@ fn cmd_task(
         render_request_json(&task.request_json)
     )?;
 
+    print_delegation_activity(&mut out, ctx, &id)?;
     print_plan(&mut out, ctx, &id)?;
     print_runs(&mut out, &runs)?;
 

@@ -20,6 +20,7 @@ jean-tools = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 # The push-to-talk binding polls only its own keys (GetAsyncKeyState). No audio
 # enters the CLI: capture and playback stay in the voice worker process.
 windows = { workspace = true }

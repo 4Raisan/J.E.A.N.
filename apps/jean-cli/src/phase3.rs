@@ -20,9 +20,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::owner_preferences;
 use jean_core::{
-    call_tool, delegate, exposed_tools, list_tools, mcp_bounds, mcp_servers, serve_mcp, Context,
-    DelegateRequest, DelegationReport,
+    Context, DelegateRequest, DelegationReport, call_tool, delegate, exposed_tools, list_tools,
+    mcp_bounds, mcp_servers, serve_mcp,
 };
 use jean_policy::{ConsolePrompt, Decision};
 use jean_protocol::config::{DelegationConfig, WORKER_KINDS};
@@ -31,6 +32,8 @@ use crate::phase1::{field, note};
 
 pub struct DelegateOptions {
     pub goal: String,
+    pub profile: Option<String>,
+    pub instruction: Option<String>,
     /// The directory the worker is pointed at. `None` uses `[workspace] root`.
     pub workspace: Option<PathBuf>,
     /// `None` uses `[delegation] default_worker`.
@@ -47,11 +50,17 @@ pub fn cmd_delegate(ctx: &mut Context, options: DelegateOptions) -> anyhow::Resu
             return Err(anyhow::anyhow!(
                 "no workspace was given and [workspace] root is empty — pass `--workspace \
                  <directory>` or set `[workspace] root`"
-            ))
+            ));
         }
     };
     let request = DelegateRequest {
-        goal: options.goal.clone(),
+        goal: owner_profile_goal(
+            &options.goal,
+            options.profile.as_deref(),
+            options.instruction.as_deref(),
+            owner_preferences::State::load(&ctx.paths.data_dir)?
+                .applies(&workspace.canonicalize()?.display().to_string()),
+        )?,
         workspace,
         worker: options.worker.clone(),
     };
@@ -69,6 +78,75 @@ pub fn cmd_delegate(ctx: &mut Context, options: DelegateOptions) -> anyhow::Resu
         }
     }
     Ok(ExitCode::from(report.result.exit_status() as u16 as u8))
+}
+
+fn owner_profile_goal(
+    goal: &str,
+    profile: Option<&str>,
+    instruction: Option<&str>,
+    learned_no_animation: bool,
+) -> anyhow::Result<String> {
+    let (name, criteria) = match profile {
+        None => ("workspace preference", ""),
+        Some("quick-prototype") => (
+            "quick prototype",
+            "Keep the change minimal; prioritize a working responsive page, reuse existing components, and avoid polish work. Acceptance guidance: render the main flow and verify the key interaction.",
+        ),
+        Some("polished-ui") => (
+            "polished UI",
+            "Deliver a refined responsive interface with consistent spacing, typography, loading/empty/error states, keyboard accessibility, subtle motion and cohesive interaction details. Acceptance guidance: inspect responsive states and accessibility-sensitive controls.",
+        ),
+        Some(other) => anyhow::bail!("unsupported owner profile {other:?}"),
+    };
+    if profile.is_none() && !learned_no_animation && instruction.is_none() {
+        return Ok(goal.to_owned());
+    }
+    let mut effective = if learned_no_animation {
+        let replaced = criteria.replace(
+            "subtle motion",
+            "no animation (accepted workspace preference)",
+        );
+        if replaced == criteria {
+            format!("{criteria}\nAccepted workspace preference: no animation.")
+        } else {
+            replaced
+        }
+    } else {
+        criteria.to_owned()
+    };
+    if profile.is_none() && learned_no_animation {
+        effective = "Respect the accepted workspace preference: no animation.".to_owned();
+    }
+    let override_text = instruction.unwrap_or("").trim();
+    let mut override_note = "none";
+    if learned_no_animation {
+        override_note = "accepted workspace preference: no animation";
+    }
+    if !override_text.is_empty() {
+        // An explicit instruction replaces overlapping profile guidance in the prompt. JEAN's
+        // configured verification remains authoritative and is never synthesized from this text.
+        effective = if override_text.to_ascii_lowercase().contains("no animation") {
+            if profile.is_none() {
+                "No animation (explicit task instruction).".to_owned()
+            } else {
+                let replaced =
+                    criteria.replace("subtle motion", "no animation (explicit override)");
+                if replaced == criteria {
+                    format!("{criteria}\nNo animation (explicit override).")
+                } else {
+                    replaced
+                }
+            }
+        } else {
+            format!(
+                "{criteria}\nExplicit task instruction takes precedence where it conflicts: {override_text}"
+            )
+        };
+        override_note = override_text;
+    }
+    Ok(format!(
+        "{goal}\n\nJEAN owner profile: {name}\nEffective acceptance criteria (worker guidance only): {effective}\nExplicit instruction override: {override_note}\nOnly JEAN's independently configured verification determines the verdict."
+    ))
 }
 
 /// The report as one JSON object.
@@ -105,12 +183,7 @@ fn report_json(report: &DelegationReport) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         text(report.changed_note.as_deref()),
-        text(
-            report
-                .verification
-                .as_ref()
-                .map(|verdict| verdict.label())
-        ),
+        text(report.verification.as_ref().map(|verdict| verdict.label())),
         quote(report.result.as_str()),
         report.result.exit_status(),
         report.events,
@@ -519,11 +592,7 @@ fn cmd_mcp_call(
             )?;
         }
         writeln!(out, "result   ({} bytes{})", report.bytes, {
-            if report.truncated {
-                ", capped"
-            } else {
-                ""
-            }
+            if report.truncated { ", capped" } else { "" }
         })?;
         writeln!(out, "{}", report.text)?;
         for line in &report.notes {
