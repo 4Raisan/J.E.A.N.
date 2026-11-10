@@ -5,6 +5,6 @@
 - Redaction: args/env/goal redacted; captured output NOT redacted (tool prints it).
 - UIPI: integrity mismatch = typed blocker, never retry.
 - Browser: never attach to operator profile; ProfileNotEmpty refused; endpoint loopback-checked.
-- Elevation: single-op helper via `runas`, no password storage, `auto_deny` never elevated.
+- Runtime elevation is unsupported. The policy refuses elevated operations and the installer omits the refusal stub. Installer administrator consent is for setup.
 - Licenses: cargo-deny green (GPL/tray/tauri/conpty/portable-pty/device_query banned; winapi via ntapi wrapper only).
 - Weights: Zipformer Apache-2.0, Kokoro Apache-2.0, lexicon CMUdict BSD-2 w/ attribution.
