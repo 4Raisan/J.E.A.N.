@@ -18,12 +18,13 @@
 //! request reaches the middle of a long utterance rather than only its end.
 
 use sherpa_onnx::{
-    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
-    OfflineTtsModelConfig, OfflineTtsVitsModelConfig, OnlineRecognizer, OnlineRecognizerConfig,
-    VadModelConfig, VoiceActivityDetector,
+    GenerationConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+    OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig, OfflineTtsModelConfig,
+    OfflineTtsVitsModelConfig, OnlineRecognizer, OnlineRecognizerConfig, VadModelConfig,
+    VoiceActivityDetector,
 };
 
-use jean_protocol::config::VoiceConfig;
+use jean_protocol::config::{SpeechRecognizer, VoiceConfig};
 
 use crate::assets;
 use crate::audio::Pcm;
@@ -41,6 +42,9 @@ pub struct SherpaEngine {
 
 impl SherpaEngine {
     pub fn new(config: &VoiceConfig) -> Result<Self, String> {
+        if config.recognizer == SpeechRecognizer::ParakeetTdtV2Int8 && config.sample_rate != 16000 {
+            return Err("Parakeet TDT v2 requires voice.sample_rate = 16000 Hz".into());
+        }
         if assets::recognition(config)
             .iter()
             .any(|check| !check.present)
@@ -66,6 +70,24 @@ impl SherpaEngine {
         // Push-to-talk bounds the utterance, so endpointing must not split one
         // press into several transcripts the owner would have to reassemble.
         config.enable_endpoint = false;
+        config
+    }
+
+    fn parakeet_config(&self) -> OfflineRecognizerConfig {
+        let models = &self.config.models.parakeet;
+        let mut config = OfflineRecognizerConfig::default();
+        config.feat_config.sample_rate = 16000;
+        config.model_config.transducer = OfflineTransducerModelConfig {
+            encoder: Some(models.encoder.clone()),
+            decoder: Some(models.decoder.clone()),
+            joiner: Some(models.joiner.clone()),
+        };
+        config.model_config.tokens = Some(models.tokens.clone());
+        config.model_config.model_type = Some("nemo_transducer".into());
+        config.model_config.provider = Some("cpu".into());
+        config.model_config.num_threads = 2;
+        config.model_config.debug = false;
+        config.decoding_method = Some("greedy_search".into());
         config
     }
 
@@ -159,6 +181,26 @@ impl SherpaEngine {
 
 impl EngineFactory for SherpaEngine {
     fn create_recognizer(&self) -> Result<Box<dyn Recognizer>, String> {
+        if self.config.recognizer == SpeechRecognizer::ParakeetTdtV2Int8 {
+            let recognizer = OfflineRecognizer::create(&self.parakeet_config()).ok_or_else(|| {
+                format!(
+                    "sherpa-onnx could not create the Parakeet TDT v2 INT8 offline recognizer from {} / {} / {} with tokens {}; check that all four files come from the documented Parakeet bundle and use the 16 kHz Nemo transducer export (docs/voice-assets.md §2b)",
+                    self.config.models.parakeet.encoder,
+                    self.config.models.parakeet.decoder,
+                    self.config.models.parakeet.joiner,
+                    self.config.models.parakeet.tokens
+                )
+            })?;
+            return Ok(Box::new(OfflineSherpaRecognizer {
+                recognizer,
+                samples: Vec::new(),
+                sample_rate: self.config.sample_rate,
+                max_frames: self.config.sample_rate as usize
+                    * self.config.capture_timeout_ms as usize
+                    / 1000,
+                active: false,
+            }));
+        }
         let recognizer = OnlineRecognizer::create(&self.recognizer_config()).ok_or_else(|| {
             format!(
                 "sherpa-onnx could not create a streaming recognizer from {} / {} / {} with tokens {}; \
@@ -188,7 +230,14 @@ impl EngineFactory for SherpaEngine {
     }
 
     fn label(&self) -> &'static str {
-        "sherpa-onnx 2.0.1 (streaming transducer ASR; synthesis engine per config)"
+        match self.config.recognizer {
+            SpeechRecognizer::Zipformer => {
+                "sherpa-onnx 2.0.1 (streaming Zipformer transducer ASR; synthesis engine per config)"
+            }
+            SpeechRecognizer::ParakeetTdtV2Int8 => {
+                "sherpa-onnx 2.0.1 (offline Parakeet TDT v2 INT8 ASR; synthesis engine per config)"
+            }
+        }
     }
 }
 
@@ -221,6 +270,71 @@ struct SherpaRecognizer {
     vad: Option<VoiceActivityDetector>,
     stream: Option<sherpa_onnx::OnlineStream>,
     sample_rate: u32,
+}
+
+/// Parakeet TDT is an offline model: collect the bounded press, then decode it
+/// once on release. This implements the same worker interface as Zipformer.
+struct OfflineSherpaRecognizer {
+    recognizer: OfflineRecognizer,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    max_frames: usize,
+    active: bool,
+}
+
+impl Recognizer for OfflineSherpaRecognizer {
+    fn begin(&mut self) -> Result<(), String> {
+        if self.active {
+            return Err("Parakeet recognizer is already capturing".into());
+        }
+        self.samples.clear();
+        self.active = true;
+        Ok(())
+    }
+
+    fn feed(&mut self, pcm: &Pcm, cancel: &CancelFlag) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("recognition cancelled".into());
+        }
+        if !self.active {
+            return Err("audio arrived before push-to-talk activation".into());
+        }
+        if pcm.sample_rate != self.sample_rate {
+            return Err(format!(
+                "Parakeet expects {} Hz PCM, got {} Hz",
+                self.sample_rate, pcm.sample_rate
+            ));
+        }
+        if self.samples.len().saturating_add(pcm.samples.len()) > self.max_frames {
+            return Err("Parakeet capture exceeded voice.capture_timeout_ms".into());
+        }
+        self.samples.extend_from_slice(&pcm.samples);
+        Ok(())
+    }
+
+    fn finish(&mut self, cancel: &CancelFlag) -> Result<String, String> {
+        if cancel.is_cancelled() {
+            return Err("recognition cancelled".into());
+        }
+        if !std::mem::take(&mut self.active) {
+            return Err("Parakeet recognizer was not capturing".into());
+        }
+        if self.samples.is_empty() {
+            return Err("Parakeet capture contained no audio frames".into());
+        }
+        let stream = self.recognizer.create_stream();
+        stream.accept_waveform(self.sample_rate as i32, &self.samples);
+        self.recognizer.decode(&stream);
+        if cancel.is_cancelled() {
+            self.samples.clear();
+            return Err("recognition cancelled".into());
+        }
+        let result = stream
+            .get_result()
+            .ok_or_else(|| "sherpa-onnx returned no Parakeet result".to_owned())?;
+        self.samples.clear();
+        Ok(result.text.trim().to_owned())
+    }
 }
 
 impl SherpaRecognizer {

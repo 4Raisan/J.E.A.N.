@@ -9,7 +9,7 @@
 //! the task worker.
 
 use std::io::{self, BufReader};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use jean_protocol::config::{AudioBackend as AudioBackendKind, SpeechBackend, VoiceConfig};
@@ -640,6 +640,10 @@ pub fn doctor() -> i32 {
             "enabled": config.enabled,
             "mode": config.mode,
             "backend": format!("{:?}", config.backend),
+            "recognizer": match config.recognizer {
+                jean_protocol::config::SpeechRecognizer::Zipformer => "zipformer",
+                jean_protocol::config::SpeechRecognizer::ParakeetTdtV2Int8 => "parakeet_tdt_v2_int8",
+            },
             "audio_backend": format!("{:?}", config.audio_backend()),
             // Non-empty means no endpoint is opened in either direction, which is
             // the difference between a validation run and a noisy one.
@@ -718,6 +722,7 @@ pub fn transcribe(path: &str) -> i32 {
             return 1;
         }
     };
+    let processing_started = Instant::now();
     let factory = match engine_factory(&config) {
         Ok(factory) => factory,
         Err(reason) => {
@@ -773,6 +778,7 @@ pub fn transcribe(path: &str) -> i32 {
             "engine_sample_rate": config.sample_rate,
             "frames": frames.len(),
             "duration_ms": source.duration().as_millis() as u64,
+            "offline_processing_ms": processing_started.elapsed().as_millis() as u64,
             "transcript": transcript,
         })
     );

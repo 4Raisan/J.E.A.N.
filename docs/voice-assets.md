@@ -136,7 +136,7 @@ fp32 decoder is unchanged. Mixing int8 and fp32 across the three files is fine �
 it is the same exported model — but all three must come from **this one
 directory**, because a mismatched `tokens.txt` silently produces the wrong words.
 
-### 2b. Offline alternative: Parakeet TDT 0.6B v2 INT8 (identified, not provisioned)
+### 2b. Offline alternative: Parakeet TDT 0.6B v2 INT8 (adapter shipped; weights not provisioned)
 
 The pinned `sherpa-onnx` 2.0.1 Rust crate and its matching native tree **can** run NVIDIA's
 English Parakeet TDT 0.6B v2. There is no `tdt` field on `OfflineModelConfig`, and that is a false
@@ -152,14 +152,75 @@ upstream's CLI for this asset says.
 | Checksum | the GitHub release publishes **none** (`digests: null`); verify the extracted files against the mirror's LFS SHA-256 at `https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8` — `encoder.int8.onnx` `92a10bd9…57ca8b` (652,282,309 B), `decoder.int8.onnx` `4d097bae…020f41` (7,257,753 B), `joiner.int8.onnx` `77a29f3e…56f428` (1,739,080 B), `tokens.txt` (9,384 B, not an LFS object) |
 | Destination | `%LOCALAPPDATA%\JEAN\models\asr\sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8\` |
 
-It does not work yet, and not because of the library: the worker builds an `OnlineRecognizer`
-only ([`workers/voice/src/sherpa.rs`](file:///C:/Users/4Raisan/Desktop/MIII/Personal%20Projects/J.E.A.N.%20-%20The%20AI%20Companion/workers/voice/src/sherpa.rs)),
-and a TDT export has no streaming cache inputs for it. Two changes are needed — an
-`OfflineRecognizer` pass fed from the buffered press at `EndCapture`, and config keys for a second
-model family, since `voice.models.encoder/decoder/joiner/tokens` already name the streaming bundle
-and `VoiceConfig` denies unknown fields. A selector defaulting to streaming keeps **this** zipformer
-the default and the comparison honest; `IMPLEMENTATION_STATUS.md` §65.4 has the detail and
-`target/p5u-compare.ps1` is the harness that runs the moment both halves exist.
+JEAN now offers an explicit `[voice] recognizer = "parakeet_tdt_v2_int8"` choice alongside
+`"zipformer"` (the unchanged default). Parakeet is buffered for one bounded push-to-talk capture
+and decoded once on release through the pinned 2.0.1 `OfflineRecognizer`, configured with the
+three transducer files, `tokens.txt`, CPU provider and `model_type = "nemo_transducer"`. It requires
+`voice.sample_rate = 16000`. Its files live under `[voice.models.parakeet]` and must come from one
+Parakeet bundle; they do not replace or mix with the streaming `voice.models.encoder/decoder/joiner/tokens`.
+Missing files identify their exact configuration keys, and an incompatible bundle names the selected
+model family and the asset documentation. Synthesis continues to use its existing Kokoro/VITS fields.
+
+Example Parakeet settings (put these in each isolated comparison config alongside the existing
+`[voice.models]` synthesis keys):
+
+```toml
+[voice]
+recognizer = "parakeet_tdt_v2_int8"
+sample_rate = 16000
+
+[voice.models.parakeet]
+encoder = "C:/models/parakeet/encoder.int8.onnx"
+decoder = "C:/models/parakeet/decoder.int8.onnx"
+joiner = "C:/models/parakeet/joiner.int8.onnx"
+tokens = "C:/models/parakeet/tokens.txt"
+```
+
+The worker exposes the selected recognizer in `jean voice doctor` and the engine label returned from
+`jean voice transcribe`. The transcribe JSON's `offline_processing_ms` covers engine creation/model
+load, PCM resampling, and inference/finalization after WAV parsing. The harness also records `CommandWallMs` (process
+startup through result) and sampled peak working set. Neither duration is microphone release-to-text
+latency.
+
+`tools/voice-tester/compare-asr.ps1` runs the same manifest WAVs through isolated data directories
+whose `[voice].recognizer` is respectively `zipformer` and `parakeet_tdt_v2_int8`. Provide a UTF-8
+CSV with these columns:
+
+```csv
+wav,expected,app_names,developer_terms
+recordings/example.wav,"Open Jean and inspect sherpa onnx","Jean","sherpa-onnx"
+```
+
+Semicolon-separate multiple names or terms. Supply an explicit term in a category that does not apply
+to a row, or use `-` for an empty category. Matching is exact
+after case/punctuation normalization and requires phrase boundaries. Each recognizer row records
+substitutions, deletions, insertions, word error rate, normalized whole-transcript exact match, exact
+app-name/developer-term matches, offline processing time, command wall time, sampled combined CLI and
+voice-worker working set, exit code, engine confirmation, transcript and errors. Keep the manifest and output private; the
+CSV contains the recognized transcript.
+
+When both model bundles and consented recordings are present, run:
+
+```powershell
+$env:SHERPA_ONNX_LIB_DIR = "$env:LOCALAPPDATA\JEAN\native\sherpa-onnx-v2.0.1-win-x64-static-MT-Release-lib\lib"
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+cargo build -p jean-voice --features sherpa --locked --offline -j 2
+
+pwsh -NoProfile -File tools/voice-tester/compare-asr.ps1 `
+  -JeanExe target\debug\jean.exe `
+  -VoiceWorkerExe target\debug\jean-voice.exe `
+  -RecordingsCsv C:\private\jean-asr\recordings.csv `
+  -ZipformerDataDir C:\private\jean-asr\zipformer `
+  -ParakeetDataDir C:\private\jean-asr\parakeet `
+  -OutputCsv C:\private\jean-asr\comparison.csv
+```
+
+Each data directory needs its own `jean.toml`, with the selected recognizer and the complete matching
+asset paths. `VoiceWorkerExe` must be a worker built with `--features sherpa` against the pinned
+native library. `-ValidateOnly` checks the configs and recording manifest without invoking inference;
+`-SelfTest` exercises only synthetic scoring fixtures and is never recognition evidence. No operator
+recordings were found with this checkout and the Parakeet bundle is not provisioned here, so the
+Zipformer vendor sample clips are not used to claim a two-model result.
 
 ## 3. Voice activity detection (optional)
 
@@ -489,7 +550,7 @@ Then, in this repository:
    `recognition_assets` must all be `present: true`; `synthesis_assets` may stay
    false and recognition will still work, because the two are provisioned
    separately. `engine.label` becomes
-   `sherpa-onnx 2.0.1 (streaming transducer ASR; synthesis engine per config)`,
+   the selected recognizer and engine label (default `zipformer`, the streaming transducer),
    `sherpa_feature_linked` becomes `true`, and `native_provisioning` prints the
    `SHERPA_ONNX_LIB_DIR` path the worker process actually inherited.
    To validate without touching your own `jean.toml`, keep the file in a scratch

@@ -2,7 +2,7 @@
 //! document that lists the download, because "model not found" on its own sends
 //! an operator looking in the wrong place.
 
-use jean_protocol::config::VoiceConfig;
+use jean_protocol::config::{SpeechRecognizer, VoiceConfig};
 
 pub struct AssetCheck {
     pub key: &'static str,
@@ -30,15 +30,36 @@ fn check(key: &'static str, path: &str, dir: bool) -> AssetCheck {
 /// because it lacks the other.
 pub fn recognition(config: &VoiceConfig) -> Vec<AssetCheck> {
     let models = &config.models;
-    [
-        ("voice.models.encoder", &models.encoder, false),
-        ("voice.models.decoder", &models.decoder, false),
-        ("voice.models.joiner", &models.joiner, false),
-        ("voice.models.tokens", &models.tokens, false),
-    ]
-    .into_iter()
-    .map(|(key, path, dir)| check(key, path, dir))
-    .collect()
+    let entries = match config.recognizer {
+        SpeechRecognizer::Zipformer => vec![
+            ("voice.models.encoder", models.encoder.as_str()),
+            ("voice.models.decoder", models.decoder.as_str()),
+            ("voice.models.joiner", models.joiner.as_str()),
+            ("voice.models.tokens", models.tokens.as_str()),
+        ],
+        SpeechRecognizer::ParakeetTdtV2Int8 => vec![
+            (
+                "voice.models.parakeet.encoder",
+                models.parakeet.encoder.as_str(),
+            ),
+            (
+                "voice.models.parakeet.decoder",
+                models.parakeet.decoder.as_str(),
+            ),
+            (
+                "voice.models.parakeet.joiner",
+                models.parakeet.joiner.as_str(),
+            ),
+            (
+                "voice.models.parakeet.tokens",
+                models.parakeet.tokens.as_str(),
+            ),
+        ],
+    };
+    entries
+        .into_iter()
+        .map(|(key, path)| check(key, path, false))
+        .collect()
 }
 
 /// What synthesis needs, which depends on the bundle: VITS takes a model and a
@@ -150,8 +171,12 @@ pub fn native_unavailable(config: &VoiceConfig, linked: bool) -> String {
              {missing}. The fixture backend is a test double and is never reported as speech."
         );
     }
+    let recognizer = match config.recognizer {
+        SpeechRecognizer::Zipformer => "zipformer (streaming transducer)",
+        SpeechRecognizer::ParakeetTdtV2Int8 => "parakeet_tdt_v2_int8 (offline Nemo transducer)",
+    };
     format!(
-        "sherpa-onnx is linked but the configured recognition assets are unusable: {missing}. \
+        "sherpa-onnx is linked but selected recognizer {recognizer} has unusable assets: {missing}. \
          Point the voice.models keys at real files (docs/voice-assets.md lists the bundles, \
          versions, checksums and licenses). Optional assets: {}.",
         describe_missing(&optional(config))
@@ -179,7 +204,7 @@ pub fn synthesis_unavailable_for(config: &VoiceConfig, needs_lexicon: bool) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jean_protocol::config::{SpeechBackend, SpeechModels};
+    use jean_protocol::config::{SpeechBackend, SpeechModels, SpeechRecognizer};
 
     #[test]
     fn an_unprovisioned_default_names_every_unset_key_and_the_feature() {
@@ -202,6 +227,27 @@ mod tests {
         assert!(!message.contains("without the `sherpa` feature"));
         assert!(message.contains("voice.models.decoder is unset"));
         assert!(message.contains("Optional assets"));
+    }
+
+    #[test]
+    fn parakeet_reports_its_separate_bundle_and_actionable_missing_keys() {
+        let mut config = VoiceConfig::default();
+        config.recognizer = SpeechRecognizer::ParakeetTdtV2Int8;
+        let checks = recognition(&config);
+        assert_eq!(checks.len(), 4);
+        assert!(checks.iter().all(|check| !check.present));
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.key.starts_with("voice.models.parakeet."))
+        );
+        let error = native_unavailable(&config, true);
+        assert!(
+            error.contains("voice.models.parakeet.encoder is unset"),
+            "{error}"
+        );
+        assert!(error.contains("docs/voice-assets.md"), "{error}");
+        assert!(!error.contains("voice.models.encoder is unset"), "{error}");
     }
 
     #[test]
