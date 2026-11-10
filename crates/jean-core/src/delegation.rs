@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 
 use jean_acp::contract::{
     Bounds, DelegateRequest as WorkerRequest, EventSink, PermissionAnswer, PermissionHost,
-    PermissionRequest, RunSpec, WorkerAction, WorkerEvent, WorkerOutcome, STOP_CANCELLED,
+    PermissionRequest, RunSpec, WorkerAction, WorkerEvent, WorkerFailureKind, WorkerOutcome,
+    STOP_CANCELLED,
 };
 use jean_policy::{
     AuditEvent, AuditWriter, Authority, Decision, DenyReason, Operation, OperationKind, Policy,
@@ -162,6 +163,20 @@ pub struct DelegationReport {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug)]
+pub enum ResumeOutcome {
+    Completed(DelegationReport),
+    NeedsAttention {
+        task_id: String,
+        reason: String,
+    },
+    Blocked {
+        task_id: String,
+        status: String,
+        reason: String,
+    },
+}
+
 impl DelegationReport {
     /// The operator-facing summary, one line per fact.
     pub fn lines(&self) -> Vec<String> {
@@ -172,6 +187,7 @@ impl DelegationReport {
             self.kind,
             self.workspace.display()
         )];
+        out.push(format!("task: {}", self.task_id));
         out.push(format!("isolation: {}", self.isolation));
         out.push(format!("baseline check: {}", verdict_text(&self.baseline)));
         out.push(format!(
@@ -264,8 +280,23 @@ pub fn delegate_with(
     prompter: &mut dyn Prompter,
     runner: &dyn WorkerRunner,
 ) -> Result<DelegationReport> {
+    delegate_with_mode(ctx, request, prompter, runner, false, true)
+}
+
+fn delegate_with_mode(
+    ctx: &mut Context,
+    request: &DelegateRequest,
+    prompter: &mut dyn Prompter,
+    runner: &dyn WorkerRunner,
+    resume_in_place: bool,
+    allow_recovery_resume: bool,
+) -> Result<DelegationReport> {
     ctx.prepare_for_writing()?;
-    let config = ctx.config.delegation.clone();
+    let mut config = ctx.config.delegation.clone();
+    if resume_in_place {
+        config.isolate_in_worktree = false;
+        config.require_clean_baseline = false;
+    }
     if !config.enabled {
         return Err(CoreError::Intent {
             reason:
@@ -461,6 +492,35 @@ pub fn delegate_with(
         return Err(CoreError::Intent { reason: note });
     }
 
+    // Durable before the worker can modify its isolated workspace. If this process is interrupted,
+    // the uncertain marker forces reconciliation against the task record and workspace evidence.
+    crate::owner::write_checkpoint(
+        &ctx.paths.data_dir,
+        &crate::owner::Checkpoint {
+            task_id: task_id.clone(),
+            goal: request.goal.clone(),
+            resolved_scope: format!(
+                "{}; verification: {}",
+                workdir.display(),
+                verification.describe()
+            ),
+            results: vec![format!("baseline verification: {}", baseline.label())],
+            next_action: "worker may act; reconcile workspace and task evidence before retry"
+                .to_owned(),
+            uncertain: true,
+            workspace: workdir.display().to_string(),
+            remaining_work: request.goal.clone(),
+            completed_effects: Vec::new(),
+            eligible_free_workers: Vec::new(),
+            attempted_workers: vec![worker.name.clone()],
+            attempts: 0,
+            max_attempts: 1,
+            resumable: false,
+            resumed_task_id: None,
+            blocked_on: None,
+        },
+    )?;
+
     // The worker session.
     let bounds = Bounds {
         max_frame_bytes: config.max_frame_bytes,
@@ -638,7 +698,139 @@ pub fn delegate_with(
     let cancelled = cancel.load(Ordering::Relaxed)
         || outcome.stop_reason == STOP_CANCELLED
         || token.is_cancelled();
-    let result = decide_result(cancelled, &outcome, verification_verdict.as_ref());
+    let recovery_failure = outcome.failure_kind;
+    let recognized_recovery = recovery_failure.is_some();
+    let result = if recognized_recovery {
+        DelegationResult::NeedsAttention
+    } else {
+        decide_result(cancelled, &outcome, verification_verdict.as_ref())
+    };
+
+    let mut checkpoint_results = vec![
+        format!("baseline verification: {}", baseline.label()),
+        format!("worker stopped: {}", outcome.stop_reason),
+        format!(
+            "independent verification: {}",
+            verification_verdict
+                .as_ref()
+                .map(Verdict::label)
+                .unwrap_or("not run")
+        ),
+        format!("JEAN task verdict: {}", result.as_str()),
+    ];
+    checkpoint_results.extend(shown.iter().map(|file| format!("changed: {file}")));
+    let mut resumable = false;
+    let remaining_work = outcome.remaining_work.clone().unwrap_or_default();
+    let mut completed_effects = Vec::new();
+    let mut eligible_free_workers = Vec::new();
+    let mut attempted_workers = vec![worker.name.clone()];
+    let mut blocked_on = match recovery_failure {
+        Some(WorkerFailureKind::SignInExpired) => {
+            Some(crate::owner::RecoveryBlocker::SignInExpired)
+        }
+        Some(WorkerFailureKind::NetworkUnavailable) => {
+            Some(crate::owner::RecoveryBlocker::NetworkUnavailable)
+        }
+        _ => None,
+    };
+    let mut next_action = if result == DelegationResult::Succeeded {
+        "review the verified diff; no further action is pending".to_owned()
+    } else {
+        "review task status and reconcile workspace evidence before any retry".to_owned()
+    };
+    if recognized_recovery && allow_recovery_resume {
+        eligible_free_workers = config
+            .workers
+            .iter()
+            .filter(|candidate| {
+                candidate.enabled && candidate.free_fallback && candidate.name != worker.name
+            })
+            .map(|candidate| candidate.name.clone())
+            .collect();
+        let effect_snapshot = if pre_existing.is_empty() {
+            if changed.is_empty() {
+                Ok(Vec::new())
+            } else {
+                crate::owner::snapshot_workspace_effects(&workdir, &changed)
+            }
+        } else {
+            Err(CoreError::Environment {
+                reason: "the initial workspace already had uncommitted changes".to_owned(),
+            })
+        };
+        match effect_snapshot {
+            Ok(effects)
+                if !remaining_work.trim().is_empty() && !eligible_free_workers.is_empty() =>
+            {
+                completed_effects = effects;
+                resumable = true;
+                next_action = match recovery_failure {
+                    Some(WorkerFailureKind::QuotaExhausted) => format!(
+                        "quota_exhausted: resume once with an eligible free worker: jean resume {task_id}"
+                    ),
+                    Some(WorkerFailureKind::ContextExhausted) => format!(
+                        "context_exhausted: resume remaining work in a fresh session: jean resume {task_id}"
+                    ),
+                    Some(WorkerFailureKind::SignInExpired) => format!(
+                        "{}: {}; then run jean resume {task_id} --condition-cleared",
+                        crate::owner::RecoveryBlocker::SignInExpired.status(),
+                        crate::owner::RecoveryBlocker::SignInExpired.action()
+                    ),
+                    Some(WorkerFailureKind::NetworkUnavailable) => format!(
+                        "{}: {}; then run jean resume {task_id} --condition-cleared",
+                        crate::owner::RecoveryBlocker::NetworkUnavailable.status(),
+                        crate::owner::RecoveryBlocker::NetworkUnavailable.action()
+                    ),
+                    None => unreachable!(),
+                };
+            }
+            Ok(_) => {
+                next_action = "needs_attention: quota evidence lacked remaining work or an eligible free worker".to_owned();
+            }
+            Err(error) => {
+                next_action = format!("needs_attention: quota fallback is unsafe: {error}");
+            }
+        }
+        if eligible_free_workers.is_empty() {
+            next_action = "needs_attention: no explicitly free-eligible fallback worker is enabled"
+                .to_owned();
+            resumable = false;
+        }
+    }
+    if !allow_recovery_resume && recovery_failure.is_some() {
+        resumable = false;
+        if blocked_on.is_none() {
+            next_action =
+                "needs_attention: the one replacement attempt ended; no further retry is allowed"
+                    .to_owned();
+        }
+    }
+    let checkpoint_workspace = workdir.display().to_string();
+    crate::owner::write_checkpoint(
+        &ctx.paths.data_dir,
+        &crate::owner::Checkpoint {
+            task_id: task_id.clone(),
+            goal: request.goal.clone(),
+            resolved_scope: format!(
+                "{}; verification: {}",
+                workdir.display(),
+                verification.describe()
+            ),
+            results: checkpoint_results,
+            next_action,
+            uncertain: false,
+            workspace: checkpoint_workspace,
+            remaining_work,
+            completed_effects,
+            eligible_free_workers,
+            attempted_workers: std::mem::take(&mut attempted_workers),
+            attempts: 0,
+            max_attempts: if recognized_recovery { 1 } else { 0 },
+            resumable,
+            resumed_task_id: None,
+            blocked_on: blocked_on.take(),
+        },
+    )?;
 
     let mut notes = Vec::new();
     if let Some(failure) = &outcome.failure {
@@ -709,6 +901,222 @@ pub fn delegate_with(
         transcript,
         notes,
     })
+}
+
+/// Restore a checkpoint, reconcile its exact workspace evidence, and make at most one
+/// replacement delegation through the ordinary policy/verification path.
+pub fn resume_checkpoint_with(
+    ctx: &mut Context,
+    task_id: &str,
+    prompter: &mut dyn Prompter,
+    runner: &dyn WorkerRunner,
+) -> Result<ResumeOutcome> {
+    resume_checkpoint_with_condition(ctx, task_id, prompter, runner, false)
+}
+
+fn resume_checkpoint_with_condition(
+    ctx: &mut Context,
+    task_id: &str,
+    prompter: &mut dyn Prompter,
+    runner: &dyn WorkerRunner,
+    condition_cleared: bool,
+) -> Result<ResumeOutcome> {
+    let mut checkpoint = crate::owner::read_checkpoint(&ctx.paths.data_dir, task_id)?;
+    let attention = |ctx: &Context, checkpoint: &mut crate::owner::Checkpoint, reason: String| {
+        checkpoint.resumable = false;
+        checkpoint.next_action = format!("needs_attention: {reason}");
+        crate::owner::write_checkpoint(&ctx.paths.data_dir, checkpoint)?;
+        Ok::<ResumeOutcome, CoreError>(ResumeOutcome::NeedsAttention {
+            task_id: checkpoint.task_id.clone(),
+            reason,
+        })
+    };
+
+    if checkpoint.uncertain {
+        return Ok(ResumeOutcome::NeedsAttention {
+            task_id: checkpoint.task_id,
+            reason: "a replacement may already have acted; preserve the reservation and reconcile manually before retrying".to_owned(),
+        });
+    }
+    if !checkpoint.resumable {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "checkpoint is not marked resumable".to_owned(),
+        );
+    }
+    if checkpoint.attempts >= checkpoint.max_attempts || checkpoint.max_attempts == 0 {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "the checkpoint's bounded retry count is exhausted".to_owned(),
+        );
+    }
+    if let Err(error) = crate::owner::reconcile_for_resume(&checkpoint) {
+        return attention(ctx, &mut checkpoint, error.to_string());
+    }
+    if let Some(
+        blocker @ (crate::owner::RecoveryBlocker::SignInExpired
+        | crate::owner::RecoveryBlocker::NetworkUnavailable),
+    ) = checkpoint.blocked_on
+    {
+        if !condition_cleared {
+            let reason = blocker.action().to_owned();
+            checkpoint.next_action = format!(
+                "{}: {reason}; then run jean resume {} --condition-cleared",
+                blocker.status(),
+                checkpoint.task_id
+            );
+            crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
+            return Ok(ResumeOutcome::Blocked {
+                task_id: checkpoint.task_id.clone(),
+                status: blocker.status().to_owned(),
+                reason,
+            });
+        }
+    }
+
+    let min_free = ctx.config.delegation.resume_min_free_disk_bytes;
+    for path in [
+        Path::new(&checkpoint.workspace),
+        ctx.paths.data_dir.as_path(),
+    ] {
+        match available_disk_bytes(path) {
+            Ok(bytes) if bytes >= min_free => {}
+            Ok(bytes) => {
+                let blocker = crate::owner::RecoveryBlocker::LowDisk;
+                let reason = format!(
+                    "{}; detected {bytes} available bytes, configured minimum is {min_free}",
+                    blocker.action()
+                );
+                checkpoint.blocked_on = Some(blocker);
+                checkpoint.next_action = format!("{}: {reason}", blocker.status());
+                crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
+                return Ok(ResumeOutcome::Blocked {
+                    task_id: checkpoint.task_id.clone(),
+                    status: blocker.status().to_owned(),
+                    reason,
+                });
+            }
+            Err(error) => {
+                let blocker = crate::owner::RecoveryBlocker::DiskCheckUnavailable;
+                let reason = format!("{}: {error}", blocker.action());
+                checkpoint.blocked_on = Some(blocker);
+                checkpoint.next_action = format!("{}: {reason}", blocker.status());
+                crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
+                return Ok(ResumeOutcome::Blocked {
+                    task_id: checkpoint.task_id.clone(),
+                    status: blocker.status().to_owned(),
+                    reason,
+                });
+            }
+        }
+    }
+    let candidate = checkpoint.eligible_free_workers.iter().find_map(|name| {
+        ctx.config.delegation.workers.iter().find(|worker| {
+            worker.name == *name
+                && worker.enabled
+                && worker.free_fallback
+                && !checkpoint
+                    .attempted_workers
+                    .iter()
+                    .any(|attempted| attempted == name)
+        })
+    });
+    let Some(candidate) = candidate else {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "no enabled, explicitly free-eligible untried worker remains".to_owned(),
+        );
+    };
+    if checkpoint.remaining_work.trim().is_empty() {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "checkpoint has no remaining work".to_owned(),
+        );
+    }
+
+    let worker_name = candidate.name.clone();
+    checkpoint.blocked_on = None;
+    checkpoint.attempts += 1;
+    checkpoint.attempted_workers.push(worker_name.clone());
+    checkpoint.uncertain = true;
+    checkpoint.resumable = false;
+    checkpoint.next_action =
+        format!("replacement worker {worker_name:?} may act; reconcile before any further retry");
+    crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
+
+    let request = DelegateRequest {
+        goal: checkpoint.remaining_work.clone(),
+        workspace: PathBuf::from(&checkpoint.workspace),
+        worker: Some(worker_name.clone()),
+    };
+    let report = delegate_with_mode(ctx, &request, prompter, runner, true, false)?;
+
+    checkpoint.uncertain = false;
+    checkpoint.resumed_task_id = Some(report.task_id.clone());
+    checkpoint
+        .results
+        .push(format!("replacement worker: {worker_name}"));
+    checkpoint.results.push(format!(
+        "replacement task verdict: {}",
+        report.result.as_str()
+    ));
+    checkpoint.next_action = if report.result == DelegationResult::Succeeded {
+        "resume verified; no further worker attempt is allowed".to_owned()
+    } else {
+        "needs_attention: replacement did not independently verify; no further worker attempt is allowed".to_owned()
+    };
+    crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
+    Ok(ResumeOutcome::Completed(report))
+}
+
+pub fn resume_checkpoint(
+    ctx: &mut Context,
+    task_id: &str,
+    prompter: &mut dyn Prompter,
+) -> Result<ResumeOutcome> {
+    resume_checkpoint_with(ctx, task_id, prompter, &AcpRunner)
+}
+
+pub fn resume_checkpoint_after_condition_cleared(
+    ctx: &mut Context,
+    task_id: &str,
+    prompter: &mut dyn Prompter,
+) -> Result<ResumeOutcome> {
+    resume_checkpoint_with_condition(ctx, task_id, prompter, &AcpRunner, true)
+}
+
+fn available_disk_bytes(path: &Path) -> std::result::Result<u64, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        let resolved = path
+            .canonicalize()
+            .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
+        let wide: Vec<u16> = resolved.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut available = 0_u64;
+        // SAFETY: `wide` is NUL-terminated and remains alive for the call. The output pointer
+        // points to a valid u64 for the duration of the synchronous Windows API call.
+        unsafe {
+            windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                PCWSTR(wide.as_ptr()),
+                Some(&mut available),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| format!("free-space query failed: {error}"))?;
+        Ok(available)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("free-space checking is implemented only on Windows".to_owned())
+    }
 }
 
 /// The result rule, in one place because it is the sentence the whole phase is judged on.

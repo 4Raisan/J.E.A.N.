@@ -40,6 +40,25 @@ pub enum SpeechBackend {
     Fixture,
 }
 
+/// Recognition family. Zipformer remains the default streaming engine; Parakeet
+/// is decoded offline after the captured utterance has been buffered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechRecognizer {
+    #[default]
+    Zipformer,
+    ParakeetTdtV2Int8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ParakeetModels {
+    pub encoder: String,
+    pub decoder: String,
+    pub joiner: String,
+    pub tokens: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpeechModels {
@@ -47,6 +66,8 @@ pub struct SpeechModels {
     pub decoder: String,
     pub joiner: String,
     pub tokens: String,
+    /// Separate offline bundle; never mixed with the streaming Zipformer files.
+    pub parakeet: ParakeetModels,
     pub tts_model: String,
     pub tts_tokens: String,
     pub tts_lexicon: String,
@@ -87,6 +108,8 @@ pub struct VoiceConfig {
     pub enabled: bool,
     pub mode: String,
     pub backend: SpeechBackend,
+    /// Defaults to Zipformer to preserve the existing streaming path.
+    pub recognizer: SpeechRecognizer,
     pub startup_timeout_ms: u64,
     pub request_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
@@ -143,6 +166,7 @@ impl Default for VoiceConfig {
             enabled: false,
             mode: "push_to_talk".into(),
             backend: SpeechBackend::SherpaOnnx,
+            recognizer: SpeechRecognizer::Zipformer,
             startup_timeout_ms: 5000,
             request_timeout_ms: 2000,
             shutdown_timeout_ms: 2000,
@@ -207,6 +231,11 @@ impl VoiceConfig {
         }
         if !(8000..=192000).contains(&self.sample_rate) {
             return Err(fail("engine sample rate must be 8000..=192000 Hz"));
+        }
+        if self.recognizer == SpeechRecognizer::ParakeetTdtV2Int8 && self.sample_rate != 16000 {
+            return Err(fail(
+                "Parakeet TDT v2 requires voice.sample_rate = 16000 Hz",
+            ));
         }
         for (name, device) in [
             ("input_device", &self.input_device),
@@ -342,7 +371,9 @@ pub enum ConfigError {
     #[error("config file {path}: {reason}")]
     Io { path: PathBuf, reason: String },
 
-    #[error("config file {path}: unsupported config_version {found}; this build supports exactly {supported}. Refusing to guess how older/newer keys map.")]
+    #[error(
+        "config file {path}: unsupported config_version {found}; this build supports exactly {supported}. Refusing to guess how older/newer keys map."
+    )]
     UnsupportedVersion {
         path: PathBuf,
         found: u64,
@@ -1296,6 +1327,10 @@ pub struct WorkerConfig {
     /// Model name passed to the worker when it takes one. Never a prompt.
     #[serde(default)]
     pub model: String,
+    /// Explicitly eligible as a free recovery worker. False by default; JEAN never
+    /// treats a worker's model name or provider error text as evidence that it is free.
+    #[serde(default)]
+    pub free_fallback: bool,
     /// Environment variable **names** forwarded to the worker. Values are never
     /// configurable here, and a name listed here is forwarded only if the process
     /// allowlist in `[process].env_allowlist` also permits it.
@@ -1364,6 +1399,10 @@ pub struct DelegationConfig {
     pub verify_args: Vec<String>,
     #[serde(default = "d_verify_timeout")]
     pub verify_timeout_secs: u64,
+    /// Required available space on both the workspace and JEAN data volume before a
+    /// replacement worker is started. The retry remains pending when this floor is not met.
+    #[serde(default = "d_resume_min_free_disk_bytes")]
+    pub resume_min_free_disk_bytes: u64,
     /// Run the worker in a detached `git worktree` of the workspace instead of the
     /// operator's own checkout.
     #[serde(default = "d_true")]
@@ -1498,6 +1537,9 @@ const fn d_max_worker_output_bytes() -> u64 {
 const fn d_verify_timeout() -> u64 {
     900
 }
+const fn d_resume_min_free_disk_bytes() -> u64 {
+    512 * 1024 * 1024
+}
 const fn d_max_changed_files() -> usize {
     200
 }
@@ -1585,6 +1627,7 @@ fn default_workers() -> Vec<WorkerConfig> {
             args: vec!["acp".to_owned()],
             enabled: true,
             model: String::new(),
+            free_fallback: false,
             env_passthrough: Vec::new(),
             capability: "agent.delegate".to_owned(),
             sandbox: "workspace-write".to_owned(),
@@ -1600,6 +1643,7 @@ fn default_workers() -> Vec<WorkerConfig> {
             args: vec!["exec".to_owned()],
             enabled: true,
             model: String::new(),
+            free_fallback: false,
             env_passthrough: Vec::new(),
             capability: "agent.delegate".to_owned(),
             sandbox: "workspace-write".to_owned(),
@@ -1700,6 +1744,9 @@ impl DelegationConfig {
         }
         if !self.verify_command.trim().is_empty() && self.verify_timeout_secs == 0 {
             return Err("verify_timeout_secs must be greater than zero".to_owned());
+        }
+        if self.resume_min_free_disk_bytes == 0 || self.resume_min_free_disk_bytes > 1_u64 << 40 {
+            return Err("resume_min_free_disk_bytes must be between 1 byte and 1 TiB".to_owned());
         }
         if self.max_changed_files_reported == 0 {
             return Err("max_changed_files_reported must be at least 1".to_owned());
@@ -1837,6 +1884,7 @@ impl_default_from_fns!(WorkerConfig {
     args => Vec::new(),
     enabled => true,
     model => String::new(),
+    free_fallback => false,
     env_passthrough => Vec::new(),
     capability => d_worker_capability(),
     sandbox => d_worker_sandbox(),
@@ -1857,6 +1905,7 @@ impl_default_from_fns!(DelegationConfig {
     verify_command => String::new(),
     verify_args => Vec::new(),
     verify_timeout_secs => d_verify_timeout(),
+    resume_min_free_disk_bytes => d_resume_min_free_disk_bytes(),
     isolate_in_worktree => true,
     worktree_root => String::new(),
     require_clean_baseline => true,
@@ -2000,7 +2049,7 @@ impl AppConfig {
                 return fail(
                     "core.log_level",
                     format!("{other:?} is not one of trace|debug|info|warn|error|off"),
-                )
+                );
             }
         }
 
@@ -2010,7 +2059,7 @@ impl AppConfig {
                 return fail(
                     "core.log_rotation",
                     format!("{other:?} is not one of minutely|hourly|daily|never"),
-                )
+                );
             }
         }
 
@@ -2020,7 +2069,7 @@ impl AppConfig {
                 return fail(
                     "store.journal_mode",
                     format!("{other:?} is not a SQLite journal mode"),
-                )
+                );
             }
         }
 
@@ -2030,7 +2079,7 @@ impl AppConfig {
                 return fail(
                     "store.synchronous",
                     format!("{other:?} is not one of OFF|NORMAL|FULL|EXTRA"),
-                )
+                );
             }
         }
 
@@ -2142,7 +2191,7 @@ impl AppConfig {
                 return fail(
                     "policy.default_tier",
                     format!("{other:?} is not one of read_only|normal|elevated"),
-                )
+                );
             }
         }
 
@@ -2253,7 +2302,7 @@ impl AppConfig {
                              connected by this build. Remove it rather than waiting for a \
                              discovery result that will never arrive."
                         ),
-                    )
+                    );
                 }
                 other => {
                     return fail(
@@ -2262,7 +2311,7 @@ impl AppConfig {
                             "{other:?} is not a discovery source; this build reads path, \
                              start_menu and registry"
                         ),
-                    )
+                    );
                 }
             }
         }
@@ -2298,7 +2347,7 @@ impl AppConfig {
                         "{other:?} is not one of none|toast. There is no tray, window or \
                      taskbar button in Phase 1."
                     ),
-                )
+                );
             }
         }
         if self.ui.app_user_model_id.trim().is_empty() {
@@ -2613,7 +2662,7 @@ fn inspect_and_prune(path: &Path, value: &mut toml::Value) -> Result<Vec<String>
                         "config_version must be a positive integer, found `{other}`; \
                          refusing to guess which schema this file targets"
                     ),
-                })
+                });
             }
         };
         if found != u64::from(SUPPORTED_CONFIG_VERSION) {
@@ -2811,6 +2860,26 @@ mod tests {
         let cfg = AppConfig::default();
         cfg.validate().expect("defaults must be valid");
         assert_eq!(cfg.config_version, SUPPORTED_CONFIG_VERSION);
+        assert_eq!(cfg.voice.recognizer, SpeechRecognizer::Zipformer);
+    }
+
+    #[test]
+    fn parakeet_recognizer_is_explicit_and_requires_its_model_rate() {
+        #[derive(Deserialize)]
+        struct Selector {
+            recognizer: SpeechRecognizer,
+        }
+        let parsed: Selector = toml::from_str("recognizer = \"parakeet_tdt_v2_int8\"").unwrap();
+        assert_eq!(parsed.recognizer, SpeechRecognizer::ParakeetTdtV2Int8);
+        let mut voice = VoiceConfig {
+            recognizer: parsed.recognizer,
+            sample_rate: 44100,
+            ..VoiceConfig::default()
+        };
+        let err = voice.validate().unwrap_err().to_string();
+        assert!(err.contains("voice.sample_rate = 16000"), "{err}");
+        voice.sample_rate = 16000;
+        voice.validate().unwrap();
     }
 
     #[test]
@@ -3037,9 +3106,11 @@ mod tests {
         unsafe { std::env::set_var("JEAN_LOG_LEVEL", "trace") };
         let loaded = load_layers(&[]).unwrap();
         assert_eq!(loaded.config.core.log_level, "trace");
-        assert!(loaded
-            .sources
-            .contains(&ConfigSource::Env("JEAN_LOG_LEVEL")));
+        assert!(
+            loaded
+                .sources
+                .contains(&ConfigSource::Env("JEAN_LOG_LEVEL"))
+        );
         restore_env("JEAN_LOG_LEVEL", before.as_deref());
     }
 

@@ -125,7 +125,7 @@ rl.on('line', (line) => {
                 content: { type: 'text', text: 'writing the file now' } } } });
     // The agent asks the client to perform the write. That is ACP's own shape: the client decides.
     send({ jsonrpc: '2.0', id: 'fs-1', method: 'fs/write_text_file', params: {
-      sessionId: 'fixture-1', path: target, content: 'written by the agent\n' } });
+      sessionId: 'fixture-1', path: target, content: 'JEAN_OWNER_HANDOFF_OK' } });
   } else if (msg.id === 'fs-1') {
     if (msg.error) {
       send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fixture-1',
@@ -193,7 +193,7 @@ fn scenario(
         workspace.join("agent-note.txt")
     };
     let check = format!(
-        "process.exit(require('fs').existsSync('{}')?0:1)",
+        "process.exit(require('fs').readFileSync('{}','utf8')==='JEAN_OWNER_HANDOFF_OK'?0:1)",
         posix(&target)
     );
     std::fs::write(
@@ -250,6 +250,11 @@ fn a_live_acp_agent_writes_inside_its_workspace_and_jeans_check_decides() {
     // The workflow, in the order the objective states it.
     assert_eq!(report.worker, "fixture", "the live ACP session ran");
     assert_eq!(
+        report.baseline.label(),
+        "not_proven",
+        "the independent check fails before the edit"
+    );
+    assert_eq!(
         report.stop_reason.as_str(),
         "end_turn",
         "the agent's own turn ended: {:?}",
@@ -274,8 +279,8 @@ fn a_live_acp_agent_writes_inside_its_workspace_and_jeans_check_decides() {
     );
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
-        "written by the agent\n",
-        "with the agent's content, not a placeholder"
+        "JEAN_OWNER_HANDOFF_OK",
+        "the exact requested bytes, not a placeholder"
     );
     // Covered by the delegation the operator already approved — so the prompter was never asked.
     assert!(
@@ -302,6 +307,15 @@ fn a_live_acp_agent_writes_inside_its_workspace_and_jeans_check_decides() {
         report.verification
     );
     assert_eq!(report.result.exit_status(), 0);
+    let checkpoint =
+        jean_core::owner::read_checkpoint(&ctx.paths.data_dir, &report.task_id).unwrap();
+    assert!(!checkpoint.uncertain);
+    assert!(checkpoint
+        .results
+        .iter()
+        .any(|r| r == "JEAN task verdict: succeeded"));
+    assert!(!checkpoint.resumable);
+    assert!(checkpoint.completed_effects.is_empty());
     assert_eq!(
         ctx.store.require_task(&report.task_id).unwrap().state,
         TaskState::Succeeded

@@ -394,6 +394,9 @@ max_output_bytes = 8388608
 verify_command = ""
 verify_args = []
 verify_timeout_secs = 900
+# Before resuming, both the workspace and JEAN data volumes must have at least this
+# many bytes available. A blocked resume preserves its checkpoint and retry allowance.
+resume_min_free_disk_bytes = 536870912
 # REFUSED: false, unless there is a reason. A worktree is what makes "the agent changed
 # files" reviewable instead of already-merged-into-your-tree.
 isolate_in_worktree = true
@@ -523,6 +526,9 @@ max_concurrent_workers = 4
 enabled = false
 mode = "push_to_talk"
 backend = "sherpa_onnx"
+# Zipformer is the existing streaming recognizer. Parakeet TDT v2 is an explicit
+# offline alternative and requires its separate bundle below.
+recognizer = "zipformer"
 startup_timeout_ms = 5000
 request_timeout_ms = 2000
 shutdown_timeout_ms = 2000
@@ -587,3 +593,10 @@ tts_speaker = 0
 vad = ""
 # Only for a shared (DLL) link. A static link needs no runtime library directory.
 native_lib_dir = ""
+
+[voice.models.parakeet]
+# Separate Parakeet TDT v2 INT8 bundle. Fill all four paths from one extracted copy.
+encoder = ""
+decoder = ""
+joiner = ""
+tokens = ""

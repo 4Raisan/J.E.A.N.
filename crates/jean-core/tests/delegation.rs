@@ -171,6 +171,8 @@ fn outcome(stop_reason: &str, claim: Option<&str>) -> WorkerOutcome {
         stdout_bytes: 128,
         output_dir: None,
         failure: None,
+        failure_kind: None,
+        remaining_work: None,
     }
 }
 
@@ -952,6 +954,8 @@ fn a_cancelled_delegation_stops_before_the_check_and_settles_exactly_once() {
         stdout_bytes: 16,
         output_dir: None,
         failure: None,
+        failure_kind: None,
+        remaining_work: None,
     }))
     .cancel();
     let report = delegate_with(

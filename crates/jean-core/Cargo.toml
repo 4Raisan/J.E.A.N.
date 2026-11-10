@@ -52,6 +52,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+sha2 = "=0.11.1"
 
 # Only for the cancellation pipe. Everything else in this crate is portable.
 [target.'cfg(windows)'.dependencies]
