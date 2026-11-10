@@ -42,7 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
     PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowDisplayAffinity, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED,
-    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CS_HREDRAW, CS_VREDRAW,
+    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX, CBS_DROPDOWNLIST, CB_ADDSTRING, CS_HREDRAW,
+    CS_VREDRAW,
     HCURSOR, HMENU, MSG, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_COMMAND, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD, WS_OVERLAPPEDWINDOW,
     WS_VISIBLE, WS_VSCROLL,
@@ -67,6 +68,8 @@ const ID_STATUS: usize = 1006;
 const ID_DESTROY_STATUS: usize = 1007;
 const ID_AMBIGUOUS_LEFT: usize = 1008;
 const ID_AMBIGUOUS_RIGHT: usize = 1009;
+const ID_GROUP_LEFT: usize = 1010;
+const ID_GROUP_RIGHT: usize = 1011;
 
 /// The status label, and the click counter behind its text.
 ///
@@ -410,28 +413,54 @@ fn main() {
     if let Ok(handle) = unsafe { GetDlgItem(Some(main), ID_STATUS as i32) } {
         STATUS.store(handle.0 as isize, Ordering::SeqCst);
     }
-    let _ = child(
+    let left_group = child(
         main,
         "BUTTON",
-        "Continue",
-        WINDOW_STYLE(0),
-        ID_AMBIGUOUS_LEFT,
+        "Workspace A",
+        WINDOW_STYLE(BS_GROUPBOX as u32),
+        ID_GROUP_LEFT,
         20,
-        170,
-        120,
-        30,
+        165,
+        270,
+        75,
     );
-    let _ = child(
+    let right_group = child(
         main,
         "BUTTON",
-        "Continue",
-        WINDOW_STYLE(0),
-        ID_AMBIGUOUS_RIGHT,
-        150,
-        170,
-        120,
-        30,
+        "Workspace B",
+        WINDOW_STYLE(BS_GROUPBOX as u32),
+        ID_GROUP_RIGHT,
+        315,
+        165,
+        270,
+        75,
     );
+    if let Some(parent) = left_group {
+        let _ = child(
+            parent,
+            "BUTTON",
+            "Continue",
+            WINDOW_STYLE(0),
+            ID_AMBIGUOUS_LEFT,
+            18,
+            30,
+            120,
+            30,
+        );
+    }
+    if let Some(parent) = right_group {
+        let _ = child(
+            parent,
+            "BUTTON",
+            "Continue",
+            WINDOW_STYLE(0),
+            ID_AMBIGUOUS_RIGHT,
+            18,
+            30,
+            120,
+            30,
+        );
+    }
     let _ = child(
         main,
         "BUTTON",

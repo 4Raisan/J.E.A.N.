@@ -423,13 +423,13 @@ fn dialog_control_ids_become_the_automation_ids_the_locators_address() {
 fn invoke_is_performed_and_the_resulting_change_is_visible() {
     let _guard = lock_desktop();
     let fixture = Fixture::start("normal", None);
-
     let before = control(&fixture, 1006);
     assert_eq!(before.name, "idle", "the fixture starts idle");
 
     // The witness is the status label, and the assertion is about *it*: a send button that was pressed
     // does not itself change, so an implementation that only re-reads the acted control would report a
     // successful no-op. This is R-21's requirement in the shape the fixture can actually prove.
+    let started = std::time::Instant::now();
     let effect = accessibility::act(
         fixture.id(),
         Fixture::by_id(1002),
@@ -455,6 +455,10 @@ fn invoke_is_performed_and_the_resulting_change_is_visible() {
         control(&fixture, 1006).name,
         "clicked:1",
         "the fixture's own counter is the verifier"
+    );
+    println!(
+        "MEASURED request-to-verified-result: {} ms (one Invoke plus independent status read)",
+        started.elapsed().as_millis()
     );
 
     accessibility::act(
@@ -731,19 +735,60 @@ fn an_ambiguous_locator_is_refused_rather_than_resolved_by_enumeration_order() {
         other => panic!("expected Ambiguous, got {other:?}"),
     }
 
-    // And the ancestry form resolves it, which is the reason `Path` exists at all.
-    let left = Locator::Path(vec![Fixture::by_id(1008)]);
+    // Names alone remain ambiguous across parent groups. The ancestry form must start at one parent,
+    // then resolve the same accessible name underneath it.
+    let left = Locator::Path(vec![
+        Locator::Name {
+            name: "Workspace A".to_owned(),
+            control_type: Some(ControlKind::Group),
+        },
+        Locator::Name {
+            name: "Continue".to_owned(),
+            control_type: Some(ControlKind::Button),
+        },
+    ]);
+    let started = std::time::Instant::now();
     let effect = accessibility::act(
         fixture.id(),
         left,
         Action::Invoke,
-        Some(Fixture::by_id(1006)),
+        None,
         settings(),
         None,
     )
-    .expect("a path through the control's own id is not ambiguous");
-    assert!(effect.is_verified());
-    assert_eq!(control(&fixture, 1006).name, "ambiguous:left");
+    .expect("a path through the intended parent group is not ambiguous");
+    assert_eq!(effect.control.automation_id, "1008");
+    assert!(!effect.is_verified(), "an Invoke return without a state change is not evidence: {effect:?}");
+    assert_eq!(control(&fixture, 1006).name, "idle");
+    assert_eq!(control(&fixture, 1008).name, "Continue");
+    assert_eq!(control(&fixture, 1009).name, "Continue");
+
+    let right = Locator::Path(vec![
+        Locator::Name {
+            name: "Workspace B".to_owned(),
+            control_type: Some(ControlKind::Group),
+        },
+        Locator::Name {
+            name: "Continue".to_owned(),
+            control_type: Some(ControlKind::Button),
+        },
+    ]);
+    let right = accessibility::act(
+        fixture.id(),
+        right,
+        Action::Invoke,
+        None,
+        settings(),
+        None,
+    )
+    .expect("the other parent resolves its own Continue button");
+    assert_eq!(right.control.automation_id, "1009");
+    assert!(!right.is_verified());
+    assert_eq!(control(&fixture, 1006).name, "idle");
+    println!(
+        "MEASURED request-to-observed-no-op: {} ms (parent-scoped Invoke; expected state did not change)",
+        started.elapsed().as_millis()
+    );
 }
 
 #[test]

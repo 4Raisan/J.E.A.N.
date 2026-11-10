@@ -2386,6 +2386,55 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_pattern_call_without_the_expected_observation_is_not_success() {
+        use jean_windows::accessibility::{
+            Control, ControlKind, Locator, Pattern, Readback, Witness,
+        };
+
+        let locator = Locator::AutomationId("status".to_owned());
+        let unchanged = Readback {
+            name: Some("idle".to_owned()),
+            enabled: Some(true),
+            ..Readback::default()
+        };
+        let effect = accessibility::Effect {
+            control: Control {
+                automation_id: "continue".to_owned(),
+                name: "Continue".to_owned(),
+                name_truncated: false,
+                kind: ControlKind::Button,
+                class_name: "Button".to_owned(),
+                is_enabled: true,
+                has_keyboard_focus: false,
+                is_password: false,
+                rect: None,
+                runtime_id: Vec::new(),
+                patterns: vec![Pattern::Invoke],
+                depth: None,
+            },
+            action: accessibility::Action::Invoke,
+            pattern: Pattern::Invoke,
+            before: Readback::default(),
+            after: Some(Readback::default()),
+            changed: false,
+            witness: Some(Witness {
+                locator: locator.clone(),
+                before: unchanged.clone(),
+                after: Some(unchanged),
+                changed: false,
+                unresolved: false,
+            }),
+            uncertain: false,
+            uncertainty_reason: None,
+            foreground_after: None,
+        };
+
+        let judged = judge(&effect, &locator, Some("clicked:1"), &mut Vec::new());
+        assert!(matches!(judged.verdict, Verdict::NotProven(_)));
+        assert!(!judged.verdict.is_proven());
+    }
+
+    #[test]
     fn an_input_that_was_never_sent_is_disproven_and_one_maybe_half_sent_is_uncertain() {
         // The defect this test exists for: a refusal before `SendInput` used to be reported as
         // unverifiable, which tells the operator the desktop might have changed when the one thing known
