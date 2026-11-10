@@ -56,7 +56,7 @@ trap {
 $Here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $Root = (Resolve-Path (Join-Path $Here (Join-Path '..' '..'))).Path
 $Jean = Join-Path $Root 'target\debug\jean.exe'
-$Worker = Join-Path $Root 'target\p5q\bin\jean-voice-sherpa-dynamic.exe'
+$Worker = Join-Path $Root 'target\voice-current\debug\jean-voice.exe'
 $Mode = if ($Offline) { 'offline' } else { 'mic' }
 $Data = Join-Path $Here (Join-Path 'config' $Mode)
 $Config = Join-Path $Data 'jean.toml'
@@ -76,7 +76,7 @@ function Get-SetupProblems {
         $found += "looked in: $Jean"
     }
     if (-not (Test-Path -LiteralPath $Worker)) {
-        $found += 'Voice worker is missing. Rebuild it with --features sherpa into target\p5q\bin (voice-assets.md 4a-ii).'
+        $found += 'Build the current worker with --features sherpa and CARGO_TARGET_DIR=target\voice-current (see docs/voice-assets.md).'
         $found += "looked in: $Worker"
     }
     if (-not (Test-Path -LiteralPath $Config)) {
@@ -289,6 +289,7 @@ function Step-Machine {
             }
             elseif ($voice -eq 'ready') { Set-Phase 'idle' 'Ready. Start listening, or play the test sentence.' }
             elseif ($voice -like 'unavailable*') { Set-Phase 'failed' "Voice worker could not start: $voice" }
+            elseif ($voice -like '*disconnected*') { Set-Phase 'failed' "Voice worker disconnected during startup. Run jean voice doctor with this worker to see the error." }
             elseif ($voice -eq 'disabled') { Set-Phase 'failed' 'Voice is disabled in this configuration; nothing to test.' }
             else {
                 if ($script:Tick % 3 -eq 0) { Send-Owner 'status' $null | Out-Null }
