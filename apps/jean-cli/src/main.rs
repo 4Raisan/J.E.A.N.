@@ -86,6 +86,7 @@ mod phase2;
 mod phase3;
 mod phase4;
 mod phase5;
+mod spoken_reply;
 
 #[derive(Parser)]
 #[command(
@@ -101,6 +102,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Speak UTF-8 text from stdin using Windows Speech.
+    Speak {
+        /// Condense a long task result before speaking it.
+        #[arg(long)]
+        task_result: bool,
+        /// Installed Windows voice name.
+        #[arg(long)]
+        voice: Option<String>,
+        /// Speaking rate from -10 to 10.
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-10..=10))]
+        rate: i32,
+    },
     /// Search recorded history without launching a model or voice worker.
     History {
         #[command(subcommand)]
@@ -941,11 +954,16 @@ fn error_chain(err: &anyhow::Error) -> Vec<String> {
 }
 
 fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
+    if let Command::Speak { task_result, voice, rate } = command {
+        spoken_reply::speak_from_stdin(task_result, voice, rate)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let exe_dir = executable_directory();
     let mut ctx = Context::load(exe_dir.as_deref())?;
     report_warnings(&ctx);
 
     match command {
+        Command::Speak { .. } => unreachable!("speech is handled before loading context"),
         Command::History { command } => memory::history(&mut ctx, command),
         Command::Memory { command } => memory::facts(&mut ctx, command),
         Command::Preferences { command } => memory::preferences(&mut ctx, command),
