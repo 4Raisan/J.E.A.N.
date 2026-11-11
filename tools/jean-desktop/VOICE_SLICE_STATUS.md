@@ -1,5 +1,24 @@
 # JEAN Desktop — Voice Slice Status
 
+## Rust speech output
+
+Rebuild `jean.exe` before launching the desktop. The overlay now sends
+UTF-8 text to `jean speak` and owns the speech process for Stop. The Rust
+command calls Windows Speech directly. For task output it accepts
+`--task-result` and reads back the opening and up to two short lines.
+Chat replies pass through in full. Use `--voice` or `JARVIS_VOICE` to
+select an installed voice, and `--rate` to adjust the pace from -10 to 10.
+
+The desktop still captures the microphone through sounddevice and
+decodes with Project 9 Faster-Whisper. The entries below document the
+previous Python speech and readback implementation.
+
+The locked offline Windows CLI build and focused Rust readback test
+passed. The CLI spoke through David and Zira, including a slower Zira
+test. An offscreen desktop check decoded a real WAV, spoke a simulated
+task result, and stopped the native speech process. Physical dictation
+and a live conversation through the overlay remain to be checked.
+
 ## Voice defaults and Windows checks
 
 Project 9 Faster-Whisper is now the default recognizer. Project 2 remains

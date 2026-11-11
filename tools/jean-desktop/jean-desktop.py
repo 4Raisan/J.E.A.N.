@@ -14,12 +14,10 @@ Zipformer+Parakeet hybrid — then routed by mode:
   * Chat  → `jean chat <text>`        (read-only conversation, never a task)
   * Task  → `jean exec --goal <text> <tool> <args>`  (first word = tool id)
 
-Chat replies are spoken verbatim. Long task results go through
-speech_render.render_for_speech (outcome + verbatim key facts) and then
-project 9's Windows System.Speech backend. Stop halts
+Chat replies are spoken verbatim. Long task results are shortened by
+the Rust `jean speak --task-result` command before Windows Speech plays them. Stop halts
 playback; provider/playback failures are surfaced in the status line.
 """
-import importlib.util
 import math
 import subprocess
 import sys
@@ -28,7 +26,6 @@ import threading
 from pathlib import Path
 
 import voice_bench
-import speech_render
 
 from PyQt6.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QRadialGradient, QPen, QFont
@@ -39,10 +36,6 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 EXE = ROOT / "target" / "debug" / "jean.exe"
-PROJECT9 = ROOT / "9 - Local Whisper and Windows Speech"
-speech_backend_spec = importlib.util.spec_from_file_location("jean_windows_speech", PROJECT9 / "osal.py")
-speech_backend = importlib.util.module_from_spec(speech_backend_spec)
-speech_backend_spec.loader.exec_module(speech_backend)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -52,7 +45,7 @@ class Bridge(QObject):
     level = pyqtSignal(float)          # measured mic level 0..1
     capture_finished = pyqtSignal(bool, int, str)
     decoded = pyqtSignal(str, str, str, str)  # mode, backend, text, error
-    speak_requested = pyqtSignal(str)
+    speak_requested = pyqtSignal(str, bool)  # text, task result
     work_finished = pyqtSignal()
     playback_finished = pyqtSignal(object, str)  # process, error text
     refresh_requested = pyqtSignal()
@@ -486,7 +479,7 @@ class Overlay(QWidget):
             else:
                 self.bridge.result.emit("JEAN", reply.strip() or "(empty reply)")
                 self.bridge.transcript.emit(f"JEAN: {reply.strip()}")
-                self.bridge.speak_requested.emit(reply.strip())
+                self.bridge.speak_requested.emit(reply.strip(), False)
             self._finish_busy()
 
         threading.Thread(target=work, daemon=True).start()
@@ -516,7 +509,7 @@ class Overlay(QWidget):
             self.bridge.transcript.emit(f"Task result: {shown[:400]}")
             # This is the successful JEAN CLI tool output. The voice surface
             # does not relabel it as independently verified task work.
-            self.bridge.speak_requested.emit(speech_render.render_for_speech(shown))
+            self.bridge.speak_requested.emit(shown, True)
             self.bridge.refresh_requested.emit()
             self._finish_busy()
 
@@ -555,24 +548,26 @@ class Overlay(QWidget):
             else:
                 self.bridge.result.emit("JEAN", reply.strip() or "(empty reply)")
                 self.bridge.transcript.emit(f"JEAN: {reply.strip()}")
-                self.bridge.speak_requested.emit(reply.strip())
+                self.bridge.speak_requested.emit(reply.strip(), False)
             self._finish_busy()
 
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- spoken output (project 9 TTS + project 12 readback) ----------
 
-    def _speak_async(self, text):
+    def _speak_async(self, text, task_result):
         if not text:
             return
         self.stop_speech_playback()
+        argv = [str(EXE), "speak"]
+        if task_result:
+            argv.append("--task-result")
         try:
-            proc = speech_backend.speech_process(text)
+            proc = subprocess.Popen(
+                argv, cwd=ROOT, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
         except OSError as exc:
             self.bridge.result.emit("Speech unavailable", str(exc))
-            return
-        if proc is None:
-            self.bridge.result.emit("Speech unavailable", "No speech backend is available.")
             return
         self.speaking_proc = proc
         self.stop_speech.setEnabled(True)
@@ -581,14 +576,14 @@ class Overlay(QWidget):
         def watch():
             error_text = ""
             try:
-                code = proc.wait(timeout=90)
+                _, stderr = proc.communicate(text, timeout=90)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait()
+                proc.communicate()
                 error_text = "playback exceeded 90 seconds and was stopped"
             else:
-                if code != 0:
-                    error_text = f"exit code {code}"
+                if proc.returncode != 0:
+                    error_text = stderr.strip() or f"exit code {proc.returncode}"
             self.bridge.playback_finished.emit(proc, error_text)
 
         threading.Thread(target=watch, daemon=True).start()
