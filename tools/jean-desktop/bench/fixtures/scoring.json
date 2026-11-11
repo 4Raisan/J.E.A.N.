@@ -1,0 +1,55 @@
+{
+  "comment": "Synthetic scoring fixture for voice_bench.py --self-test. No audio is decoded here; these pairs verify normalization, WER arithmetic and exact app-name matching only. User-voice accuracy stays pending until a consented local corpus exists.",
+  "cases": [
+    {
+      "name": "identical",
+      "reference": "open jean desktop now",
+      "hypothesis": "open jean desktop now",
+      "app_names": ["JEAN"],
+      "expected": {"wer": 0.0, "substitutions": 0, "deletions": 0, "insertions": 0, "reference_words": 4},
+      "expected_app_matches": {"JEAN": true}
+    },
+    {
+      "name": "one substitution",
+      "reference": "jean opens kokoro",
+      "hypothesis": "jean opens coco",
+      "app_names": ["Kokoro"],
+      "expected": {"wer": 0.3333, "substitutions": 1, "deletions": 0, "insertions": 0, "reference_words": 3},
+      "expected_app_matches": {"Kokoro": false}
+    },
+    {
+      "name": "one deletion",
+      "reference": "open jean desktop",
+      "hypothesis": "open desktop",
+      "expected": {"wer": 0.3333, "substitutions": 0, "deletions": 1, "insertions": 0, "reference_words": 3}
+    },
+    {
+      "name": "two insertions",
+      "reference": "open jean",
+      "hypothesis": "open jean please now",
+      "expected": {"wer": 1.0, "substitutions": 0, "deletions": 0, "insertions": 2, "reference_words": 2}
+    },
+    {
+      "name": "normalization: case and punctuation",
+      "reference": "JEAN: open it!",
+      "hypothesis": "jean open it",
+      "app_names": ["jean"],
+      "expected": {"wer": 0.0, "substitutions": 0, "deletions": 0, "insertions": 0, "reference_words": 3},
+      "expected_app_matches": {"jean": true}
+    },
+    {
+      "name": "app name must not match a longer word",
+      "reference": "open jeanette desktop",
+      "hypothesis": "open jeanette desktop",
+      "app_names": ["JEAN", "Jeanette"],
+      "expected": {"wer": 0.0, "substitutions": 0, "deletions": 0, "insertions": 0, "reference_words": 3},
+      "expected_app_matches": {"JEAN": false, "Jeanette": true}
+    },
+    {
+      "name": "empty hypothesis",
+      "reference": "hello there",
+      "hypothesis": "",
+      "expected": {"wer": 1.0, "substitutions": 0, "deletions": 2, "insertions": 0, "reference_words": 2}
+    }
+  ]
+}

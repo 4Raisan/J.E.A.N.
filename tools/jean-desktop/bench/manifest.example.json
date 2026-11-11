@@ -1,0 +1,11 @@
+{
+  "comment": "Template for a consented local ASR corpus. Copy to manifest.json next to this file's parent (tools/jean-desktop/bench/manifest.json) and add rows ONLY for clips the operator recorded or otherwise has consent to benchmark locally. 'wav' resolves relative to this manifest; every clip must be 16 kHz mono PCM16 WAV (the dictate.py / speech.py contract). 'reference' is the exact transcript a human verified. 'app_names' are phrases that must appear verbatim (after normalization) for the exact-match check. No clip content, transcript, or audio is committed to the repository.",
+  "clips": [
+    {
+      "wav": "clips/example-consented-clip.wav",
+      "reference": "Open JEAN Desktop",
+      "app_names": ["JEAN Desktop", "JEAN"],
+      "note": "operator-recorded consented clip; keep the WAV outside version control"
+    }
+  ]
+}
