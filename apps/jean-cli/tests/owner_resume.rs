@@ -76,13 +76,16 @@ impl Fixture {
             "sign-in" => "sign_in_expired",
             "network" => "network_unavailable",
             "decision-unknown" => "unexpected_server_error",
+            "review" => "review",
             "profile-fail" => "profile-fail",
             "profile-quick" | "profile-polished" | "profile-override" => "profile-worker",
             _ => "quota_exhausted",
         };
         std::fs::write(&alpha, ALPHA_SCRIPT).ok()?;
         std::fs::write(&beta, BETA_SCRIPT).ok()?;
-        let verification = if tag.starts_with("profile") {
+        let verification = if tag == "review" {
+            r"const fs=require('fs');process.exit(fs.readFileSync('stage-one.txt','utf8')==='first effect\n'?0:1)".to_owned()
+        } else if tag.starts_with("profile") {
             format!(
                 "const fs=require('fs');const p={};fs.appendFileSync(p,'run\\n');const count=fs.readFileSync(p,'utf8').trim().split('\\n').length;process.exit(fs.readFileSync({},'utf8')==='first effect\\n'&&fs.readFileSync({},'utf8')==='second effect\\n'&&{}?0:1)",
                 js_string(&verify_marker),
@@ -116,6 +119,29 @@ impl Fixture {
         );
         if tag == "decision-no-fallback" {
             config = config.replace("free_fallback=true", "free_fallback=false");
+        }
+        if tag == "review" {
+            config = config.replace("isolate_in_worktree=false", "isolate_in_worktree=true");
+            config.push_str("\n[policy]\nrequire_approval=[]\n");
+        }
+        if tag == "profile-quick" {
+            let checks = |profile: &str| {
+                let script = format!(
+                    "require('fs').appendFileSync({},'{}\\n');{verification}",
+                    js_string(&verify_marker),
+                    profile,
+                );
+                format!("['-e',{}]", toml_string(&script))
+            };
+            config = config.replacen(
+                "verify_timeout_secs=30",
+                &format!(
+                    "verify_quick_prototype_args={}\nverify_polished_ui_args={}\nverify_timeout_secs=30",
+                    checks("quick"),
+                    checks("polished")
+                ),
+                1,
+            );
         }
         std::fs::write(data.join("jean.toml"), config).ok()?;
         Some(Self {
@@ -241,7 +267,7 @@ rl.on('line',line=>{let m;try{m=JSON.parse(line)}catch{return}
 if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{},agentInfo:{name:'quota-fixture',version:'1'}}});
 else if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'alpha-session'}});
 else if(m.method==='session/prompt'){promptId=m.id;if(failureKind==='profile-worker'||failureKind==='profile-fail'){fs.appendFileSync(marker,JSON.stringify(m.params)+'\n');send({jsonrpc:'2.0',id:promptId,result:{stopReason:'end_turn'}})}else{send({jsonrpc:'2.0',id:'alpha-write',method:'fs/write_text_file',params:{sessionId:'alpha-session',path:process.cwd().replace(/\\/g,'/')+'/stage-one.txt',content:'first effect\n'}})}}
-else if(m.id==='alpha-write')send({jsonrpc:'2.0',id:promptId,error:{code:-32001,message:'structured recovery fixture',data:{kind:failureKind,remaining_work:'Create stage-two.txt containing exactly second effect followed by a newline.'}}});
+else if(m.id==='alpha-write'){if(failureKind==='review'){send({jsonrpc:'2.0',id:promptId,result:{stopReason:'end_turn'}})}else{send({jsonrpc:'2.0',id:promptId,error:{code:-32001,message:'structured recovery fixture',data:{kind:failureKind,remaining_work:'Create stage-two.txt containing exactly second effect followed by a newline.'}}})}}
 });
 "#;
 
@@ -272,6 +298,82 @@ else if(m.id==='interrupt-write')fs.appendFileSync(marker,'acted\n');
 "#;
 
 #[test]
+fn isolated_review_applies_only_the_saved_digest_and_clean_baseline() {
+    let Some(fixture) = Fixture::new("review") else {
+        eprintln!("skipped: node and git are required for the local ACP fixture");
+        return;
+    };
+    let make_review = || {
+        let output = fixture.run(&["delegate", "Create stage-one.txt"]);
+        assert!(output.status.success(), "{}", output_text(&output));
+        let report = output_text(&output);
+        let id = report
+            .lines()
+            .find_map(|line| line.strip_prefix("task: "))
+            .unwrap()
+            .to_owned();
+        let preview = fixture.run(&["review", &id]);
+        assert!(preview.status.success(), "{}", output_text(&preview));
+        let preview = output_text(&preview);
+        assert!(
+            preview.contains("+first effect") && preview.contains("verifier    proven"),
+            "{preview}"
+        );
+        let digest = preview
+            .lines()
+            .find_map(|line| line.strip_prefix("sha256: "))
+            .unwrap()
+            .to_owned();
+        (id, digest)
+    };
+    let (apply_id, digest) = make_review();
+    let (discard_id, discard_digest) = make_review();
+    let output = fixture.run(&["discard", &discard_id]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(!fixture
+        .run(&["apply", &discard_id, "--sha256", &discard_digest])
+        .status
+        .success());
+    assert!(!fixture.workspace.join("stage-one.txt").exists());
+    assert!(!fixture
+        .run(&["apply", &apply_id, "--sha256", "wrong"])
+        .status
+        .success());
+    let dirty = fixture.workspace.join("operator.txt");
+    std::fs::write(&dirty, "operator edit").unwrap();
+    let refused = fixture.run(&["apply", &apply_id, "--sha256", &digest]);
+    assert!(!refused.status.success() && output_text(&refused).contains("target is dirty"));
+    assert_eq!(std::fs::read_to_string(&dirty).unwrap(), "operator edit");
+    assert!(!fixture.workspace.join("stage-one.txt").exists());
+    std::fs::remove_file(dirty).unwrap();
+    let review_file = fixture
+        .data
+        .join("artifacts")
+        .join(&apply_id)
+        .join("review.json");
+    let original = std::fs::read(&review_file).unwrap();
+    let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let expected_tree = altered["tree"].as_str().unwrap();
+    altered["tree"] = serde_json::Value::String("0".repeat(expected_tree.len()));
+    std::fs::write(&review_file, serde_json::to_vec(&altered).unwrap()).unwrap();
+    let refused = fixture.run(&["apply", &apply_id, "--sha256", &digest]);
+    assert!(!refused.status.success());
+    assert!(output_text(&refused).contains("does not reconstruct"));
+    assert!(!fixture.workspace.join("stage-one.txt").exists());
+    std::fs::write(review_file, original).unwrap();
+    let applied = fixture.run(&["apply", &apply_id, "--sha256", &digest]);
+    assert!(applied.status.success(), "{}", output_text(&applied));
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("stage-one.txt"))
+            .unwrap()
+            .trim(),
+        "first effect"
+    );
+    let preview = fixture.run(&["review", &apply_id]);
+    assert!(output_text(&preview).contains("review: applied"));
+}
+
+#[test]
 fn quota_after_known_edit_resumes_once_in_fresh_process_and_verifies() {
     let Some(fixture) = Fixture::new("quota") else {
         eprintln!("skipped: node and git are required for the local ACP fixture");
@@ -294,7 +396,23 @@ fn quota_after_known_edit_resumes_once_in_fresh_process_and_verifies() {
         "{checkpoint_text}"
     );
 
-    let resumed = fixture.run(&["resume", &task_id]);
+    let mut desktop = Command::new(env!("CARGO_BIN_EXE_jean"))
+        .args([
+            "desktop-request",
+            "--channel",
+            "0123456789abcdef0123456789abcdef",
+            "--",
+            &format!("/resume {task_id}"),
+        ])
+        .env("JEAN_DATA_DIR", &fixture.data)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = desktop.stdin.take().unwrap();
+    let resumed = desktop.wait_with_output().unwrap();
+    drop(input);
     assert!(resumed.status.success(), "{}", output_text(&resumed));
     assert!(
         output_text(&resumed).contains("result: succeeded"),
@@ -760,16 +878,30 @@ fn uncertain_replacement_reservation_is_never_cleared_after_process_exit() {
         BETA_INTERRUPT_AFTER_WRITE_SCRIPT,
     )
     .unwrap();
+    // This fixture waits for a real write acknowledgement through Git,
+    // verification, and ACP. Leave headroom for the other Windows fixtures
+    // running concurrently, including inside the replacement's watchdog.
+    let config_path = fixture.data.join("jean.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        config_path,
+        config
+            .replace("session_timeout_secs=30", "session_timeout_secs=120")
+            .replace("idle_timeout_secs=10", "idle_timeout_secs=60"),
+    )
+    .unwrap();
+    let log_path = fixture.root.join("replacement.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut replacement = Command::new(env!("CARGO_BIN_EXE_jean"))
         .args(["resume", &task_id])
         .env("JEAN_DATA_DIR", &fixture.data)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
         .spawn()
         .expect("start replacement in a fresh JEAN process");
     let marker = fixture.root.join("beta-started.txt");
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + std::time::Duration::from_secs(90);
     let mut replacement_acted = false;
     while Instant::now() < deadline {
         if std::fs::read_to_string(&marker)
@@ -784,9 +916,14 @@ fn uncertain_replacement_reservation_is_never_cleared_after_process_exit() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if !replacement_acted {
+        let early_exit = replacement.try_wait().unwrap();
         let _ = replacement.kill();
         let _ = replacement.wait();
-        panic!("replacement did not write its known edit before the test interruption");
+        let trace = std::fs::read_to_string(&marker).unwrap_or_default();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        panic!(
+            "replacement did not acknowledge its write within 90 seconds +             (early exit: {early_exit:?})\nworker trace:\n{trace}\nJEAN output:\n{log}"
+        );
     }
     // Simulate JEAN being interrupted after the replacement's write was applied but before the
     // worker returned a final response or the checkpoint could be settled.
@@ -874,11 +1011,91 @@ fn run_profile(
     let worker = std::fs::read_to_string(marker).expect("worker captured its prompt");
     let checks = std::fs::read_to_string(verifier).expect("configured verifier ran");
     assert_eq!(
-        checks.lines().count(),
+        checks.lines().filter(|line| *line == "run").count(),
         2,
         "baseline and post-worker checks must run"
     );
+    if fixture.root.to_string_lossy().contains("profile-quick") {
+        let expected = if profile == "quick-prototype" {
+            "quick"
+        } else {
+            "polished"
+        };
+        assert_eq!(checks, format!("{expected}\nrun\n{expected}\nrun\n"));
+    }
     (task_id, output_text(&status), worker)
+}
+
+#[test]
+fn desktop_goal_routes_to_worker_and_requires_a_matching_approval() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let Some(fixture) = Fixture::new("profile-quick") else {
+        eprintln!("skipped: node and git are required for the local ACP fixture");
+        return;
+    };
+    let config = fixture.data.join("jean.toml");
+    let mut content = std::fs::read_to_string(&config).unwrap();
+    content.push_str("\n[policy]\nrequire_approval=['agent.delegate']\napproval_timeout_secs=10\n");
+    std::fs::write(config, content).unwrap();
+
+    const CHANNEL: &str = "0123456789abcdef0123456789abcdef";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jean"))
+        .args(["desktop-request", "--channel", CHANNEL, "--workspace"])
+        .arg(&fixture.workspace)
+        .args([
+            "--profile",
+            "quick-prototype",
+            "--",
+            "Start with alpha. Build the dashboard frontend",
+        ])
+        .env("JEAN_DATA_DIR", &fixture.data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut task_id = None;
+    let mut requested = false;
+    let mut verified = false;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if let Some(body) = line.strip_prefix(&format!("JEAN:{CHANNEL} ")) {
+            let message: serde_json::Value = serde_json::from_str(body).unwrap();
+            match message["kind"].as_str() {
+                Some("task") => task_id = message["id"].as_str().map(str::to_owned),
+                Some("approval") => {
+                    assert!(task_id.is_some(), "task ID is available before approval");
+                    let id = message["id"].as_u64().unwrap();
+                    writeln!(
+                        input,
+                        "{}",
+                        serde_json::json!({"kind":"approve","id":id + 1,"allow":false})
+                    )
+                    .unwrap();
+                    writeln!(
+                        input,
+                        "{}",
+                        serde_json::json!({"kind":"approve","id":id,"allow":true})
+                    )
+                    .unwrap();
+                    input.flush().unwrap();
+                    requested = true;
+                }
+                _ => {}
+            }
+        }
+        verified |= line.starts_with("result: succeeded");
+    }
+    assert!(child.wait().unwrap().success());
+    assert!(requested && verified);
+    let status = fixture.run(&["task", &task_id.unwrap()]);
+    assert!(output_text(&status).contains("latest step"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("verify-runs.txt")).unwrap(),
+        "quick\nrun\nquick\nrun\n"
+    );
 }
 
 #[test]

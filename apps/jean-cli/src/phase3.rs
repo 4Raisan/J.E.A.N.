@@ -22,8 +22,8 @@ use std::process::ExitCode;
 
 use crate::owner_preferences;
 use jean_core::{
-    Context, DelegateRequest, DelegationReport, call_tool, delegate, exposed_tools, list_tools,
-    mcp_bounds, mcp_servers, serve_mcp,
+    call_tool, delegate, exposed_tools, list_tools, mcp_bounds, mcp_servers, serve_mcp, Context,
+    DelegateRequest, DelegationReport,
 };
 use jean_policy::{ConsolePrompt, Decision};
 use jean_protocol::config::{DelegationConfig, WORKER_KINDS};
@@ -43,6 +43,15 @@ pub struct DelegateOptions {
 }
 
 pub fn cmd_delegate(ctx: &mut Context, options: DelegateOptions) -> anyhow::Result<ExitCode> {
+    let mut prompter = ConsolePrompt::new(&ctx.config.policy);
+    delegate_with_prompt(ctx, options, &mut prompter)
+}
+
+pub(crate) fn delegate_with_prompt(
+    ctx: &mut Context,
+    options: DelegateOptions,
+    prompter: &mut dyn jean_policy::Prompter,
+) -> anyhow::Result<ExitCode> {
     let workspace = match (&options.workspace, ctx.config.workspace.root.trim()) {
         (Some(path), _) => path.clone(),
         (None, root) if !root.is_empty() => PathBuf::from(root),
@@ -65,8 +74,19 @@ pub fn cmd_delegate(ctx: &mut Context, options: DelegateOptions) -> anyhow::Resu
         worker: options.worker.clone(),
     };
 
-    let mut prompter = ConsolePrompt::new(&ctx.config.policy);
-    let report = delegate(ctx, &request, &mut prompter)?;
+    let configured_args = match options.profile.as_deref() {
+        Some("quick-prototype") => &ctx.config.delegation.verify_quick_prototype_args[..],
+        Some("polished-ui") => &ctx.config.delegation.verify_polished_ui_args[..],
+        _ => &[],
+    };
+    let args = (!configured_args.is_empty()).then(|| configured_args.to_vec());
+    let original_args =
+        args.map(|args| std::mem::replace(&mut ctx.config.delegation.verify_args, args));
+    let report = delegate(ctx, &request, prompter);
+    if let Some(args) = original_args {
+        ctx.config.delegation.verify_args = args;
+    }
+    let report = report?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

@@ -469,6 +469,20 @@ enum Command {
         id: String,
     },
 
+    /// Show the saved patch and verification evidence for an isolated delegation.
+    Review { id: String },
+
+    /// Stage and write the exact reviewed patch against its original Git baseline.
+    Apply {
+        id: String,
+        /// SHA-256 printed by `jean review`.
+        #[arg(long)]
+        sha256: String,
+    },
+
+    /// Mark the saved patch discarded and retain its evidence.
+    Discard { id: String },
+
     /// Reconcile and resume one interrupted owner handoff.
     Resume {
         /// Original task id printed by `jean goal`.
@@ -1166,30 +1180,24 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             } else {
                 jean_core::delegation::resume_checkpoint(&mut ctx, &id, &mut prompter)?
             };
-            match resumed {
-                jean_core::delegation::ResumeOutcome::Completed(report) => {
-                    for line in report.lines() {
-                        println!("{line}");
-                    }
-                    Ok(ExitCode::from(report.result.exit_status() as u16 as u8))
-                }
-                jean_core::delegation::ResumeOutcome::NeedsAttention { task_id, reason } => {
-                    println!("task: {task_id}");
-                    println!("result: needs_attention");
-                    println!("reason: {reason}");
-                    Ok(ExitCode::from(4))
-                }
-                jean_core::delegation::ResumeOutcome::Blocked {
-                    task_id,
-                    status,
-                    reason,
-                } => {
-                    println!("task: {task_id}");
-                    println!("result: {status}");
-                    println!("reason: {reason}");
-                    Ok(ExitCode::from(4))
-                }
-            }
+            print_resume(resumed)
+        }
+        Command::Review { id } => {
+            let preview = jean_core::delegation::review::preview(&ctx, &id)?;
+            print_review(&ctx, &id, &preview)?;
+            print!("{}", review_patch_text(&preview.patch));
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Apply { id, sha256 } => {
+            let mut prompt = jean_policy::ConsolePrompt::new(&ctx.config.policy);
+            jean_core::delegation::review::apply(&ctx, &id, &sha256, &mut prompt)?;
+            println!("result: applied to the working tree and index");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Discard { id } => {
+            jean_core::delegation::review::discard(&ctx, &id)?;
+            println!("result: discarded; isolated evidence retained");
+            Ok(ExitCode::SUCCESS)
         }
         Command::Agent => phase3::cmd_agent(&ctx.config.delegation),
         Command::Mcp { action } => phase3::cmd_mcp(&mut ctx, action.into()),
@@ -1270,6 +1278,58 @@ impl From<Option<ApprovalsCommand>> for phase1::ApprovalAction {
 
 /// The two `--send` values, checked where a wrong count is a stated error rather than an
 /// index that panics.
+fn print_review(
+    ctx: &Context,
+    id: &str,
+    preview: &jean_core::delegation::review::Preview,
+) -> anyhow::Result<()> {
+    println!("workspace: {}", preview.workspace.display());
+    println!("baseline: {}", preview.baseline);
+    println!("sha256: {}", preview.sha256);
+    println!("review: {}", preview.state);
+    print_delegation_activity(&mut std::io::stdout(), ctx, id)?;
+    Ok(())
+}
+
+fn review_patch_text(patch: &[u8]) -> String {
+    let mut text = String::new();
+    for character in String::from_utf8_lossy(patch).chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    text
+}
+
+fn print_resume(resumed: jean_core::delegation::ResumeOutcome) -> anyhow::Result<ExitCode> {
+    match resumed {
+        jean_core::delegation::ResumeOutcome::Completed(report) => {
+            for line in report.lines() {
+                println!("{line}");
+            }
+            Ok(ExitCode::from(report.result.exit_status() as u16 as u8))
+        }
+        jean_core::delegation::ResumeOutcome::NeedsAttention { task_id, reason } => {
+            println!("task: {task_id}");
+            println!("result: needs_attention");
+            println!("reason: {reason}");
+            Ok(ExitCode::from(4))
+        }
+        jean_core::delegation::ResumeOutcome::Blocked {
+            task_id,
+            status,
+            reason,
+        } => {
+            println!("task: {task_id}");
+            println!("result: {status}");
+            println!("reason: {reason}");
+            Ok(ExitCode::from(if status == "cancelled" { 130 } else { 4 }))
+        }
+    }
+}
+
 fn send_title_and_body(values: Option<&[String]>) -> anyhow::Result<Option<(String, String)>> {
     let Some(values) = values else {
         return Ok(None);
