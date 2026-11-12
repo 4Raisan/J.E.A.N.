@@ -426,6 +426,12 @@ enum Command {
         action: Option<ModelCommand>,
     },
 
+    /// Inspect and label replacement-worker selector observations.
+    Decision {
+        #[command(subcommand)]
+        action: DecisionCommand,
+    },
+
     /// Phase 3. Hand a goal to an external coding agent, then check the result yourself.
     ///
     /// The whole workflow in one command: J.E.A.N. resolves the workspace and the verification command
@@ -864,6 +870,16 @@ enum ModelCommand {
     Ping,
 }
 
+#[derive(Subcommand)]
+enum DecisionCommand {
+    /// Compare labeled shadow choices with the Rust fallback and show the activation gate.
+    Report,
+    /// Show recorded choices and outcome for a recovery task.
+    Inspect { id: String },
+    /// Record the expected option ID for a shadow observation.
+    Label { id: String, choice: usize },
+}
+
 /// `jean approvals …`
 #[derive(Subcommand)]
 enum ApprovalsCommand {
@@ -1105,6 +1121,28 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             },
         ),
         Command::Model { action } => phase2::cmd_model(&ctx, action.into()),
+        Command::Decision { action } => {
+            use jean_core::decision;
+            match action {
+                DecisionCommand::Report => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decision::report(&ctx)?)?
+                    );
+                }
+                DecisionCommand::Inspect { id } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decision::inspect(&ctx, &id)?)?
+                    );
+                }
+                DecisionCommand::Label { id, choice } => {
+                    decision::label(&ctx, &id, choice)?;
+                    println!("Recorded expected choice {choice} for {id}.");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
 
         // Phase 3. `delegate` runs the worker under the existing policy, audit and supervision;
         // `agent` reads configuration and resolves names, and starts nothing.
