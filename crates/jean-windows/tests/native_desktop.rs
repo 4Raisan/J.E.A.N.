@@ -36,6 +36,10 @@ use jean_windows::capture::{self, FrameQuality};
 use jean_windows::identity::{self, DisplayAffinity, WindowId};
 use jean_windows::input::{self, Target};
 use jean_windows::{worker, WindowsError};
+use windows::core::w;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+};
 
 /// Read one `key=value` field out of a fixture line.
 fn field(text: &str, key: &str) -> isize {
@@ -748,17 +752,13 @@ fn an_ambiguous_locator_is_refused_rather_than_resolved_by_enumeration_order() {
         },
     ]);
     let started = std::time::Instant::now();
-    let effect = accessibility::act(
-        fixture.id(),
-        left,
-        Action::Invoke,
-        None,
-        settings(),
-        None,
-    )
-    .expect("a path through the intended parent group is not ambiguous");
+    let effect = accessibility::act(fixture.id(), left, Action::Invoke, None, settings(), None)
+        .expect("a path through the intended parent group is not ambiguous");
     assert_eq!(effect.control.automation_id, "1008");
-    assert!(!effect.is_verified(), "an Invoke return without a state change is not evidence: {effect:?}");
+    assert!(
+        !effect.is_verified(),
+        "an Invoke return without a state change is not evidence: {effect:?}"
+    );
     assert_eq!(control(&fixture, 1006).name, "idle");
     assert_eq!(control(&fixture, 1008).name, "Continue");
     assert_eq!(control(&fixture, 1009).name, "Continue");
@@ -773,15 +773,8 @@ fn an_ambiguous_locator_is_refused_rather_than_resolved_by_enumeration_order() {
             control_type: Some(ControlKind::Button),
         },
     ]);
-    let right = accessibility::act(
-        fixture.id(),
-        right,
-        Action::Invoke,
-        None,
-        settings(),
-        None,
-    )
-    .expect("the other parent resolves its own Continue button");
+    let right = accessibility::act(fixture.id(), right, Action::Invoke, None, settings(), None)
+        .expect("the other parent resolves its own Continue button");
     assert_eq!(right.control.automation_id, "1009");
     assert!(!right.is_verified());
     assert_eq!(control(&fixture, 1006).name, "idle");
@@ -1672,8 +1665,12 @@ fn a_coordinate_click_lands_on_the_control_on_the_monitor_it_was_placed_on() {
             ..Default::default()
         },
         None,
-    )
-    .expect("a click aimed at the control the operator is looking at must be sent");
+    );
+    if let Err(WindowsError::FocusChanged { actual, .. }) = &sent {
+        eprintln!("SKIPPED second-monitor coordinate click: foreground changed to {actual} before the send.");
+        return;
+    }
+    let sent = sent.expect("a click aimed at the control the operator is looking at must be sent");
     assert!(
         sent.is_complete(),
         "SendInput accepted {}/{} events at ({},{}) normalised to {:?}",
@@ -1687,7 +1684,12 @@ fn a_coordinate_click_lands_on_the_control_on_the_monitor_it_was_placed_on() {
     // The witness is the fixture's counter, not the API's return value. A click that landed on the
     // monitor's wallpaper, on the title bar, or one pixel off the button is accepted by `SendInput`
     // exactly as this one was, and only the control that was aimed at can tell them apart.
-    let after = control(&fixture, 1006).name;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut after = control(&fixture, 1006).name;
+    while after == "idle" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(30));
+        after = control(&fixture, 1006).name;
+    }
     assert_eq!(
         after, "clicked:1",
         "a coordinate click at ({},{}) on monitor {landed:?} (dpi {}) did not reach the button: \
@@ -1695,7 +1697,46 @@ fn a_coordinate_click_lands_on_the_control_on_the_monitor_it_was_placed_on() {
         point.0, point.1, landed.dpi
     );
 
-    // The two refusals, through the same call rather than through `Target::verify` alone: what has to be
+    let cover = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            w!("STATIC"),
+            w!("J.E.A.N. click test cover"),
+            WS_POPUP | WS_VISIBLE,
+            point.0 - 20,
+            point.1 - 20,
+            40,
+            40,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .expect("create a cover without taking foreground");
+    let covered = input::send(
+        Target {
+            window: fixture.id(),
+            point,
+            expect_foreground: fixture.id(),
+        },
+        input::Input::Click {
+            button: input::Button::Left,
+        },
+        input::Settings::default(),
+        None,
+    );
+    unsafe { DestroyWindow(cover) }.expect("remove the test cover");
+    if let Err(WindowsError::FocusChanged { actual, .. }) = &covered {
+        eprintln!("SKIPPED covered-point check: foreground changed to {actual} before the send.");
+        return;
+    }
+    assert!(
+        matches!(&covered, Err(WindowsError::StaleElement { control }) if control.contains("hits hwnd=")),
+        "a foreground window covered at the click point must be refused: {covered:?}"
+    );
+
+    // The remaining refusals, through the same call rather than through `Target::verify` alone: what has to be
     // proven is that `send` stops before `SendInput`, so that the counter is still the number it was.
     let stale = input::send(
         Target {
@@ -1752,7 +1793,7 @@ fn a_coordinate_click_lands_on_the_control_on_the_monitor_it_was_placed_on() {
     assert_eq!(
         control(&fixture, 1006).name,
         "clicked:1",
-        "the two refused sends performed nothing, which is the whole point of verifying inside the send"
+        "the refused sends performed nothing, which is the whole point of verifying inside the send"
     );
     assert_eq!(
         0,
@@ -1764,7 +1805,7 @@ fn a_coordinate_click_lands_on_the_control_on_the_monitor_it_was_placed_on() {
     eprintln!(
         "MEASURED: a coordinate click at ({},{}) — normalised {normalised:?} of a virtual desktop \
          {}x{}@{},{} — landed on monitor {}x{}@{},{} at dpi {} ({}%) and the fixture's own counter read \
-         {after:?}; two refused sends after it left that counter unchanged.",
+         {after:?}; three refused sends after it left that counter unchanged.",
         point.0,
         point.1,
         desktop.width(),

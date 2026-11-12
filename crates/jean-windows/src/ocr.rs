@@ -675,10 +675,17 @@ impl SidecarOcr {
     pub fn from_env() -> Option<Self> {
         let python = std::env::var_os("JEAN_OCR_PYTHON")?;
         let script = std::env::var_os("JEAN_OCR_SCRIPT")?;
-        Some(Self { python: python.into(), script: script.into() })
+        Some(Self {
+            python: python.into(),
+            script: script.into(),
+        })
     }
 
-    pub fn extract_with_timeout(&self, request: &OcrRequest, timeout: std::time::Duration) -> WindowsResult<OcrResult> {
+    pub fn extract_with_timeout(
+        &self,
+        request: &OcrRequest,
+        timeout: std::time::Duration,
+    ) -> WindowsResult<OcrResult> {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
         let line = SidecarProtocol::request_line(request)?;
@@ -688,17 +695,37 @@ impl SidecarOcr {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| WindowsError::InvalidSetting { reason: format!("ocr sidecar spawn failed: {e}") })?;
-        child.stdin.as_mut().ok_or_else(|| WindowsError::InvalidSetting { reason: "ocr sidecar: no stdin".to_owned() })?.write_all(line.as_bytes()).map_err(|e| WindowsError::InvalidSetting { reason: format!("ocr sidecar write failed: {e}") })?;
+            .map_err(|e| WindowsError::InvalidSetting {
+                reason: format!("ocr sidecar spawn failed: {e}"),
+            })?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| WindowsError::InvalidSetting {
+                reason: "ocr sidecar: no stdin".to_owned(),
+            })?
+            .write_all(line.as_bytes())
+            .map_err(|e| WindowsError::InvalidSetting {
+                reason: format!("ocr sidecar write failed: {e}"),
+            })?;
         let (tx, rx) = std::sync::mpsc::channel();
-        let out = child.stdout.take().ok_or_else(|| WindowsError::InvalidSetting { reason: "ocr sidecar: no stdout".to_owned() })?;
+        let out = child
+            .stdout
+            .take()
+            .ok_or_else(|| WindowsError::InvalidSetting {
+                reason: "ocr sidecar: no stdout".to_owned(),
+            })?;
         std::thread::spawn(move || {
             let mut r = BufReader::new(out);
             let mut s = String::new();
             let _ = r.read_line(&mut s);
             let _ = tx.send(s);
         });
-        let reply = rx.recv_timeout(timeout).map_err(|_| WindowsError::InvalidSetting { reason: "ocr sidecar timed out".to_owned() })?;
+        let reply = rx
+            .recv_timeout(timeout)
+            .map_err(|_| WindowsError::InvalidSetting {
+                reason: "ocr sidecar timed out".to_owned(),
+            })?;
         let _ = child.kill();
         let _ = child.wait();
         SidecarProtocol::parse_reply(reply.trim())
@@ -709,10 +736,14 @@ impl TextExtractor for SidecarOcr {
     fn extract(&self, request: &OcrRequest) -> WindowsResult<OcrResult> {
         self.extract_with_timeout(request, std::time::Duration::from_secs(30))
     }
-    fn name(&self) -> &'static str { "rapidocr-sidecar" }
+    fn name(&self) -> &'static str {
+        "rapidocr-sidecar"
+    }
     fn status(&self) -> BackendStatus {
         if self.python.is_file() && self.script.is_file() {
-            BackendStatus::Unverified("rapidocr sidecar: python+script present, needs image validation".to_owned())
+            BackendStatus::Unverified(
+                "rapidocr sidecar: python+script present, needs image validation".to_owned(),
+            )
         } else {
             BackendStatus::Unavailable("python/script missing".to_owned())
         }
@@ -724,15 +755,25 @@ mod tests {
     use super::*;
     #[test]
     fn sidecar_missing_files_reports_unavailable() {
-        let s = SidecarOcr { python: PathBuf::from("nope.exe"), script: PathBuf::from("nope.py") };
+        let s = SidecarOcr {
+            python: PathBuf::from("nope.exe"),
+            script: PathBuf::from("nope.py"),
+        };
         assert!(matches!(s.status(), BackendStatus::Unavailable(_)));
     }
     #[test]
     fn request_line_roundtrips_through_parse() {
-        let req = OcrRequest { image: PathBuf::from("x.bmp"), languages: vec!["en".to_owned()], regions: vec![] };
+        let req = OcrRequest {
+            image: PathBuf::from("x.bmp"),
+            languages: vec!["en".to_owned()],
+            regions: vec![],
+        };
         let line = req.encode();
         assert!(line.contains("\"x.bmp\""));
-        let out = SidecarProtocol::parse_reply(r#"{"lines":[{"text":"hi","confidence":0.5,"box":[[0,0],[10,0],[10,10],[0,10]]}]}"#).unwrap();
+        let out = SidecarProtocol::parse_reply(
+            r#"{"lines":[{"text":"hi","confidence":0.5,"box":[[0,0],[10,0],[10,10],[0,10]]}]}"#,
+        )
+        .unwrap();
         assert_eq!(out.lines[0].text, "hi");
     }
 }

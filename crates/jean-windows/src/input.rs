@@ -37,6 +37,7 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -44,7 +45,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, SM_CXVIRTUALSCREEN};
+use windows::Win32::UI::WindowsAndMessaging::{
+    IsChild, SetCursorPos, WindowFromPoint, SM_CXVIRTUALSCREEN,
+};
 
 use crate::bounded::{spawn_bounded, Outcome};
 use crate::error::{WindowsError, WindowsResult};
@@ -435,6 +438,23 @@ pub struct SendInputBackend;
 impl InputBackend for SendInputBackend {
     fn send(&self, target: &Target, input: &Input, settings: &Settings) -> WindowsResult<Sent> {
         let state = target.verify()?;
+        if matches!(
+            input,
+            Input::Click { .. } | Input::DoubleClick { .. } | Input::Scroll { .. }
+        ) {
+            let (x, y) = target.point;
+            let window = target.window.to_raw();
+            let hit = unsafe { WindowFromPoint(POINT { x, y }) };
+            // The foreground window can still be covered by a non-activating overlay.
+            if hit != window && !unsafe { IsChild(window, hit) }.as_bool() {
+                return Err(WindowsError::StaleElement {
+                    control: format!(
+                        "point ({x},{y}) hits hwnd={} instead of target hwnd={}",
+                        hit.0 as isize, target.window.hwnd
+                    ),
+                });
+            }
+        }
         let desktop = virtual_desktop();
         let (dx, dy) = to_normalised(target.point, desktop);
 
