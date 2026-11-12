@@ -37,6 +37,15 @@ pub enum RecoveryBlocker {
     DiskCheckUnavailable,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCause {
+    Quota,
+    Context,
+    SignIn,
+    Network,
+}
+
 impl RecoveryBlocker {
     pub const fn status(self) -> &'static str {
         match self {
@@ -86,6 +95,8 @@ pub struct Checkpoint {
     pub resumed_task_id: Option<String>,
     #[serde(default)]
     pub blocked_on: Option<RecoveryBlocker>,
+    #[serde(default)]
+    pub recovery_cause: Option<RecoveryCause>,
 }
 
 fn checked_path(data_dir: &Path, task_id: &str) -> Result<PathBuf> {
@@ -256,11 +267,6 @@ pub fn reconcile_workspace(checkpoint: &Checkpoint) -> Result<()> {
         .map_err(|e| CoreError::Environment {
             reason: format!("checkpoint workspace is unavailable: {e}"),
         })?;
-    let expected: std::collections::BTreeSet<_> = checkpoint
-        .completed_effects
-        .iter()
-        .map(|e| e.path.clone())
-        .collect();
     let output = Command::new("git")
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(&workspace)
@@ -273,8 +279,21 @@ pub fn reconcile_workspace(checkpoint: &Checkpoint) -> Result<()> {
             reason: "workspace reconciliation could not read Git status".to_owned(),
         });
     }
+    reconcile_status(checkpoint, &workspace, &output.stdout)
+}
+
+pub(crate) fn reconcile_status(
+    checkpoint: &Checkpoint,
+    workspace: &Path,
+    status: &[u8],
+) -> Result<()> {
+    let expected: std::collections::BTreeSet<_> = checkpoint
+        .completed_effects
+        .iter()
+        .map(|effect| effect.path.clone())
+        .collect();
     let mut actual = std::collections::BTreeSet::new();
-    for record in output.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+    for record in status.split(|b| *b == 0).filter(|s| !s.is_empty()) {
         if record.len() < 4 || record[2] != b' ' {
             return Err(CoreError::Environment {
                 reason:
@@ -305,7 +324,7 @@ pub fn reconcile_workspace(checkpoint: &Checkpoint) -> Result<()> {
     let effects = if expected.is_empty() {
         Vec::new()
     } else {
-        snapshot_workspace_effects(&workspace, &expected.iter().cloned().collect::<Vec<_>>())?
+        snapshot_workspace_effects(workspace, &expected.iter().cloned().collect::<Vec<_>>())?
     };
     let observed: std::collections::BTreeMap<_, _> =
         effects.into_iter().map(|e| (e.path.clone(), e)).collect();
@@ -445,6 +464,7 @@ mod tests {
             resumable: false,
             resumed_task_id: None,
             blocked_on: None,
+            recovery_cause: None,
         }
     }
 

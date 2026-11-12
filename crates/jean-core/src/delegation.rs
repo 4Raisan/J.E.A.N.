@@ -65,6 +65,8 @@ use crate::error::{CoreError, Result};
 use crate::ipc::CancelListener;
 use crate::verify::Verdict;
 
+pub mod review;
+
 /// What the operator asked to have done, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegateRequest {
@@ -165,7 +167,7 @@ pub struct DelegationReport {
 
 #[derive(Debug)]
 pub enum ResumeOutcome {
-    Completed(DelegationReport),
+    Completed(Box<DelegationReport>),
     NeedsAttention {
         task_id: String,
         reason: String,
@@ -280,7 +282,7 @@ pub fn delegate_with(
     prompter: &mut dyn Prompter,
     runner: &dyn WorkerRunner,
 ) -> Result<DelegationReport> {
-    delegate_with_mode(ctx, request, prompter, runner, false, true)
+    delegate_with_mode(ctx, request, prompter, runner, None, None)
 }
 
 fn delegate_with_mode(
@@ -288,12 +290,13 @@ fn delegate_with_mode(
     request: &DelegateRequest,
     prompter: &mut dyn Prompter,
     runner: &dyn WorkerRunner,
-    resume_in_place: bool,
-    allow_recovery_resume: bool,
+    resume_baseline: Option<&review::Baseline>,
+    resume_checkpoint: Option<&crate::owner::Checkpoint>,
 ) -> Result<DelegationReport> {
+    let allow_recovery_resume = resume_checkpoint.is_none();
     ctx.prepare_for_writing()?;
     let mut config = ctx.config.delegation.clone();
-    if resume_in_place {
+    if !allow_recovery_resume {
         config.isolate_in_worktree = false;
         config.require_clean_baseline = false;
     }
@@ -308,6 +311,23 @@ fn delegate_with_mode(
     let worker = select_worker(&config, request.worker.as_deref())?;
     let workspace = resolve_workspace(request.workspace.as_path())?;
     let verification = resolve_verification(&config)?;
+    if allow_recovery_resume {
+        let mut volumes = vec![workspace.clone(), ctx.paths.data_dir.clone()];
+        if config.isolate_in_worktree && !config.worktree_root.trim().is_empty() {
+            volumes.push(std::path::absolute(&config.worktree_root).map_err(|e| {
+                CoreError::Intent {
+                    reason: format!("cannot resolve worktree root: {e}"),
+                }
+            })?);
+        }
+        for path in &volumes {
+            if let Some((blocker, reason)) = disk_blocker(path, config.resume_min_free_disk_bytes) {
+                return Err(CoreError::Intent {
+                    reason: format!("{}: {reason}", blocker.status()),
+                });
+            }
+        }
+    }
 
     let task_id = new_task_id();
     let delegation_id = format!(
@@ -319,15 +339,17 @@ fn delegate_with_mode(
         path: artifacts.clone(),
         reason: e.to_string(),
     })?;
+    let _task_lock = review::task_lock(ctx, &task_id)?;
     let transcript = artifacts.join("worker-transcript.log");
 
     let store = &ctx.store;
+    let recorded_goal = ctx.redactor.redact(&request.goal);
     store.insert_task(&TaskRecord::new(
         task_id.clone(),
-        request.goal.clone(),
+        recorded_goal.clone(),
         Some(format!("delegate:{}", worker.name)),
         serde_json::json!({
-            "goal": request.goal,
+            "goal": recorded_goal,
             "worker": worker.name,
             "kind": worker.kind,
             "workspace": workspace.display().to_string(),
@@ -335,6 +357,7 @@ fn delegate_with_mode(
         })
         .to_string(),
     ))?;
+    crate::runner::record_ownership(store, &task_id)?;
     store.transition(
         &task_id,
         TaskState::Planning,
@@ -347,7 +370,7 @@ fn delegate_with_mode(
             task_id: task_id.clone(),
             worker: worker.name.clone(),
             kind: worker.kind.clone(),
-            goal: ctx.redactor.redact(&request.goal),
+            goal: recorded_goal,
             workspace: workspace.display().to_string(),
             worktree: None,
             worktree_note: None,
@@ -381,6 +404,7 @@ fn delegate_with_mode(
         reason: e.to_string(),
     })?;
     let mut teardown = Teardown::new(listener, CancelBridge::start(token.clone(), cancel.clone()));
+    (ctx.task_started)(&task_id);
 
     let policy = Policy::new(ctx.config.policy.clone());
     let audit = AuditWriter::new(
@@ -409,6 +433,23 @@ fn delegate_with_mode(
         }
         denied @ Decision::Denied(_) => {
             record(&audit, &launch_operation, &denied, &actor, &workspace)?;
+            if token.is_cancelled() {
+                let note = "delegation cancelled before worker approval";
+                finish(
+                    store,
+                    &audit,
+                    &actor,
+                    &launch_operation,
+                    &delegation_id,
+                    &task_id,
+                    DelegationResult::Cancelled,
+                    note,
+                );
+                teardown.stop();
+                return Err(CoreError::Intent {
+                    reason: note.into(),
+                });
+            }
             let text = AuditEvent::denial_text(denied.reason().expect("a denial has a reason"));
             teardown.stop();
             store
@@ -417,6 +458,7 @@ fn delegate_with_mode(
             store
                 .transition(&task_id, TaskState::Failed, Some(&text))
                 .ok();
+            store.clear_runner(&task_id).ok();
             return Err(CoreError::Intent {
                 reason: format!("the delegation was refused: {text}"),
             });
@@ -431,7 +473,53 @@ fn delegate_with_mode(
     // Where the worker will actually work, and what was already dirty there.
     let isolation = prepare_isolation(ctx, &config, store, &delegation_id, &task_id, &workspace)?;
     let workdir = isolation.directory.clone();
+    let _workspace_lock =
+        if allow_recovery_resume && isolation.repository && isolation.worktree.is_none() {
+            Some(review::workspace_lock(ctx, &task_id, &workdir)?)
+        } else {
+            None
+        };
+    let validate_replacement = || -> Result<()> {
+        if let Some(checkpoint) = resume_checkpoint {
+            if let Err(error) = review::validate_resume_workspace(ctx, checkpoint, resume_baseline)
+            {
+                finish(
+                    store,
+                    &audit,
+                    &actor,
+                    &launch_operation,
+                    &delegation_id,
+                    &task_id,
+                    DelegationResult::NeedsAttention,
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        }
+        Ok(())
+    };
+    validate_replacement()?;
+    let mut review_note = None;
+    let review_baseline = if let Some(baseline) = resume_baseline {
+        Some(baseline.clone())
+    } else if isolation.worktree.is_some() {
+        match review::record_baseline(ctx, &task_id, &workspace, &workdir) {
+            Ok(baseline) => Some(baseline),
+            Err(error) => {
+                review_note = Some(format!("review unavailable: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let pre_existing = dirty_files(ctx, workdir.as_path(), &task_id, "status-before")?;
+    let recovery_head =
+        if allow_recovery_resume && isolation.repository && isolation.worktree.is_none() {
+            review::record_recovery_head(ctx, &task_id, &workdir).is_ok()
+        } else {
+            false
+        };
     // What the operator had already modified in *their own* tree. Only worth asking when the worker
     // went somewhere else, because a worktree starts at HEAD and does not carry those changes, and
     // "the worker changed nothing" would otherwise read as "nothing needed changing".
@@ -471,6 +559,9 @@ fn delegate_with_mode(
         )
         .ok();
     let baseline = baseline_run.verdict;
+    if !token.is_cancelled() {
+        validate_replacement()?;
+    }
 
     if config.require_clean_baseline && !pre_existing.is_empty() && isolation.worktree.is_none() {
         let note = format!(
@@ -518,6 +609,7 @@ fn delegate_with_mode(
             resumable: false,
             resumed_task_id: None,
             blocked_on: None,
+            recovery_cause: None,
         },
     )?;
 
@@ -582,7 +674,21 @@ fn delegate_with_mode(
             bounds.permission_timeout,
             granted,
         );
-        let outcome = runner.run(&spec, &mut host, &mut sink);
+        let outcome = if token.is_cancelled() {
+            Ok(WorkerOutcome {
+                stop_reason: STOP_CANCELLED.into(),
+                claim: None,
+                exit_code: None,
+                events: 0,
+                stdout_bytes: 0,
+                output_dir: None,
+                failure: None,
+                failure_kind: None,
+                remaining_work: None,
+            })
+        } else {
+            runner.run(&spec, &mut host, &mut sink)
+        };
         (outcome, host.covered, host.asked)
     };
 
@@ -674,6 +780,18 @@ fn delegate_with_mode(
 
     // The independent check, after the worker. Same resolved argv as the baseline, from the same
     // configuration the worker never saw.
+    let before_verification = review_baseline.as_ref().and_then(|baseline| {
+        if cancel.load(Ordering::Relaxed) || outcome.failure_kind.is_some() {
+            return None;
+        }
+        match review::snapshot(ctx, &task_id, &workdir, baseline) {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                review_note = Some(format!("review unavailable: {error}"));
+                None
+            }
+        }
+    });
     let verification_verdict = if cancel.load(Ordering::Relaxed) {
         // A cancelled delegation gets no second act: the operator asked for it to stop, and running
         // a check they may have watched time out would be J.E.A.N. deciding to keep working.
@@ -700,7 +818,9 @@ fn delegate_with_mode(
         || token.is_cancelled();
     let recovery_failure = outcome.failure_kind;
     let recognized_recovery = recovery_failure.is_some();
-    let result = if recognized_recovery {
+    let result = if cancelled {
+        DelegationResult::Cancelled
+    } else if recognized_recovery {
         DelegationResult::NeedsAttention
     } else {
         decide_result(cancelled, &outcome, verification_verdict.as_ref())
@@ -734,11 +854,28 @@ fn delegate_with_mode(
         _ => None,
     };
     let mut next_action = if result == DelegationResult::Succeeded {
-        "review the verified diff; no further action is pending".to_owned()
+        if let (Some(baseline), Some(tree)) = (&review_baseline, before_verification) {
+            match review::publish(ctx, &task_id, &workdir, baseline, &tree) {
+                Ok(true) => {
+                    review_note = Some(format!(
+                        "inspect the verified patch with jean review {task_id}"
+                    ))
+                }
+                Ok(false) => {
+                    review_note = Some("verification passed with no workspace diff".into())
+                }
+                Err(error) => review_note = Some(format!("review unavailable: {error}")),
+            }
+        }
+        review_note
+            .clone()
+            .unwrap_or_else(|| "verification passed; no isolated patch is available".into())
+    } else if outcome.stop_reason == jean_acp::contract::STOP_TIMEOUT {
+        "deadline reached; inspect recorded effects before starting another task".to_owned()
     } else {
         "review task status and reconcile workspace evidence before any retry".to_owned()
     };
-    if recognized_recovery && allow_recovery_resume {
+    if recognized_recovery && allow_recovery_resume && !cancelled {
         eligible_free_workers = config
             .workers
             .iter()
@@ -747,7 +884,11 @@ fn delegate_with_mode(
             })
             .map(|candidate| candidate.name.clone())
             .collect();
-        let effect_snapshot = if pre_existing.is_empty() {
+        let effect_snapshot = if review_baseline.is_none() && !recovery_head {
+            Err(CoreError::Intent {
+                reason: "the Git recovery baseline was not recorded".into(),
+            })
+        } else if pre_existing.is_empty() {
             if changed.is_empty() {
                 Ok(Vec::new())
             } else {
@@ -763,7 +904,8 @@ fn delegate_with_mode(
                 if !remaining_work.trim().is_empty() && !eligible_free_workers.is_empty() =>
             {
                 completed_effects = effects;
-                resumable = true;
+                let evidence = review::record_recovery_index(ctx, &task_id, &workdir);
+                resumable = evidence.is_ok();
                 next_action = match recovery_failure {
                     Some(WorkerFailureKind::QuotaExhausted) => format!(
                         "quota_exhausted: resume once with an eligible free worker: jean resume {task_id}"
@@ -783,6 +925,11 @@ fn delegate_with_mode(
                     ),
                     None => unreachable!(),
                 };
+                if let Err(error) = evidence {
+                    next_action = format!(
+                        "needs_attention: could not record recovery index evidence: {error}"
+                    );
+                }
             }
             Ok(_) => {
                 next_action = "needs_attention: quota evidence lacked remaining work or an eligible free worker".to_owned();
@@ -829,10 +976,16 @@ fn delegate_with_mode(
             resumable,
             resumed_task_id: None,
             blocked_on: blocked_on.take(),
+            recovery_cause: recovery_failure.map(|failure| match failure {
+                WorkerFailureKind::QuotaExhausted => crate::owner::RecoveryCause::Quota,
+                WorkerFailureKind::ContextExhausted => crate::owner::RecoveryCause::Context,
+                WorkerFailureKind::SignInExpired => crate::owner::RecoveryCause::SignIn,
+                WorkerFailureKind::NetworkUnavailable => crate::owner::RecoveryCause::Network,
+            }),
         },
     )?;
 
-    let mut notes = Vec::new();
+    let mut notes = review_note.into_iter().collect::<Vec<_>>();
     if let Some(failure) = &outcome.failure {
         notes.push(format!("the worker's session reported: {failure}"));
     }
@@ -921,6 +1074,7 @@ fn resume_checkpoint_with_condition(
     runner: &dyn WorkerRunner,
     condition_cleared: bool,
 ) -> Result<ResumeOutcome> {
+    let _lock = review::task_lock(ctx, task_id)?;
     let mut checkpoint = crate::owner::read_checkpoint(&ctx.paths.data_dir, task_id)?;
     let attention = |ctx: &Context, checkpoint: &mut crate::owner::Checkpoint, reason: String| {
         checkpoint.resumable = false;
@@ -945,15 +1099,19 @@ fn resume_checkpoint_with_condition(
             "checkpoint is not marked resumable".to_owned(),
         );
     }
-    if checkpoint.attempts >= checkpoint.max_attempts || checkpoint.max_attempts == 0 {
+    if checkpoint.attempts > 0 || checkpoint.max_attempts == 0 {
         return attention(
             ctx,
             &mut checkpoint,
             "the checkpoint's bounded retry count is exhausted".to_owned(),
         );
     }
-    if let Err(error) = crate::owner::reconcile_for_resume(&checkpoint) {
-        return attention(ctx, &mut checkpoint, error.to_string());
+    if ctx.store.require_task(task_id)?.state != TaskState::NeedsAttention {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "the original task did not settle in needs_attention".into(),
+        );
     }
     if let Some(
         blocker @ (crate::owner::RecoveryBlocker::SignInExpired
@@ -981,55 +1139,64 @@ fn resume_checkpoint_with_condition(
         Path::new(&checkpoint.workspace),
         ctx.paths.data_dir.as_path(),
     ] {
-        match available_disk_bytes(path) {
-            Ok(bytes) if bytes >= min_free => {}
-            Ok(bytes) => {
-                let blocker = crate::owner::RecoveryBlocker::LowDisk;
-                let reason = format!(
-                    "{}; detected {bytes} available bytes, configured minimum is {min_free}",
-                    blocker.action()
-                );
+        if let Some((blocker, reason)) = disk_blocker(path, min_free) {
+            // A disk failure must not consume the separate sign-in/network
+            // acknowledgement before a replacement can actually be reserved.
+            if !matches!(
+                checkpoint.blocked_on,
+                Some(
+                    crate::owner::RecoveryBlocker::SignInExpired
+                        | crate::owner::RecoveryBlocker::NetworkUnavailable
+                )
+            ) {
                 checkpoint.blocked_on = Some(blocker);
-                checkpoint.next_action = format!("{}: {reason}", blocker.status());
-                crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
-                return Ok(ResumeOutcome::Blocked {
-                    task_id: checkpoint.task_id.clone(),
-                    status: blocker.status().to_owned(),
-                    reason,
-                });
             }
-            Err(error) => {
-                let blocker = crate::owner::RecoveryBlocker::DiskCheckUnavailable;
-                let reason = format!("{}: {error}", blocker.action());
-                checkpoint.blocked_on = Some(blocker);
-                checkpoint.next_action = format!("{}: {reason}", blocker.status());
-                crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
-                return Ok(ResumeOutcome::Blocked {
-                    task_id: checkpoint.task_id.clone(),
-                    status: blocker.status().to_owned(),
-                    reason,
-                });
-            }
+            checkpoint.next_action = format!("{}: {reason}", blocker.status());
+            crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
+            return Ok(ResumeOutcome::Blocked {
+                task_id: checkpoint.task_id.clone(),
+                status: blocker.status().to_owned(),
+                reason,
+            });
         }
     }
-    let candidate = checkpoint.eligible_free_workers.iter().find_map(|name| {
-        ctx.config.delegation.workers.iter().find(|worker| {
-            worker.name == *name
-                && worker.enabled
-                && worker.free_fallback
-                && !checkpoint
-                    .attempted_workers
-                    .iter()
-                    .any(|attempted| attempted == name)
+    if let Err(error) = review::reconcile_checkpoint(ctx, &checkpoint) {
+        return attention(ctx, &mut checkpoint, error.to_string());
+    }
+    let baseline_start = Instant::now();
+    let search_path = std::env::var("PATH").ok();
+    let extensions = std::env::var("PATHEXT").ok();
+    let mut seen = BTreeSet::new();
+    let candidates: Vec<_> = checkpoint
+        .eligible_free_workers
+        .iter()
+        .filter(|name| seen.insert(name.to_string()))
+        .filter_map(|name| {
+            ctx.config.delegation.workers.iter().find(|worker| {
+                worker.name == *name
+                    && worker.enabled
+                    && worker.free_fallback
+                    && crate::resolve::resolve_executable(
+                        &worker.command,
+                        search_path.as_deref(),
+                        extensions.as_deref(),
+                    )
+                    .is_ok()
+                    && !checkpoint
+                        .attempted_workers
+                        .iter()
+                        .any(|attempted| attempted == name)
+            })
         })
-    });
-    let Some(candidate) = candidate else {
+        .collect();
+    if candidates.is_empty() {
         return attention(
             ctx,
             &mut checkpoint,
-            "no enabled, explicitly free-eligible untried worker remains".to_owned(),
+            "no enabled, explicitly free-eligible untried worker with a resolvable executable remains".to_owned(),
         );
-    };
+    }
+    let baseline_us = u64::try_from(baseline_start.elapsed().as_micros()).unwrap_or(u64::MAX);
     if checkpoint.remaining_work.trim().is_empty() {
         return attention(
             ctx,
@@ -1038,7 +1205,97 @@ fn resume_checkpoint_with_condition(
         );
     }
 
-    let worker_name = candidate.name.clone();
+    let verifier = resolve_verification(&ctx.config.delegation)?;
+    let previous = ctx.store.delegations_for_task(task_id)?;
+    let Some(previous) = previous.last() else {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "the original verifier could not be found".into(),
+        );
+    };
+    let args: Vec<String> =
+        serde_json::from_str(&previous.verify_args_json).map_err(|e| CoreError::Intent {
+            reason: format!("invalid recorded verifier arguments: {e}"),
+        })?;
+    let config = &ctx.config.delegation;
+    let known_args = args == config.verify_args
+        || (!config.verify_quick_prototype_args.is_empty()
+            && args == config.verify_quick_prototype_args)
+        || (!config.verify_polished_ui_args.is_empty() && args == config.verify_polished_ui_args);
+    if previous.verify_command != verifier.executable.display().to_string() || !known_args {
+        return attention(
+            ctx,
+            &mut checkpoint,
+            "the original verifier no longer matches configuration".into(),
+        );
+    }
+
+    let review_baseline = if let Some(worktree) = &previous.worktree {
+        match review::resume_baseline(ctx, task_id, worktree, &checkpoint.workspace) {
+            Ok(baseline) => Some(baseline),
+            Err(error) => return attention(ctx, &mut checkpoint, error.to_string()),
+        }
+    } else {
+        if let Err(error) =
+            review::check_recovery_head(ctx, task_id, Path::new(&checkpoint.workspace))
+        {
+            return attention(ctx, &mut checkpoint, error.to_string());
+        }
+        None
+    };
+    let mut choice = 0;
+    if let Some(cause) = checkpoint.recovery_cause {
+        if ctx.config.decision.mode != jean_protocol::config::DecisionMode::Off
+            && (2..=crate::decision::MAX_CHOICES).contains(&candidates.len())
+        {
+            let token = crate::signals::owner_token()?;
+            let cancel = Arc::new(AtomicBool::new(token.is_cancelled()));
+            let bridge = CancelBridge::start(token.clone(), cancel.clone());
+            choice = crate::decision::choose(
+                ctx,
+                task_id,
+                cause,
+                &previous.kind,
+                &candidates,
+                baseline_us,
+                &cancel,
+            );
+            bridge.stop();
+            crate::signals::disarm();
+            if token.is_cancelled() {
+                return Ok(ResumeOutcome::Blocked {
+                    task_id: task_id.to_owned(),
+                    status: "cancelled".into(),
+                    reason: "resume cancelled before reserving a replacement worker".into(),
+                });
+            }
+            if let Err(error) =
+                review::validate_resume_workspace(ctx, &checkpoint, review_baseline.as_ref())
+            {
+                return attention(ctx, &mut checkpoint, error.to_string());
+            }
+        }
+    }
+
+    let _workspace_lock = review::workspace_lock(ctx, task_id, Path::new(&checkpoint.workspace))?;
+    if let Err(error) =
+        review::validate_resume_workspace(ctx, &checkpoint, review_baseline.as_ref())
+    {
+        return attention(ctx, &mut checkpoint, error.to_string());
+    }
+    if crate::signals::interrupt().is_some() {
+        return Ok(ResumeOutcome::Blocked {
+            task_id: task_id.to_owned(),
+            status: "cancelled".into(),
+            reason: "resume cancelled before reserving a replacement worker".into(),
+        });
+    }
+    let worker_name = candidates
+        .get(choice)
+        .unwrap_or(&candidates[0])
+        .name
+        .clone();
     checkpoint.blocked_on = None;
     checkpoint.attempts += 1;
     checkpoint.attempted_workers.push(worker_name.clone());
@@ -1053,7 +1310,17 @@ fn resume_checkpoint_with_condition(
         workspace: PathBuf::from(&checkpoint.workspace),
         worker: Some(worker_name.clone()),
     };
-    let report = delegate_with_mode(ctx, &request, prompter, runner, true, false)?;
+    let original_args = std::mem::replace(&mut ctx.config.delegation.verify_args, args);
+    let report = delegate_with_mode(
+        ctx,
+        &request,
+        prompter,
+        runner,
+        review_baseline.as_ref(),
+        Some(&checkpoint),
+    );
+    ctx.config.delegation.verify_args = original_args;
+    let report = report?;
 
     checkpoint.uncertain = false;
     checkpoint.resumed_task_id = Some(report.task_id.clone());
@@ -1070,7 +1337,7 @@ fn resume_checkpoint_with_condition(
         "needs_attention: replacement did not independently verify; no further worker attempt is allowed".to_owned()
     };
     crate::owner::write_checkpoint(&ctx.paths.data_dir, &checkpoint)?;
-    Ok(ResumeOutcome::Completed(report))
+    Ok(ResumeOutcome::Completed(Box::new(report)))
 }
 
 pub fn resume_checkpoint(
@@ -1087,6 +1354,37 @@ pub fn resume_checkpoint_after_condition_cleared(
     prompter: &mut dyn Prompter,
 ) -> Result<ResumeOutcome> {
     resume_checkpoint_with_condition(ctx, task_id, prompter, &AcpRunner, true)
+}
+
+fn disk_blocker(path: &Path, minimum: u64) -> Option<(crate::owner::RecoveryBlocker, String)> {
+    use crate::owner::RecoveryBlocker;
+    if minimum == 0 {
+        return None;
+    }
+    let available = path
+        .ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .ok_or_else(|| "no accessible directory on the configured volume".to_owned())
+        .and_then(available_disk_bytes);
+    match available {
+        Ok(bytes) if bytes >= minimum => None,
+        Ok(bytes) => Some((
+            RecoveryBlocker::LowDisk,
+            format!(
+                "{}; {} has {bytes} available bytes, configured minimum is {minimum}",
+                RecoveryBlocker::LowDisk.action(),
+                path.display()
+            ),
+        )),
+        Err(error) => Some((
+            RecoveryBlocker::DiskCheckUnavailable,
+            format!(
+                "{}; {}: {error}",
+                RecoveryBlocker::DiskCheckUnavailable.action(),
+                path.display()
+            ),
+        )),
+    }
 }
 
 fn available_disk_bytes(path: &Path) -> std::result::Result<u64, String> {
@@ -1201,6 +1499,7 @@ fn finish(
         tracing::warn!(delegation_id, "the task could not be transitioned");
     }
     store.set_outcome(task_id, result.as_str(), &reason).ok();
+    store.clear_runner(task_id).ok();
     let event = AuditEvent::for_decision(
         operation,
         &Decision::allowed(Authority::OwnerCommand),
@@ -1767,8 +2066,8 @@ impl Git {
 ///
 /// ## What it cannot do
 ///
-/// `run` refuses any argv whose first element is not in [`GIT_VERBS`], and that list holds only
-/// read-only inspection and `worktree add`. There is no route from here to `commit`, `push`,
+/// `run` accepts fixed argv from delegation and review, including the temporary-index snapshot
+/// and the explicitly authorized patch application. There is no route here to `commit`, `push`,
 /// `reset`, `clean`, `checkout`, `branch`, `merge` or `worktree remove` — not because a caller might
 /// forget, but because the strings are not in the list and `run` will not accept one that is not.
 /// The operator's repository is not this build's to tidy.
@@ -1780,15 +2079,30 @@ struct Repo<'a> {
 }
 
 /// The verbs [`Repo::run`] accepts.
-const GIT_VERBS: [&str; 3] = ["rev-parse", "status", "worktree"];
+const GIT_VERBS: [&str; 9] = [
+    "rev-parse",
+    "status",
+    "worktree",
+    "read-tree",
+    "add",
+    "write-tree",
+    "diff",
+    "apply",
+    "ls-files",
+];
 
 struct GitRun {
     exit_code: Option<i32>,
     stdout: Vec<u8>,
+    complete: bool,
 }
 
 impl Repo<'_> {
     fn run(&self, label: &str, args: &[&str]) -> Result<GitRun> {
+        self.run_with_index(label, args, None)
+    }
+
+    fn run_with_index(&self, label: &str, args: &[&str], index: Option<&Path>) -> Result<GitRun> {
         let verb = args.first().copied().unwrap_or("");
         if !GIT_VERBS.contains(&verb) {
             return Err(CoreError::Intent {
@@ -1797,6 +2111,16 @@ impl Repo<'_> {
         }
         let artifacts = self.ctx.paths.artifacts_for(self.task_id);
         let stdout_path = artifacts.join(format!("git-{label}-stdout"));
+        let mut env = build_child_env(
+            &self.ctx.config.process.env_allowlist,
+            &Default::default(),
+            &std::env::vars().collect(),
+        )
+        .0;
+        env.retain(|name, _| !name.to_ascii_uppercase().starts_with("GIT_"));
+        if let Some(index) = index {
+            env.insert("GIT_INDEX_FILE".into(), index.display().to_string());
+        }
         let spec = LaunchSpec {
             executable: self.git.path.clone(),
             args: {
@@ -1804,17 +2128,14 @@ impl Repo<'_> {
                     "-C".to_owned(),
                     self.dir.display().to_string(),
                     "--no-pager".to_owned(),
+                    "--no-optional-locks".to_owned(),
+                    "--no-replace-objects".to_owned(),
                 ];
                 argv.extend(args.iter().map(|a| (*a).to_owned()));
                 argv
             },
             working_dir: Some(self.dir.clone()),
-            env: build_child_env(
-                &self.ctx.config.process.env_allowlist,
-                &Default::default(),
-                &std::env::vars().collect(),
-            )
-            .0,
+            env,
             timeout: Some(Duration::from_secs(30)),
             output_cap_bytes: self.ctx.output_cap(),
             stdout_path: Some(stdout_path.clone()),
@@ -1825,9 +2146,16 @@ impl Repo<'_> {
         // that was cancelled must still be able to ask the repository what it left behind.
         let token = CancelToken::new()?;
         let outcome = jean_process::supervise(&spec, &token, |_| {})?;
+        let stdout = std::fs::read(&stdout_path);
         Ok(GitRun {
             exit_code: outcome.exit_code,
-            stdout: std::fs::read(&stdout_path).unwrap_or_default(),
+            complete: outcome.completed_naturally()
+                && !outcome.stdout.truncated
+                && outcome.stdout.path.is_some()
+                && stdout
+                    .as_ref()
+                    .is_ok_and(|bytes| bytes.len() as u64 == outcome.stdout.bytes),
+            stdout: stdout.unwrap_or_default(),
         })
     }
 
@@ -1845,8 +2173,18 @@ impl Repo<'_> {
         if !self.is_work_tree()? {
             return Ok(BTreeSet::new());
         }
-        let run = self.run(label, &["status", "--porcelain=v1", "-z"])?;
-        if run.exit_code != Some(0) {
+        let run = self.run(
+            label,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        if !run.complete || run.exit_code != Some(0) {
             return Err(CoreError::Intent {
                 reason: format!(
                     "`git status` in {} exited {:?}, so no file summary is available",

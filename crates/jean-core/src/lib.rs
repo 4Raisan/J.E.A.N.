@@ -42,6 +42,7 @@
 pub mod browser;
 pub mod captures;
 pub mod context;
+pub mod decision;
 pub mod delegation;
 pub mod desktop;
 pub mod env;

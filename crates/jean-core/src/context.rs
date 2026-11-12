@@ -19,6 +19,7 @@ pub struct Context {
     pub redactor: Redactor,
     pub sources: Vec<ConfigSource>,
     pub warnings: Vec<String>,
+    pub task_started: fn(&str),
     preference_base: AppConfig,
 }
 
@@ -66,6 +67,7 @@ impl Context {
             redactor,
             sources: loaded.sources,
             warnings,
+            task_started: |_| {},
             preference_base,
         })
     }
