@@ -448,6 +448,8 @@ pub struct AppConfig {
     /// deterministic, which is the shipped default.
     #[serde(default)]
     pub model: ModelConfig,
+    #[serde(default)]
+    pub decision: DecisionConfig,
     /// Delegation to an external coding agent, added by Phase 3. `enabled = false` keeps every
     /// Phase-0/1/2 command working and makes `jean delegate` refuse.
     #[serde(default)]
@@ -1144,6 +1146,92 @@ impl_default_from_fns!(ModelConfig {
     never_delegate_to_model => default_never_delegate_to_model(),
 });
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionMode {
+    #[default]
+    Off,
+    Shadow,
+    Active,
+}
+
+/// One optional selector for replacement worker choice. Separate from the planner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecisionConfig {
+    pub mode: DecisionMode,
+    pub protocol: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
+    pub timeout_secs: u64,
+    pub max_calls: u32,
+    /// Operator's worst-case estimate for one bounded request, in millionths of USD.
+    pub reserve_per_call_micros: u64,
+    /// Total reservation cap across this JEAN data directory.
+    pub budget_micros: u64,
+    pub min_labeled: usize,
+    pub max_p95_ms: u64,
+}
+
+impl Default for DecisionConfig {
+    fn default() -> Self {
+        Self {
+            mode: DecisionMode::Off,
+            protocol: "chat_completions".into(),
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: String::new(),
+            api_key_env: "JEAN_DECISION_API_KEY".into(),
+            timeout_secs: 3,
+            max_calls: 100,
+            reserve_per_call_micros: 0,
+            budget_micros: 0,
+            min_labeled: 20,
+            max_p95_ms: 2_000,
+        }
+    }
+}
+
+impl DecisionConfig {
+    pub fn transport(&self) -> ModelConfig {
+        ModelConfig {
+            provider: "openai_compatible".into(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key_env: self.api_key_env.clone(),
+            request_timeout_secs: self.timeout_secs,
+            max_prompt_bytes: 4096,
+            max_response_bytes: 4096,
+            max_output_tokens: 32,
+            retry_backoff_ms: Vec::new(),
+            ..ModelConfig::default()
+        }
+    }
+
+    fn check(&self) -> std::result::Result<(), String> {
+        if !matches!(self.protocol.as_str(), "chat_completions" | "system_one") {
+            return Err("protocol must be chat_completions or system_one".into());
+        }
+        if !(1..=10).contains(&self.timeout_secs)
+            || !(1..=1_000).contains(&self.max_calls)
+            || !(5..=1_000).contains(&self.min_labeled)
+            || !(1..=10_000).contains(&self.max_p95_ms)
+        {
+            return Err("timeout_secs must be 1..=10, max_calls 1..=1000, min_labeled 5..=1000, and max_p95_ms 1..=10000".into());
+        }
+        if self.mode != DecisionMode::Off {
+            self.transport().check()?;
+            let endpoint = split_endpoint(&self.base_url)?;
+            if (!endpoint.loopback && self.reserve_per_call_micros == 0)
+                || self.budget_micros < self.reserve_per_call_micros
+            {
+                return Err("configure a positive per-call reservation for a remote endpoint and a budget that covers at least one call".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Notification delivery.
 ///
 /// Phase 1 has a CLI and no tray, so `[ui]` means exactly two things here:
@@ -1193,6 +1281,7 @@ impl Default for AppConfig {
             search: SearchConfig::default(),
             ui: UiConfig::default(),
             model: ModelConfig::default(),
+            decision: DecisionConfig::default(),
             delegation: DelegationConfig::default(),
             mcp: McpConfig::default(),
             browser: BrowserConfig::default(),
@@ -1397,6 +1486,11 @@ pub struct DelegationConfig {
     pub verify_command: String,
     #[serde(default)]
     pub verify_args: Vec<String>,
+    /// Profile arguments for the same verifier. Empty uses `verify_args`.
+    #[serde(default)]
+    pub verify_quick_prototype_args: Vec<String>,
+    #[serde(default)]
+    pub verify_polished_ui_args: Vec<String>,
     #[serde(default = "d_verify_timeout")]
     pub verify_timeout_secs: u64,
     /// Required available space on both the workspace and JEAN data volume before a
@@ -1904,6 +1998,8 @@ impl_default_from_fns!(DelegationConfig {
     workers => default_workers(),
     verify_command => String::new(),
     verify_args => Vec::new(),
+    verify_quick_prototype_args => Vec::new(),
+    verify_polished_ui_args => Vec::new(),
     verify_timeout_secs => d_verify_timeout(),
     resume_min_free_disk_bytes => d_resume_min_free_disk_bytes(),
     isolate_in_worktree => true,
@@ -2361,6 +2457,9 @@ impl AppConfig {
 
         if let Err(problem) = self.model.check() {
             return fail("model", problem);
+        }
+        if let Err(problem) = self.decision.check() {
+            return fail("decision", problem);
         }
         if let Err(problem) = self.delegation.check() {
             return fail("delegation", problem);
@@ -3106,11 +3205,9 @@ mod tests {
         unsafe { std::env::set_var("JEAN_LOG_LEVEL", "trace") };
         let loaded = load_layers(&[]).unwrap();
         assert_eq!(loaded.config.core.log_level, "trace");
-        assert!(
-            loaded
-                .sources
-                .contains(&ConfigSource::Env("JEAN_LOG_LEVEL"))
-        );
+        assert!(loaded
+            .sources
+            .contains(&ConfigSource::Env("JEAN_LOG_LEVEL")));
         restore_env("JEAN_LOG_LEVEL", before.as_deref());
     }
 

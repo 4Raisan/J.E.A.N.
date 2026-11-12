@@ -363,6 +363,20 @@ never_delegate_to_model = [
   "policy_decisions", "secret_handling",
 ]
 
+# Optional replacement-worker selector. See docs/decision-model.md.
+[decision]
+mode = "off"
+protocol = "chat_completions"
+base_url = "http://127.0.0.1:8080/v1"
+model = ""
+api_key_env = "JEAN_DECISION_API_KEY"
+timeout_secs = 3
+max_calls = 100
+reserve_per_call_micros = 0
+budget_micros = 0
+min_labeled = 20
+max_p95_ms = 2000
+
 # Phase 3. Delegation to an external coding agent. `enabled = true` says this build may
 # start a worker; it does not authorize a specific agent, a workspace, or a permission the
 # worker asks for mid-session — every one of those still goes through `[policy]`, the
@@ -393,10 +407,14 @@ max_frame_bytes = 262144
 max_output_bytes = 8388608
 verify_command = ""
 verify_args = []
+# Optional profile-specific argument vectors for the same verify_command.
+# Empty uses verify_args, e.g. ["test", "--lib"] or ["test", "--all-targets"].
+verify_quick_prototype_args = []
+verify_polished_ui_args = []
 verify_timeout_secs = 900
 # Before resuming, both the workspace and JEAN data volumes must have at least this
 # many bytes available. A blocked resume preserves its checkpoint and retry allowance.
-resume_min_free_disk_bytes = 536870912
+resume_min_free_disk_bytes = 536870912 # Also checked before starting a new delegation.
 # REFUSED: false, unless there is a reason. A worktree is what makes "the agent changed
 # files" reviewable instead of already-merged-into-your-tree.
 isolate_in_worktree = true
