@@ -8,10 +8,10 @@
 //! Nothing here starts or contacts a model server.
 
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 
 const TOOLS: &str = r#"
@@ -198,32 +198,54 @@ fn chat_is_read_only_and_includes_prior_turn_context_for_followups() {
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(std::time::Duration::from_millis(10))
+                }
                 Err(error) => panic!("fixture did not receive a chat request: {error}"),
             }
         };
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
             let n = stream.read(&mut buffer).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             request.extend_from_slice(&buffer[..n]);
             let header_end = request.windows(4).position(|w| w == b"\r\n\r\n");
             if let Some(end) = header_end {
                 let headers = String::from_utf8_lossy(&request[..end]);
-                let length = headers.lines().find_map(|line| {
-                    line.to_ascii_lowercase().strip_prefix("content-length: ")
-                        .and_then(|value| value.parse::<usize>().ok())
-                }).unwrap_or(0);
-                if request.len() >= end + 4 + length { break; }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
             }
         }
         let body_start = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let body: serde_json::Value = serde_json::from_slice(&request[body_start..]).unwrap();
         let messages = body["messages"].as_array().unwrap();
-        assert!(messages.iter().any(|message| message["content"].as_str().unwrap_or_default().contains("Earlier, we discussed Spotify")));
-        assert!(messages.iter().any(|message| message["content"].as_str().unwrap_or_default().contains("What did I ask you to open?")));
+        assert!(messages.iter().any(|message| message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Earlier, we discussed Spotify")));
+        assert!(messages.iter().any(|message| message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("What did I ask you to open?")));
         let response = r#"{"choices":[{"message":{"content":"You asked me to open Spotify."},"finish_reason":"stop"}]}"#;
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
     });
@@ -232,11 +254,21 @@ fn chat_is_read_only_and_includes_prior_turn_context_for_followups() {
         &format!("[model]\nprovider = \"openai_compatible\"\nbase_url = \"http://{address}\"\nmodel = \"fixture-chat\"\napi_key_env = \"\"\nrequest_timeout_secs = 5\nretry_backoff_ms = []\n"),
     );
     let run = harness.run(&[
-        "chat", "What did I ask you to open?", "--context",
+        "chat",
+        "What did I ask you to open?",
+        "--context",
         "You: Earlier, we discussed Spotify.\nJEAN: I can help with Spotify.",
     ]);
     server.join().expect("fixture received the model turn");
     assert_eq!(run.code, 0, "{}", run.text());
-    assert!(run.stdout.contains("You asked me to open Spotify."), "{}", run.stdout);
-    assert!(!run.text().contains("task "), "conversation must not create or report a task: {}", run.text());
+    assert!(
+        run.stdout.contains("You asked me to open Spotify."),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.text().contains("task "),
+        "conversation must not create or report a task: {}",
+        run.text()
+    );
 }

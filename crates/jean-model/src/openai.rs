@@ -142,7 +142,10 @@ impl ModelClient for OpenAiCompatible {
             } else {
                 "application/json"
             };
-            let mut headers = vec![("Accept".to_owned(), accept.to_owned())];
+            let mut headers = vec![
+                ("Accept".to_owned(), accept.to_owned()),
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+            ];
             if let Some(token) = &bearer {
                 headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
             }
