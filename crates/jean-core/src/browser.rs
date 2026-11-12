@@ -51,6 +51,8 @@ use crate::context::Context;
 use crate::error::{CoreError, Result};
 use crate::verify::Verdict;
 
+mod profile;
+
 /// The capability a browser workflow declares, and the name it is approved and audited under.
 pub const BROWSER_CAPABILITY: &str = "browser.drive";
 
@@ -135,6 +137,7 @@ pub fn run(
         });
     }
     let executable = resolve_browser(&config)?;
+    profile::sweep(&ctx.paths.artifacts, &ctx.store);
 
     let operation = browser_operation(ctx, &executable, request);
     let policy = Policy::new(ctx.config.policy.clone());
@@ -216,12 +219,15 @@ fn drive(
         .paths
         .artifacts
         .join(format!("browser-{task_id}-{stamp}"));
-    make_dir(&artifact_dir)?;
     // A profile J.E.A.N. made, in a directory J.E.A.N. chose, which `jean-browser` refuses to share: it
     // will not start on a profile that already holds something, so no setting can point this at a
     // person's own.
+    let mut disposable =
+        profile::Disposable::create(&artifact_dir).map_err(|e| CoreError::Directory {
+            path: artifact_dir.clone(),
+            reason: e.to_string(),
+        })?;
     let profile = artifact_dir.join("profile");
-    make_dir(&profile)?;
 
     ctx.store.transition(
         task_id,
@@ -279,22 +285,10 @@ fn drive(
         }
     };
     report.exit_code = exit_code;
-    // The profile is disposable because J.E.A.N. made it, in this run, under its own artifact
-    // directory. Chrome's helper processes may hold a file briefly after the
-    // main pid exits, so retry instead of a single remove_dir_all that
-    // leaves the directory behind (§60.9). Bounded: 20 x 100ms = 2s.
-    let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..20 {
-        match std::fs::remove_dir_all(&profile) {
-            Ok(()) => { last_err = None; break; }
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        tracing::warn!(profile = %profile.display(), error = %e, "disposable browser profile could not be removed; it will be cleaned by the next run");
+    if let Err(error) = disposable.cleanup() {
+        report.steps.push(format!(
+            "profile cleanup deferred to a later browser run: {error}"
+        ));
     }
 
     let verdict = report.verdict.clone();
@@ -544,13 +538,6 @@ fn note(ctx: &mut Context, task_id: &str, steps: &mut Vec<String>, detail: Strin
     ) {
         tracing::warn!(error = %e, "a browser step could not be recorded");
     }
-}
-
-fn make_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).map_err(|e| CoreError::File {
-        path: dir.to_path_buf(),
-        reason: e.to_string(),
-    })
 }
 
 /// The browser is closed by J.E.A.N. — that is the promise of owning it — so an observed code is the

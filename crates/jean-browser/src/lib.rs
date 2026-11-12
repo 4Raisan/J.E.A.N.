@@ -34,14 +34,14 @@
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use headless_chrome::protocol::cdp::Page;
 use headless_chrome::Browser as CdpBrowser;
 use headless_chrome::Tab;
+use headless_chrome::protocol::cdp::Page;
 
 use jean_process::piped::{Control, PipedChild};
 use jean_process::spec::{LaunchSpec, TerminalMode};
@@ -260,14 +260,14 @@ impl OwnedBrowser {
             Some(url) if endpoint_is_loopback(&url) => url,
             Some(url) => {
                 let _ = control.terminate();
-                let _ = pump.join();
+                finish_stderr(pump);
                 return Err(BrowserError::Endpoint {
                     reason: format!("{url} is not a loopback debugging address"),
                 });
             }
             None => {
                 let _ = control.terminate();
-                let _ = pump.join();
+                finish_stderr(pump);
                 return Err(BrowserError::Endpoint {
                     reason: format!(
                         "the browser printed no debugging endpoint within {} s",
@@ -283,7 +283,7 @@ impl OwnedBrowser {
             Ok(browser) => browser,
             Err(e) => {
                 let _ = control.terminate();
-                let _ = pump.join();
+                finish_stderr(pump);
                 return Err(BrowserError::Endpoint {
                     reason: format!("the endpoint refused the CDP handshake: {e}"),
                 });
@@ -452,12 +452,12 @@ impl OwnedBrowser {
         self.tab = None;
         let until = Instant::now() + self.action_timeout.min(Duration::from_secs(5));
         let _ = self.control.terminate();
-        while self.control.is_running() && Instant::now() < until {
+        while !self.control.tree_empty().unwrap_or(false) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
         let code = self.control.exit_code_if_settled();
         if let Some(pump) = self.stderr_pump.take() {
-            let _ = pump.join();
+            finish_stderr(pump);
         }
         code
     }
@@ -467,12 +467,21 @@ impl Drop for OwnedBrowser {
     fn drop(&mut self) {
         // The path a `?` takes on the way out. A browser left running because a page did not contain
         // what was expected is the exact failure this crate promises the operator it cannot have.
-        if self.control.is_running() {
-            let _ = self.control.terminate();
-        }
         if let Some(pump) = self.stderr_pump.take() {
-            let _ = pump.join();
+            // The main process can exit while descendants still own the pipe.
+            let _ = self.control.terminate();
+            finish_stderr(pump);
         }
+    }
+}
+
+fn finish_stderr(pump: JoinHandle<()>) {
+    let until = Instant::now() + Duration::from_secs(1);
+    while !pump.is_finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if pump.is_finished() {
+        let _ = pump.join();
     }
 }
 
