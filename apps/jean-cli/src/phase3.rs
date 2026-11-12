@@ -199,9 +199,18 @@ fn report_json(report: &DelegationReport) -> String {
     )
 }
 
-/// A JSON string, escaped for the two characters that can appear in this data and break one.
+/// A JSON string literal, escaped for every character that can break one — including the
+/// newlines and tabs that multiline tool output and notes carry.
 pub(crate) fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    serde_json::Value::String(value.to_owned()).to_string()
+}
+
+/// A JSON array of note strings. Always bracketed, so an empty note list is `[]`, not a bare value.
+pub(crate) fn notes_array(notes: &[String]) -> String {
+    format!(
+        "[{}]",
+        notes.iter().map(|note| quote(note)).collect::<Vec<_>>().join(", ")
+    )
 }
 
 /// `jean agent status` — what the configuration says, what resolves, and what this build speaks.
@@ -568,12 +577,7 @@ fn cmd_mcp_call(
                 .exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "null".to_owned()),
-            report
-                .notes
-                .iter()
-                .map(|note| quote(note))
-                .collect::<Vec<_>>()
-                .join(", ")
+            notes_array(&report.notes)
         )?;
     } else {
         field(
@@ -592,7 +596,11 @@ fn cmd_mcp_call(
             )?;
         }
         writeln!(out, "result   ({} bytes{})", report.bytes, {
-            if report.truncated { ", capped" } else { "" }
+            if report.truncated {
+                ", capped"
+            } else {
+                ""
+            }
         })?;
         writeln!(out, "{}", report.text)?;
         for line in &report.notes {
@@ -807,4 +815,67 @@ fn browser_json(report: &jean_core::browser::BrowserReport) -> String {
         ),
         steps
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{notes_array, quote};
+
+    /// The `mcp call --json` report must stay parseable when a tool returns multiline text and
+    /// several notes. The old escaper handled only `\` and `"`, so a raw newline in `text` produced
+    /// invalid JSON (a standard parser rejected it with "invalid control character").
+    #[test]
+    fn mcp_call_json_survives_multiline_output_and_multiple_notes() {
+        let text = "line one\nline two\ttabbed\r\n\"quoted\" ✅ final";
+        let notes = ["first note\nwith a newline", "second note\twith a tab"];
+        let report = format!(
+            "{{\n  \"text\": {},\n  \"notes\": [{}]\n}}\n",
+            quote(text),
+            notes.iter().map(|note| quote(note)).collect::<Vec<_>>().join(", ")
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&report).expect("a standard JSON parser must read the report");
+        assert_eq!(parsed["text"].as_str(), Some(text));
+        let parsed_notes = parsed["notes"].as_array().expect("notes is an array");
+        assert_eq!(parsed_notes.len(), notes.len());
+        for (parsed, original) in parsed_notes.iter().zip(notes) {
+            assert_eq!(parsed.as_str(), Some(original));
+        }
+    }
+
+    #[test]
+    fn quote_escapes_every_control_character() {
+        let raw = "\u{0}\u{1}\n\r\t\u{8}\u{c}\u{1f}";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&quote(raw)).expect("control characters must be escaped");
+        assert_eq!(parsed.as_str(), Some(raw));
+    }
+
+    #[test]
+    fn quote_escapes_backslash() {
+        let raw = r"back\slash";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&quote(raw)).expect("backslash must be escaped");
+        assert_eq!(parsed.as_str(), Some(raw));
+    }
+
+    #[test]
+    fn notes_array_is_always_a_bracketed_json_array() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(notes_array(&empty), "[]");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&notes_array(&empty)).expect("empty notes must be a valid array");
+        assert_eq!(parsed.as_array().map(Vec::len), Some(0));
+
+        let notes = vec![
+            "first note\nwith a newline".to_owned(),
+            "second note\twith a tab".to_owned(),
+        ];
+        let parsed: serde_json::Value = serde_json::from_str(&notes_array(&notes))
+            .expect("multiple multiline notes must be a valid array");
+        let array = parsed.as_array().expect("notes is an array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0].as_str(), Some(notes[0].as_str()));
+        assert_eq!(array[1].as_str(), Some(notes[1].as_str()));
+    }
 }
