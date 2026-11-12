@@ -6,6 +6,8 @@ The GUI cases use saved, minimal control lists from Calculator, Notepad,
 Spotify, Wikipedia, GitHub, and two synthetic examples. The suite does
 not open or click apps, capture screens, or run any selected action.
 
+The [public comparison dashboard](https://github.com/4Raisan/Decision-Model-Benchmarks) presents the three rounds and their case descriptions. Its expanded suite combines the [earlier 25 cases](season-4-cases.json) and the [25 practical JEAN cases](jean-practical-25-cases.json).
+
 Run from the JEAN root in Windows Command Prompt:
 
 ```bat
