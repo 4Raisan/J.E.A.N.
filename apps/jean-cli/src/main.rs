@@ -79,6 +79,7 @@ use jean_protocol::ipc::validate_task_id;
 use jean_store::{format_ms, EventRecord, TaskFilter, ToolRunRecord};
 use jean_tools::SortKey;
 
+mod desktop_request;
 mod memory;
 mod owner_preferences;
 mod phase1;
@@ -102,6 +103,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run an interactive request from the desktop overlay over private stdio.
+    #[command(hide = true)]
+    DesktopRequest(desktop_request::Options),
     /// Speak UTF-8 text from stdin using Windows Speech.
     Speak {
         /// Condense a long task result before speaking it.
@@ -984,7 +988,12 @@ fn error_chain(err: &anyhow::Error) -> Vec<String> {
 }
 
 fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
-    if let Command::Speak { task_result, voice, rate } = command {
+    if let Command::Speak {
+        task_result,
+        voice,
+        rate,
+    } = command
+    {
         spoken_reply::speak_from_stdin(task_result, voice, rate)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -993,6 +1002,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     report_warnings(&ctx);
 
     match command {
+        Command::DesktopRequest(options) => desktop_request::run(&mut ctx, options),
         Command::Speak { .. } => unreachable!("speech is handled before loading context"),
         Command::History { command } => memory::history(&mut ctx, command),
         Command::Memory { command } => memory::facts(&mut ctx, command),

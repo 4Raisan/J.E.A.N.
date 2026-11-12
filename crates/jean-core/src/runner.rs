@@ -376,6 +376,7 @@ fn execute(
 
     store.transition(task_id, TaskState::Running, Some("the child was launched"))?;
     record_ownership(store, task_id)?;
+    (ctx.task_started)(task_id);
 
     for note in &plan.env_notes {
         store.append_event(task_id, &Event::note(note.clone()))?;

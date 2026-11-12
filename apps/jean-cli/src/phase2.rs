@@ -89,16 +89,27 @@ pub fn cmd_chat(ctx: &Context, message: String, context: String) -> anyhow::Resu
         anyhow::bail!("JEAN's reply was truncated by the model output limit; shorten the conversation and retry");
     }
     let answer = ctx.redactor.redact(&reply.content);
-    anyhow::ensure!(!answer.trim().is_empty(), "the configured model returned an empty reply");
+    anyhow::ensure!(
+        !answer.trim().is_empty(),
+        "the configured model returned an empty reply"
+    );
     println!("{answer}");
     Ok(ExitCode::SUCCESS)
 }
 
 /// `jean do "<goal>"` — plan, then run every step through the intent pipeline.
 pub fn cmd_do(ctx: &mut Context, options: DoOptions) -> anyhow::Result<ExitCode> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let mut prompter = ConsolePrompt::new(&ctx.config.policy);
+    do_with_prompt(ctx, options, &mut prompter, &CancelFlag::new())
+}
 
+pub(crate) fn do_with_prompt(
+    ctx: &mut Context,
+    options: DoOptions,
+    prompter: &mut dyn jean_policy::Prompter,
+    cancel: &CancelFlag,
+) -> anyhow::Result<ExitCode> {
+    let mut out = std::io::stdout();
     let client = build_model(&ctx.config.model)?;
     // Checked here as well as inside the engine, so a build with `provider = "none"` says that
     // before it prints anything about a provider it will not use.
@@ -133,15 +144,12 @@ pub fn cmd_do(ctx: &mut Context, options: DoOptions) -> anyhow::Result<ExitCode>
         },
     )?;
 
-    let cancel = CancelFlag::new();
-    // The engine's own prompter, unchanged from Phase 1: a step that still needs a person is asked.
-    let mut prompter = ConsolePrompt::new(&ctx.config.policy);
     let report = run_plan(
         ctx,
         client.as_ref(),
         &options.goal,
-        &mut prompter,
-        &cancel,
+        prompter,
+        cancel,
         &mut |line| {
             // Progress goes to stdout as it happens, which is the whole reason the engine hands lines to
             // the caller rather than returning them at the end.

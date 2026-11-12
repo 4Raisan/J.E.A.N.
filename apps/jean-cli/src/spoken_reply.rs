@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use anyhow::{Context, ensure};
+use anyhow::{ensure, Context};
 
 const INPUT_LIMIT: usize = 100_000;
 const SHORT_REPLY: usize = 480;
@@ -52,11 +52,11 @@ pub fn speak_from_stdin(task_result: bool, voice: Option<String>, rate: i32) -> 
 
 #[cfg(windows)]
 fn speak(text: &str, voice: Option<&str>, rate: i32) -> anyhow::Result<()> {
+    use windows::core::BSTR;
     use windows::Win32::Media::Speech::{ISpeechVoice, SVSFIsNotXML, SpVoice};
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
     };
-    use windows::core::BSTR;
 
     struct Apartment;
     impl Drop for Apartment {
@@ -81,7 +81,8 @@ fn speak(text: &str, voice: Option<&str>, rate: i32) -> anyhow::Result<()> {
                 let display_name = description
                     .split_once(" - ")
                     .map_or(description.as_str(), |(name, _)| name);
-                if description.eq_ignore_ascii_case(name) || display_name.eq_ignore_ascii_case(name) {
+                if description.eq_ignore_ascii_case(name) || display_name.eq_ignore_ascii_case(name)
+                {
                     speaker.putref_Voice(&token)?;
                     found = true;
                     break;

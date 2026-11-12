@@ -283,6 +283,7 @@ pub fn run_owned(
     ctx.prepare_for_writing()?;
 
     let parent = open_parent_task(ctx, task_id, goal, client)?;
+    (ctx.task_started)(&parent);
     ctx.store
         .append_event(&parent, &model_requested_event(client, ctx))?;
 

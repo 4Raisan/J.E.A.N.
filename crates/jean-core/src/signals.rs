@@ -79,11 +79,6 @@ fn armed_tokens() -> &'static Mutex<Vec<CancelToken>> {
     ARMED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-#[deprecated(note = "use armed_tokens")]
-fn armed() -> &'static Mutex<Vec<CancelToken>> {
-    armed_tokens()
-}
-
 /// Point the console handler at `token`, installing it if this is the first arm.
 ///
 /// Re-arming is the normal case, not an error: it is what lets one invocation run
