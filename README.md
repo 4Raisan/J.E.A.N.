@@ -12,3 +12,7 @@ cargo test --workspace --locked
 ```
 
 The project is in development. Start with the [implementation status](IMPLEMENTATION_STATUS.md) for tested behavior and work in progress. See the [implementation guide](IMPLEMENTATION_GUIDE.md) and [planning index](PLANNING/README.md) for architecture and roadmap details.
+
+## Decision benchmarks
+
+The [benchmark cases and runners](tools/decision-bench/) evaluate task routing and Windows UI decisions. See [Decision Model Benchmarks](https://github.com/4Raisan/decision-model-benchmarks) for the interactive comparison and published results.
