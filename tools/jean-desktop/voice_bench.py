@@ -3,10 +3,10 @@
 Compares two fully local backends on identical 16 kHz mono PCM16 WAV clips
 against operator-supplied reference transcripts:
 
-  * ``project2-hybrid`` (provisional default): project 2's streaming Zipformer
+  * ``project2-hybrid``: project 2's streaming Zipformer
     partials plus the offline Parakeet final, run through ``dictate.py --wav``
     under the same pinned ``uv run --offline`` environment as Run Dictation.cmd.
-  * ``project9-whisper``: project 9's faster-whisper ``base.en`` English-only
+  * ``project9-whisper`` (desktop default): project 9's faster-whisper ``base.en`` English-only
     path, run through ``speech.py --wav`` under ``uv run --offline`` (the
     upstream Run Speech.cmd omits ``--offline``; this harness never lets a
     benchmark reach the network).
@@ -29,6 +29,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -41,7 +42,7 @@ DEFAULT_MANIFEST = HERE / "bench" / "manifest.json"
 SCORING_FIXTURE = HERE / "bench" / "fixtures" / "scoring.json"
 
 BACKENDS = ("project2-hybrid", "project9-whisper")
-DEFAULT_BACKEND = "project2-hybrid"
+DEFAULT_BACKEND = "project9-whisper"
 UV_ARGS_2 = ["run", "--offline", "--python", "3.12", "--no-project",
              "--with", "sherpa-onnx==2.0.1", "--with", "sounddevice==0.5.6",
              "--with", "numpy==2.5.4"]
@@ -117,7 +118,7 @@ def exact_phrase(text, term):
     return needle in haystack if needle.strip() else False
 
 
-def score_transcript(reference, hypothesis, app_names=()):
+def score_transcript(reference, hypothesis, app_names=(), technical_terms=()):
     rate, subs, dels, ins, ref_words = wer(reference, hypothesis)
     matches = {str(term): exact_phrase(hypothesis, term) for term in app_names}
     return {
@@ -129,6 +130,8 @@ def score_transcript(reference, hypothesis, app_names=()):
         "wer": rate,
         "exact_transcript": normalize_tokens(reference) == normalize_tokens(hypothesis),
         "app_name_matches": matches,
+        "technical_term_matches": {term: exact_phrase(hypothesis, term)
+                                   for term in technical_terms},
     }
 
 
@@ -158,6 +161,7 @@ def load_manifest(path):
         wav = row.get("wav")
         reference = row.get("reference")
         app_names = row.get("app_names", [])
+        technical_terms = row.get("technical_terms", [])
         label = f"clip {index} ({wav})" if wav else f"clip {index}"
         if not wav or not isinstance(wav, str):
             problems.append(f"{label}: missing 'wav'")
@@ -170,23 +174,31 @@ def load_manifest(path):
             with wave.open(str(clip_path), "rb") as handle:
                 shape = (handle.getnchannels(), handle.getsampwidth(),
                          handle.getframerate())
-        except (wave.Error, OSError) as exc:
+                if not handle.getnframes():
+                    problems.append(f"{label}: WAV is empty")
+                    continue
+        except (wave.Error, EOFError, OSError) as exc:
             problems.append(f"{label}: not a readable WAV: {exc}")
             continue
         if shape != EXPECTED_WAV:
             problems.append(f"{label}: expected 16 kHz mono PCM16 WAV "
                             f"(channels,sampwidth,rate={EXPECTED_WAV}), got {shape}")
             continue
-        if not reference or not str(reference).strip():
+        if not isinstance(reference, str) or not normalize_tokens(reference):
             problems.append(f"{label}: missing 'reference' transcript")
             continue
-        if not isinstance(app_names, list):
-            problems.append(f"{label}: 'app_names' must be a list")
+        if any(not isinstance(terms, list) or any(
+                not isinstance(term, str) or not normalize_tokens(term)
+                or not exact_phrase(reference, term) for term in terms
+        ) for terms in (app_names, technical_terms)):
+            problems.append(f"{label}: app_names and technical_terms must be lists "
+                            "of nonempty phrases present in the reference")
             continue
         clips.append({
             "wav": str(clip_path),
-            "reference": str(reference),
-            "app_names": [str(term) for term in app_names],
+            "reference": reference,
+            "app_names": app_names,
+            "technical_terms": technical_terms,
             "note": str(row.get("note", "")),
         })
     return clips, problems
@@ -219,7 +231,7 @@ UV_CAPTURE_ARGS = ["run", "--offline", "--python", "3.12", "--no-project",
                    "--with", "sounddevice==0.5.6", "--with", "numpy==2.5.4"]
 
 
-def capture_command(wav_path, stop_file, max_seconds=20.0):
+def capture_command(wav_path, stop_file, max_seconds=20.0, microphone=None):
     """Argv for voice_capture.py under the pinned offline uv environment —
     the same dependency pins as project 2's Run Dictation.cmd minus the ASR
     models, which capture does not need."""
@@ -227,7 +239,31 @@ def capture_command(wav_path, stop_file, max_seconds=20.0):
              str(HERE / "voice_capture.py"),
              "--out", str(Path(wav_path).resolve()),
              "--max", str(max_seconds),
-             "--stop-file", str(Path(stop_file).resolve())], HERE)
+             "--stop-file", str(Path(stop_file).resolve()),
+             *(["--microphone", microphone] if microphone else [])], HERE)
+
+
+def record_clip(destination, seconds):
+    """Save one explicitly requested microphone clip for a private corpus."""
+    destination = Path(destination)
+    if destination.exists():
+        raise ValueError("choose a new WAV path; existing files are preserved")
+    with tempfile.TemporaryDirectory(prefix="jean-bench-", ignore_cleanup_errors=True) as directory:
+        clip = Path(directory) / "clip.wav"
+        argv, cwd = capture_command(clip, Path(directory) / "stop.marker", seconds)
+        subprocess.run(argv, cwd=cwd, check=True, timeout=seconds + 15)
+        with wave.open(str(clip), "rb") as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != EXPECTED_WAV or not wav.getnframes():
+                raise ValueError("capture did not produce a usable mono PCM16 WAV")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with clip.open("rb") as source:
+            output = destination.open("xb")
+            try:
+                with output:
+                    shutil.copyfileobj(source, output)
+            except OSError:
+                destination.unlink(missing_ok=True)
+                raise
 
 
 def decode_clip(backend, wav_path, timeout=240):
@@ -249,6 +285,7 @@ def decode_clip(backend, wav_path, timeout=240):
                               creationflags=getattr(subprocess,
                                                      "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
+        result["wall_ms"] = round((time.monotonic() - started) * 1000)
         result["error"] = f"decode timed out after {timeout}s"
         return result
     except OSError as exc:
@@ -287,48 +324,66 @@ def _micro_wer(rows):
     return None if words == 0 else errors / words
 
 
+def _percentile(values, percentile):
+    return sorted(values)[(len(values) * percentile + 99) // 100 - 1] if values else None
+
+
+def _term_totals(rows, key):
+    terms = {}
+    for row in rows:
+        for term, hit in row[key].items():
+            tally = terms.setdefault(term, {"hits": 0, "total": 0})
+            tally["hits"] += int(hit)
+            tally["total"] += 1
+    return terms
+
+
 def run_benchmark(clips, backends, timeout=240):
-    report = {"clips": len(clips), "backends": {}, "rows": []}
-    for backend in backends:
-        decoded = []
-        for index, clip in enumerate(clips):
-            cold = index == 0  # first decode per backend carries model load
+    report = {"clips": len(clips), "backends": {}, "rows": [],
+              "timing": "wall time per fresh decoder process, including startup and model load"}
+    by_backend = {backend: [] for backend in backends}
+    paired = []
+    for index, clip in enumerate(clips):
+        order = backends if index % 2 == 0 else list(reversed(backends))
+        pair = {}
+        for backend in order:
             outcome = decode_clip(backend, clip["wav"], timeout=timeout)
-            row = {"clip": index, "backend": backend, "cold": cold,
+            row = {"clip": index, "backend": backend, "cold": index == 0,
                    "wav": clip["wav"], "note": clip.get("note", ""),
                    "transcript": outcome["transcript"],
                    "partials": outcome["partials"],
                    "wall_ms": outcome["wall_ms"],
                    "returncode": outcome["returncode"],
                    "error": outcome["error"]}
-            if outcome["error"] is None:
-                row.update(score_transcript(clip["reference"],
-                                            outcome["transcript"],
-                                            clip["app_names"]))
+            row.update(score_transcript(
+                clip["reference"],
+                outcome["transcript"] if outcome["error"] is None else "",
+                clip["app_names"], clip.get("technical_terms", ()),
+            ))
             report["rows"].append(row)
-            decoded.append(row)
-        scored = [r for r in decoded if r.get("wer") is not None]
-        timed = [r for r in decoded if r["wall_ms"] is not None]
-        warm = [r for r in decoded if not r["cold"] and r["wall_ms"] is not None]
-        cold_rows = [r for r in decoded if r["cold"] and r["wall_ms"] is not None]
-        app_terms = {}
-        for r in scored:
-            for term, hit in r["app_name_matches"].items():
-                app_terms.setdefault(term, []).append(hit)
+            by_backend[backend].append(row)
+            pair[backend] = row
+        if len(backends) == 2 and all(row["error"] is None for row in pair.values()):
+            paired.append(pair)
+    for backend, decoded in by_backend.items():
+        successful = [row for row in decoded if row["error"] is None]
+        timed = [row["wall_ms"] for row in decoded if row["wall_ms"] is not None]
+        paired_rows = [pair[backend] for pair in paired]
         report["backends"][backend] = {
             "clips": len(decoded),
-            "failures": sum(1 for r in decoded if r["error"] is not None),
-            "cold_wall_ms": cold_rows[0]["wall_ms"] if cold_rows else None,
-            "warm_wall_ms_mean": (round(sum(r["wall_ms"] for r in warm) / len(warm))
-                                  if warm else None),
-            "decode_wall_ms_mean": (round(sum(r["wall_ms"] for r in timed) / len(timed))
-                                    if timed else None),
-            "scored_clips": len(scored),
-            "micro_wer": _micro_wer(scored),
-            "exact_transcript_matches": sum(1 for r in scored if r["exact_transcript"]),
-            "app_name_terms": {t: {"hits": sum(v), "total": len(v)}
-                               for t, v in app_terms.items()},
+            "failures": len(decoded) - len(successful),
+            "cold_wall_ms": decoded[0]["wall_ms"] if decoded else None,
+            "wall_ms_p50": _percentile(timed, 50),
+            "wall_ms_p95": _percentile(timed, 95),
+            "scored_clips": len(successful),
+            "micro_wer": _micro_wer(successful),
+            "micro_wer_including_failures": _micro_wer(decoded),
+            "paired_success_micro_wer": _micro_wer(paired_rows),
+            "exact_transcript_matches": sum(row["exact_transcript"] for row in successful),
+            "app_name_terms": _term_totals(decoded, "app_name_matches"),
+            "technical_terms": _term_totals(decoded, "technical_term_matches"),
         }
+    report["paired_success_clips"] = len(paired)
     return report
 
 
@@ -346,7 +401,7 @@ def run_self_test():
     failures = []
     for case in cases:
         got = score_transcript(case["reference"], case["hypothesis"],
-                               case.get("app_names", []))
+                               case.get("app_names", []), case.get("technical_terms", []))
         want = case["expected"]
         checks = {
             "wer": got["wer"] is not None and want["wer"] is not None
@@ -358,6 +413,8 @@ def run_self_test():
         }
         for term, expected_hit in case.get("expected_app_matches", {}).items():
             checks[f"app:{term}"] = got["app_name_matches"].get(term) is expected_hit
+        for term, expected_hit in case.get("expected_technical_matches", {}).items():
+            checks[f"term:{term}"] = got["technical_term_matches"].get(term) is expected_hit
         bad = [name for name, ok in checks.items() if not ok]
         if bad:
             failures.append({"case": case.get("name"), "failed": bad,
@@ -372,8 +429,11 @@ def main(argv=None):
                              "relative to the manifest")
     parser.add_argument("--backend", choices=BACKENDS + ("both",),
                         default=DEFAULT_BACKEND,
-                        help="decode backend; project2-hybrid is the provisional "
-                             "default")
+                        help="decode backend; default matches the desktop")
+    parser.add_argument("--record", type=Path, metavar="WAV",
+                        help="record one local microphone clip to a new file")
+    parser.add_argument("--capture-seconds", type=int, default=20,
+                        help="maximum seconds for --record (1–30)")
     parser.add_argument("--run", action="store_true",
                         help="actually decode clips (otherwise validate only)")
     parser.add_argument("--validate", action="store_true",
@@ -387,6 +447,18 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=240,
                         help="per-clip decode timeout in seconds")
     args = parser.parse_args(argv)
+
+    if args.record is not None:
+        if args.run or args.self_test or args.validate or args.dry_run or args.output:
+            parser.error("--record is a standalone operation")
+        if not 1 <= args.capture_seconds <= 30:
+            parser.error("--capture-seconds must be between 1 and 30")
+        try:
+            record_clip(args.record, args.capture_seconds)
+        except (OSError, RuntimeError, ValueError, wave.Error, EOFError, subprocess.SubprocessError) as exc:
+            parser.exit(1, f"capture failed: {exc}\n")
+        print(f"Saved {args.record}. Add it with a verified reference to your private manifest.")
+        return 0
 
     status = 0
     if args.self_test:

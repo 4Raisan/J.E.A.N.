@@ -5,6 +5,7 @@
       "wav": "clips/example-consented-clip.wav",
       "reference": "Open JEAN Desktop",
       "app_names": ["JEAN Desktop", "JEAN"],
+      "technical_terms": [],
       "note": "operator-recorded consented clip; keep the WAV outside version control"
     }
   ]

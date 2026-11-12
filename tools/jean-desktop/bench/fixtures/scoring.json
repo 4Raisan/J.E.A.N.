@@ -46,6 +46,16 @@
       "expected_app_matches": {"JEAN": false, "Jeanette": true}
     },
     {
+      "name": "technical phrase requires exact word boundaries",
+      "reference": "run cargo clippy then open powershell",
+      "hypothesis": "run cargo clipper then open powershell",
+      "app_names": ["PowerShell"],
+      "technical_terms": ["Cargo Clippy"],
+      "expected": {"wer": 0.1667, "substitutions": 1, "deletions": 0, "insertions": 0, "reference_words": 6},
+      "expected_app_matches": {"PowerShell": true},
+      "expected_technical_matches": {"Cargo Clippy": false}
+    },
+    {
       "name": "empty hypothesis",
       "reference": "hello there",
       "hypothesis": "",

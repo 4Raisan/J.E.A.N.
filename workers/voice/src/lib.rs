@@ -9,7 +9,7 @@
 //! the task worker.
 
 use std::io::{self, BufReader};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use jean_protocol::config::{AudioBackend as AudioBackendKind, SpeechBackend, VoiceConfig};

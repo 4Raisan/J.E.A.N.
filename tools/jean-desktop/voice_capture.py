@@ -15,6 +15,7 @@ Protocol on stdout (one event per line, flushed):
     READY                     capture stream is open
     LEVEL <0.0..1.0>          RMS loudness of the latest block
     SPEECH <0.0..1.0>          loudest level seen since the last SPEECH line
+    ENDED                     capture stopped, before WAV encoding
     DONE <path>                WAV finalized and closed
     ERROR <message>            capture failed; exit code 2
 
@@ -40,12 +41,15 @@ def main(argv=None):
                         help="hard cap on capture seconds")
     parser.add_argument("--stop-file", type=Path, default=None,
                         help="capture ends as soon as this file exists")
+    parser.add_argument("--microphone", help="verified Windows WASAPI microphone name")
     parser.add_argument("--threshold", type=float, default=0.012,
                         help="RMS level that counts as speech for endpointing")
     parser.add_argument("--endpoint", type=float, default=1.4,
                         help="seconds of silence after speech that ends capture; "
                              "0 disables endpointing")
     args = parser.parse_args(argv)
+    if not 1 <= args.max <= 30:
+        parser.error("--max must be between 1 and 30 seconds")
 
     try:
         import numpy as np
@@ -57,7 +61,6 @@ def main(argv=None):
     blocks = []
     peak = 0.0
     speech_at = None
-    started = time.monotonic()
 
     def callback(data, frames, timing, status):
         nonlocal peak, speech_at
@@ -71,32 +74,61 @@ def main(argv=None):
         print(f"LEVEL {level:.4f}", flush=True)
         print(f"SPEECH {peak:.4f}", flush=True)
 
+    device = None
+    if args.microphone:
+        devices = [
+            index for index, info in enumerate(sd.query_devices())
+            if info["name"] == args.microphone and info["max_input_channels"] > 0
+            and sd.query_hostapis(info["hostapi"])["name"] == "Windows WASAPI"
+        ]
+        if len(devices) != 1:
+            print("ERROR verified microphone is missing or ambiguous in Windows WASAPI", flush=True)
+            return 2
+        device = devices[0]
+
+    def open_stream(rate):
+        return sd.InputStream(samplerate=rate, channels=1, dtype="float32",
+                              device=device, blocksize=round(BLOCK * rate / RATE),
+                              callback=callback)
+
+    rate = RATE
     try:
-        stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
-                                blocksize=BLOCK, callback=callback)
+        try:
+            stream = open_stream(rate)
+        except sd.PortAudioError:
+            rate = round(sd.query_devices(device, kind="input")["default_samplerate"])
+            if rate == RATE:
+                raise
+            stream = open_stream(rate)
+        with stream:
+            started = time.monotonic()
+            print("READY", flush=True)
+            while True:
+                time.sleep(0.05)
+                now = time.monotonic()
+                if args.stop_file is not None and args.stop_file.exists():
+                    break
+                if now - started >= args.max:
+                    break
+                if (args.endpoint > 0 and speech_at is not None
+                        and now - speech_at >= args.endpoint
+                        and now - started > args.endpoint):
+                    break
     except Exception as exc:
-        print(f"ERROR could not open microphone: {exc}", flush=True)
+        print(f"ERROR could not capture microphone: {exc}", flush=True)
         return 2
 
-    with stream:
-        print("READY", flush=True)
-        while True:
-            time.sleep(0.05)
-            now = time.monotonic()
-            if args.stop_file is not None and args.stop_file.exists():
-                break
-            if now - started >= args.max:
-                break
-            if (args.endpoint > 0 and speech_at is not None
-                    and now - speech_at >= args.endpoint
-                    and now - started > args.endpoint):
-                break
+    print("ENDED", flush=True)
     if not blocks:
         print("ERROR no audio captured", flush=True)
         return 2
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    pcm = (np.concatenate(blocks) * 32767.0).clip(-32768, 32767).astype("<i2")
+    samples = np.concatenate(blocks)
+    if rate != RATE:
+        positions = np.arange(round(len(samples) * RATE / rate)) * (rate / RATE)
+        samples = np.interp(positions, np.arange(len(samples)), samples)
+    pcm = (samples * 32767.0).clip(-32768, 32767).astype("<i2")
     try:
         with wave.open(str(args.out), "wb") as wav:
             wav.setparams((1, 2, RATE, 0, "NONE", "not compressed"))

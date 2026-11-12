@@ -231,16 +231,16 @@ mod tests {
 
     #[test]
     fn parakeet_reports_its_separate_bundle_and_actionable_missing_keys() {
-        let mut config = VoiceConfig::default();
-        config.recognizer = SpeechRecognizer::ParakeetTdtV2Int8;
+        let config = VoiceConfig {
+            recognizer: SpeechRecognizer::ParakeetTdtV2Int8,
+            ..Default::default()
+        };
         let checks = recognition(&config);
         assert_eq!(checks.len(), 4);
         assert!(checks.iter().all(|check| !check.present));
-        assert!(
-            checks
-                .iter()
-                .all(|check| check.key.starts_with("voice.models.parakeet."))
-        );
+        assert!(checks
+            .iter()
+            .all(|check| check.key.starts_with("voice.models.parakeet.")));
         let error = native_unavailable(&config, true);
         assert!(
             error.contains("voice.models.parakeet.encoder is unset"),
