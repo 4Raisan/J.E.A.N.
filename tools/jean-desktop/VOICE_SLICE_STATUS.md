@@ -1,5 +1,74 @@
 # JEAN Desktop — Voice Slice Status
 
+## Push-to-talk and task controls
+
+Choose Chat or Task before pressing Talk. Press End recording to submit the
+clip for local transcription, or let speech endpointing end the capture.
+Chat sends its transcript to the chat route. Task displays the transcript
+for editing and requires Run task before the controller receives it.
+Routine overlay audio is temporary. The overlay shows the recognizer and
+elapsed time from manual release or the capture end signal to decoded text.
+
+During a running task, Talk accepts “task status” or “cancel task”. Status
+reads the recorded task state aloud. Voice cancellation requires a second
+confirmation and targets the task that was running when capture started.
+The Status button and typed `/status` remain available during a task. Stop
+speech stops playback, while Cancel task requests cancellation separately.
+
+### Compare the recognizers on a private corpus
+
+Use a private directory outside the checkout. Record only speech you have
+permission to use, then add the verified references, app names, and
+technical phrases to a manifest using the example.
+
+```powershell
+py -3 tools/jean-desktop/voice_bench.py --record <private-clip.wav>
+py -3 tools/jean-desktop/voice_bench.py --manifest <private-manifest.json> --backend both --run --output <private-report.json>
+```
+
+The comparison runs both recognizers on each WAV, alternating which runs
+first. It reports word error rate on paired successful clips, a separate
+failure-inclusive score, app and technical phrase hits, and p50/p95 wall
+times for fresh decoder processes. Keep these timings separate from the
+overlay's release-to-text measurement.
+
+During final acceptance, run a physical microphone-to-spoken-reply pass
+in Chat, then confirm and run a harmless spoken task. While a longer task
+is running, request spoken status, stop playback, confirm the task is
+still active, and cancel it separately. Use the same private clips for
+both recognizers and record the comparison at that stage.
+
+## Desktop task controller
+
+After rebuilding `jean.exe`, open `Open JEAN Desktop.cmd`, expand Message
+and select Task mode. Typed input and push-to-talk use the same task route.
+Use a short goal for the configured planner, `Start with Codex. <goal>` for
+an explicitly selected worker, or `/delegate <goal>` for the configured
+default worker. For a registered tool, use `/tool <id> ["argument with spaces"]`.
+Chat mode uses the read-only conversation route.
+
+Select a workspace when it differs from the configured root. Delegation
+requires a configured independent verifier. The Quick prototype and
+Polished UI profiles change worker guidance and can select the corresponding
+`verify_quick_prototype_args` or `verify_polished_ui_args` in `[delegation]`.
+The per-task instruction takes precedence over conflicting guidance.
+
+The activity panel displays the active task ID and recorded progress.
+Status and Resume accept a recorded task ID. If a checkpoint requires you
+to clear a sign-in or network blocker, use
+`/resume <task-id> --condition-cleared` after resolving it. Cancel task
+requests task cancellation. Stop interrupts spoken playback.
+
+For a verified isolated delegation, select its task ID and choose Review
+to inspect the saved Git patch, verification result, baseline, and digest.
+Apply and stage writes the reviewed patch to the original working tree and
+index after checking the baseline and getting any configured approval.
+Discard closes the review and retains the isolated evidence. The equivalent
+CLI commands are `jean review <task-id>`,
+`jean apply <task-id> --sha256 <digest>`, and `jean discard <task-id>`.
+If apply was interrupted, inspect the target and index before making
+further changes. J.E.A.N. keeps that review in needs_attention.
+
 ## Rust speech output
 
 Rebuild `jean.exe` before launching the desktop. The overlay now sends
