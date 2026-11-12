@@ -53,7 +53,7 @@ headless_chrome = "1.0.22"
 # `transport-child-process` is deliberately NOT requested: it would have rmcp spawn the server with
 # its own process handling, which is a second execution path outside the job object and the audit
 # trail. JEAN spawns and supervises; rmcp is given the pipe halves (`transport-async-rw`).
-rmcp = { version = "=3.8.0", default-features = false, features = [
+rmcp = { version = "=3.9.0", default-features = false, features = [
     "client",
     "server",
     "transport-io",
