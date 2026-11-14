@@ -13,6 +13,16 @@ cargo test --workspace --locked
 
 The project is in development. Start with the [implementation status](IMPLEMENTATION_STATUS.md) for tested behavior and work in progress. See the [implementation guide](IMPLEMENTATION_GUIDE.md) and [planning index](PLANNING/README.md) for architecture and roadmap details.
 
+## First run on Windows
+
+From the same developer shell, run:
+
+~~~powershell
+cargo run --locked -p jean-cli -- --help
+~~~
+
+The CLI prints its commands and options. See the [implementation guide](IMPLEMENTATION_GUIDE.md) for the desktop entry point.
+
 ## Decision benchmarks
 
 The [benchmark cases and runners](tools/decision-bench/) evaluate task routing and Windows UI decisions. The research snapshot dated **12 November 2026** used provider free tiers, welcome credits, promotional credits, and free trials. See [Decision Model Benchmarks](https://github.com/4Raisan/Decision-Model-Benchmarks) for the graph preview and results, or [download index.html](https://raw.githubusercontent.com/4Raisan/Decision-Model-Benchmarks/main/index.html) and open it locally.
