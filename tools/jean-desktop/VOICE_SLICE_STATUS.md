@@ -1,5 +1,18 @@
 # JEAN Desktop — Voice Slice Status
 
+## Compact controls
+
+**More → Audio** contains microphone level, speaker volume, mute, Wake, voice,
+and speaking pace. The sliders and mute buttons control the current Windows
+default devices. **Windows audio devices…** opens the Recording or Playback
+tab to choose a device. Wake requires the same Windows recording device for the
+default and communications roles.
+
+Open **More → Edit layout…** to drag sections into order and check the ones
+you want expanded at startup. **Restore Defaults** returns to the compact
+layout. The More menu also opens Models, task setup, task actions, and activity
+and safety.
+
 ## Desktop model settings
 
 Open **Models** in the desktop overlay. **Main brain** configures chat and

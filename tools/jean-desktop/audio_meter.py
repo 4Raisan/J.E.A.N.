@@ -3,6 +3,7 @@
 import ctypes
 import time
 import uuid
+from contextlib import contextmanager
 
 HRESULT = ctypes.c_long
 POINTER = ctypes.c_void_p
@@ -15,6 +16,7 @@ def guid(value):
 DEVICE_ENUMERATOR = guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
 IID_ENUMERATOR = guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
 IID_METER = guid("C02216F6-8C67-4B5B-9D00-D008E73E0064")
+IID_VOLUME = guid("5CDF2C82-841E-4546-9722-0CF74078229A")
 
 class PropertyKey(ctypes.Structure):
     _fields_ = [("fmtid", ctypes.c_ubyte * 16), ("pid", ctypes.c_ulong)]
@@ -156,6 +158,42 @@ class PlaybackMeter:
         if len(names) != 1:
             raise OSError("Set the same Windows microphone as default input and communications input.")
         return names.pop()
+
+    @contextmanager
+    def _default_volume(self, capture):
+        device, volume = POINTER(), POINTER()
+        try:
+            get_default = method(self.enumerator, 4, HRESULT, ctypes.c_int,
+                                 ctypes.c_int, ctypes.POINTER(POINTER))
+            if get_default(self.enumerator, int(capture), 1, ctypes.byref(device)) < 0:
+                raise OSError("No default Windows audio device.")
+            activate = method(device, 3, HRESULT, POINTER, ctypes.c_ulong,
+                              POINTER, ctypes.POINTER(POINTER))
+            if activate(device, ctypes.byref(IID_VOLUME), 1, None, ctypes.byref(volume)) < 0:
+                raise OSError("Windows could not open the volume controls.")
+            yield volume
+        finally:
+            release(volume)
+            release(device)
+
+    def volume_state(self, capture):
+        level, muted = ctypes.c_float(), ctypes.c_int()
+        with self._default_volume(capture) as volume:
+            get_level = method(volume, 9, HRESULT, ctypes.POINTER(ctypes.c_float))
+            get_mute = method(volume, 15, HRESULT, ctypes.POINTER(ctypes.c_int))
+            if get_level(volume, ctypes.byref(level)) < 0 or get_mute(volume, ctypes.byref(muted)) < 0:
+                raise OSError("Windows could not read the audio level.")
+        return round(level.value * 100), bool(muted.value)
+
+    def set_volume(self, capture, percent):
+        with self._default_volume(capture) as volume:
+            if method(volume, 7, HRESULT, ctypes.c_float, POINTER)(volume, percent / 100, None) < 0:
+                raise OSError("Windows could not change the audio level.")
+
+    def set_muted(self, capture, muted):
+        with self._default_volume(capture) as volume:
+            if method(volume, 14, HRESULT, ctypes.c_int, POINTER)(volume, int(muted), None) < 0:
+                raise OSError("Windows could not change mute.")
 
     def close(self):
         for meter in self.meters or ():

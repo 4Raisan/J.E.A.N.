@@ -38,6 +38,7 @@ from urllib.parse import urlencode
 import voice_bench
 import gemini_listening
 import model_settings
+from desktop_panels import AudioControls, LAYOUT_KEY, LayoutEditor, read_layout
 from audio_meter import PlaybackMeter
 from workspace_trash import WorkspaceTrash
 
@@ -47,7 +48,7 @@ from PyQt6.QtGui import QBrush, QColor, QPainter, QPainterPath, QRadialGradient,
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QLineEdit, QFrame,
                              QGraphicsDropShadowEffect, QComboBox, QFileDialog,
-                             QMessageBox, QDialog, QPlainTextEdit)
+                             QMessageBox, QDialog, QMenu, QPlainTextEdit)
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -569,6 +570,7 @@ class Overlay(QWidget):
         box.setSpacing(8)
         top = QHBoxLayout()
         badge = QLabel("✦  JEAN")
+        self.badge = badge
         badge.setObjectName("badge")
         top.addWidget(badge)
         top.addStretch()
@@ -602,13 +604,17 @@ class Overlay(QWidget):
         self.backend_btn.setObjectName("mini")
         self._update_models_tooltip()
         self.backend_btn.clicked.connect(self.show_model_settings)
-        controls.addWidget(self.backend_btn)
         self.stop_speech = QPushButton("Stop speech")
         self.stop_speech.setObjectName("mini")
         self.stop_speech.setToolTip("Stop spoken playback")
         self.stop_speech.clicked.connect(self.stop_speech_playback)
         self.stop_speech.setEnabled(False)
         controls.addWidget(self.stop_speech)
+        more = QPushButton("More")
+        more.setObjectName("mini")
+        self.more_menu = QMenu(more)
+        more.setMenu(self.more_menu)
+        controls.addWidget(more)
         box.addLayout(controls)
         self.wake_button = QPushButton("Wake: On")
         self.wake_button.setObjectName("mini")
@@ -618,20 +624,17 @@ class Overlay(QWidget):
             "Local microphone detection while idle. Say Jean, Dean, Gene, or G."
         )
         self.wake_button.toggled.connect(self._set_wake_enabled)
-        voice_row = QHBoxLayout()
-        voice_row.addWidget(self.wake_button)
         self.voice_choice = QComboBox()
         self.voice_choice.setToolTip("Voice used for spoken replies")
         self.voice_choice.addItem("Voice: Windows default", "")
         self._load_voices()
-        voice_row.addWidget(self.voice_choice, 1)
-        box.addLayout(voice_row)
         action_row = QHBoxLayout()
         self.yolo = QPushButton("Ask for approval")
         self.yolo.setCheckable(True)
         self.yolo.setChecked(self.voice_settings.value("yolo", False, type=bool))
         if self.yolo.isChecked():
             self.yolo.setText("YOLO: On")
+            self.badge.setText("✦  JEAN · YOLO")
         self.yolo.setToolTip("Switch between asking for approval and YOLO")
         self.yolo.setStyleSheet("QPushButton:checked { background: #f0c64d; color: #18150c; }")
         self.yolo.toggled.connect(self._set_yolo)
@@ -651,10 +654,8 @@ class Overlay(QWidget):
         self.voice_rate.currentIndexChanged.connect(
             lambda: self.voice_settings.setValue("rate", self.voice_rate.currentData())
         )
-        action_row.addWidget(self.voice_rate)
         for button in (self.yolo, stop, history):
             button.setObjectName("mini")
-        box.addLayout(action_row)
         row = QHBoxLayout()
         self.entry = QLineEdit()
         self.entry.setPlaceholderText("Ask J.E.A.N. or give it a task…")
@@ -690,11 +691,9 @@ class Overlay(QWidget):
         self.instruction = QLineEdit()
         self.instruction.setPlaceholderText("Task-specific quality instruction")
         options.addWidget(self.instruction)
-        box.addWidget(self.task_options)
         task_row = QHBoxLayout()
         self.task_id = QLineEdit()
         self.task_id.setPlaceholderText("Task ID")
-        task_row.addWidget(self.task_id)
         for label, action in (
             ("Status", self._request_task_status),
             ("Resume", self._resume_task),
@@ -708,18 +707,38 @@ class Overlay(QWidget):
             if label == "Cancel task":
                 self.cancel_task_button = button
                 button.setEnabled(False)
-        box.addLayout(task_row)
         self.activity = QLabel()
         self.activity.setTextFormat(Qt.TextFormat.PlainText)
         self.activity.setWordWrap(True)
-        box.addWidget(self.activity)
         self.poll_task = QTimer(self)
         self.poll_task.setInterval(1500)
         self.poll_task.timeout.connect(self._request_task_status)
         self.note = QLabel("Task examples: Start with Codex. Fix the test. · /delegate Fix the test")
         self.note.setObjectName("note")
         self.note.setWordWrap(True)
-        box.addWidget(self.note)
+        options.addWidget(self.note)
+        task_actions = QWidget()
+        task_box = QVBoxLayout(task_actions)
+        task_box.setContentsMargins(0, 0, 0, 0)
+        task_box.addWidget(self.task_id)
+        task_box.addLayout(task_row)
+        task_box.addWidget(self.activity)
+        actions = QWidget()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        actions.setLayout(action_row)
+        self.sections = {
+            "audio": ("Audio", AudioControls(self.playback_meter, self._open_audio_devices,
+                                             self.wake_button, self.voice_choice, self.voice_rate)),
+            "models": ("Models", self.backend_btn),
+            "setup": ("Task setup", self.task_options),
+            "tasks": ("Task actions", task_actions),
+            "activity": ("Activity and safety", actions),
+        }
+        self.sections_box = QVBoxLayout()
+        box.addLayout(self.sections_box)
+        self.section_layout = read_layout(self.voice_settings, self.sections)
+        self.open_sections = {key for key, pinned in self.section_layout.items() if pinned}
+        self._apply_section_layout()
         outer.addWidget(self.card)
         self.card.hide()
         toggle_row = QHBoxLayout()
@@ -811,6 +830,7 @@ class Overlay(QWidget):
 
     def _set_yolo(self, enabled):
         self.yolo.setText("YOLO: On" if enabled else "Ask for approval")
+        self.badge.setText("✦  JEAN · YOLO" if enabled else "✦  JEAN")
         self.voice_settings.setValue("yolo", enabled)
         self._log_activity(f"YOLO {'enabled' if enabled else 'disabled'}")
         if enabled and self.approval is not None:
@@ -820,13 +840,56 @@ class Overlay(QWidget):
         anchor = self._ring_position()
         self.mode = {"smart": "task", "task": "chat", "chat": "smart"}[self.mode]
         self.mode_btn.setText(f"Mode: {self.mode.capitalize()}")
-        self.task_options.setVisible(self.mode != "chat")
         self.entry.setPlaceholderText({
             "smart": "Ask J.E.A.N. or give it a task…",
             "task": "Tell J.E.A.N. what to do…",
             "chat": "Ask J.E.A.N. a question…",
         }[self.mode])
         self._resize_around_ring(anchor)
+
+    def _open_audio_devices(self, capture):
+        try:
+            subprocess.Popen(["control.exe", f"mmsys.cpl,,{int(capture)}"], creationflags=NO_WINDOW)
+        except OSError as exc:
+            self.show_result("Windows audio devices unavailable", str(exc))
+
+    def _apply_section_layout(self):
+        self.more_menu.clear()
+        for key in self.section_layout:
+            title, widget = self.sections[key]
+            self.sections_box.removeWidget(widget)
+            self.sections_box.addWidget(widget)
+            widget.setVisible(key in self.open_sections)
+            if key == "models":
+                self.more_menu.addAction(title, self.show_model_settings)
+                continue
+            action = self.more_menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(key in self.open_sections)
+            action.toggled.connect(lambda visible, key=key: self._toggle_section(key, visible))
+        self.more_menu.addSeparator()
+        self.more_menu.addAction("Edit layout…", self._edit_layout)
+
+    def _toggle_section(self, key, visible):
+        anchor = self._ring_position()
+        if visible:
+            self.open_sections.add(key)
+        else:
+            self.open_sections.discard(key)
+        self.sections[key][1].setVisible(visible)
+        self._resize_around_ring(anchor)
+
+    def _edit_layout(self):
+        editor = LayoutEditor(self, {key: title for key, (title, _) in self.sections.items()},
+                              self.section_layout)
+        if editor.exec() == QDialog.DialogCode.Accepted:
+            anchor = self._ring_position()
+            self.section_layout = editor.selection()
+            self.open_sections = {key for key, pinned in self.section_layout.items() if pinned}
+            self.voice_settings.setValue(LAYOUT_KEY, json.dumps(list(self.section_layout.items())))
+            self._apply_section_layout()
+            self._resize_around_ring(anchor)
+        editor.deleteLater()
 
     def _log_activity(self, message):
         self.activity_lines.append(f"{time.strftime('%H:%M:%S')}  {message[:1200]}")
@@ -969,6 +1032,9 @@ class Overlay(QWidget):
         return self.reactor.mapToGlobal(self.reactor.rect().center())
 
     def _resize_around_ring(self, anchor):
+        self.sections_box.invalidate()
+        self.card.layout().invalidate()
+        self.card.updateGeometry()
         self.layout().invalidate()
         self.layout().activate()
         self.resize(self.sizeHint().expandedTo(self.minimumSizeHint()))
