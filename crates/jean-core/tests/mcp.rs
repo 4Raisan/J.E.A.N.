@@ -250,6 +250,7 @@ impl Peer for ScriptedPeer {
             truncated: false,
             is_error: self.tool_error,
             text,
+            structured_content: Some(serde_json::json!({"snapshot_id": "fixture"})),
             bytes,
         })
     }
@@ -451,6 +452,10 @@ fn an_allowed_call_records_the_result_and_returns_it() {
     .expect("the call is allowed by configuration");
 
     assert_eq!(report.text, "hello from the server");
+    assert_eq!(
+        report.structured_content,
+        Some(serde_json::json!({"snapshot_id": "fixture"}))
+    );
     assert!(!report.tool_error);
     assert_eq!(report.state, TaskState::Succeeded);
     assert_eq!(report.exit_status(), 0);

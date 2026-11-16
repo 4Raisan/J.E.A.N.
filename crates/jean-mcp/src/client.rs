@@ -55,6 +55,7 @@ pub struct CallOutcome {
     pub tool: String,
     /// The text content of the result, capped at `max_result_bytes`.
     pub text: String,
+    pub structured_content: Option<serde_json::Value>,
     /// The server's own tool-level failure. A real answer, not a transport problem.
     pub is_error: bool,
     /// Bytes the server actually returned, before any truncation.
@@ -173,10 +174,14 @@ impl McpSession {
             .map(|text| text.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let bytes = full.len();
+        let structured_bytes = result
+            .structured_content
+            .as_ref()
+            .map_or(0, |value| value.to_string().len());
+        let bytes = full.len().saturating_add(structured_bytes);
         let truncated = bytes > self.bounds.max_result_bytes;
         let mut text = full;
-        if truncated {
+        if text.len() > self.bounds.max_result_bytes {
             // Cut at a boundary that cannot split a character: text truncated mid-codepoint is
             // something the operator can neither read nor quote.
             let mut keep = self.bounds.max_result_bytes;
@@ -199,6 +204,11 @@ impl McpSession {
         Ok(CallOutcome {
             tool: tool.to_owned(),
             text,
+            structured_content: if truncated {
+                None
+            } else {
+                result.structured_content
+            },
             is_error: result.is_error == Some(true),
             bytes: bytes as u64,
             truncated,

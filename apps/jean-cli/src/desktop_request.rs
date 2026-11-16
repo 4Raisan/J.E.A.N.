@@ -150,6 +150,23 @@ fn route(
 ) -> anyhow::Result<ExitCode> {
     let goal = options.goal.trim();
     let (command, arguments) = split_first(goal);
+    if command == "/click" {
+        let (pid, window_id, label, before, after): (u32, u64, String, String, String) =
+            serde_json::from_str(arguments).map_err(|_| {
+                anyhow::anyhow!("Use /click [pid, window_id, \"control\", \"before\", \"after\"]")
+            })?;
+        let report = jean_core::mcp::click_cua_control(
+            ctx,
+            (pid, window_id),
+            &label,
+            &before,
+            &after,
+            prompt,
+            cancel,
+        )?;
+        println!("result: {}", report.text);
+        return Ok(ExitCode::from(report.exit_status() as u8));
+    }
     match command {
         "/review" => {
             let preview = delegation::review::preview(ctx, arguments)?;

@@ -582,7 +582,7 @@ fn cmd_mcp_call(
         write!(
             out,
             "{{\n  \"task_id\": {},\n  \"server\": {},\n  \"tool\": {},\n  \"decision\": {},\n  \
-             \"state\": {},\n  \"text\": {},\n  \"bytes\": {},\n  \"truncated\": {},\n  \
+             \"state\": {},\n  \"text\": {},\n  \"structuredContent\": {},\n  \"bytes\": {},\n  \"truncated\": {},\n  \
              \"tool_error\": {},\n  \"exit_code\": {},\n  \"notes\": {}\n}}\n",
             quote(&report.task_id),
             quote(&report.server),
@@ -590,6 +590,7 @@ fn cmd_mcp_call(
             quote(&report.decision.to_string()),
             quote(report.state.as_str()),
             quote(&report.text),
+            report.structured_content.as_ref().unwrap_or(&serde_json::Value::Null),
             report.bytes,
             report.truncated,
             report.tool_error,

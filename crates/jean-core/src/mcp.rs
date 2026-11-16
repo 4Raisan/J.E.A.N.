@@ -282,6 +282,168 @@ impl Peer for McpSession {
 /// How a session gets started: the production opener, or a scripted one.
 pub type Opener = dyn Fn(&str, &LaunchSpec, &Bounds) -> Result<Box<dyn Peer>>;
 
+/// One semantic click with fresh observations on both sides of the action.
+pub fn click_cua_control(
+    ctx: &mut Context,
+    (pid, window_id): (u32, u64),
+    label: &str,
+    before: &str,
+    after: &str,
+    prompter: &mut dyn Prompter,
+    cancel: &crate::CancelFlag,
+) -> Result<CallReport> {
+    let server = find_server(&ctx.config.mcp, "cua")?;
+    check_allowlist(server, "get_window_state")?;
+    if pid == 0
+        || window_id == 0
+        || [label, before, after].iter().any(|s| s.trim().is_empty())
+        || before == after
+    {
+        return Err(CoreError::Intent {
+            reason: "Provide a window, a control label, and distinct before/after witness labels."
+                .into(),
+        });
+    }
+    call_tool_with(
+        ctx,
+        "cua",
+        "click",
+        serde_json::json!({"pid":pid,"window_id":window_id,"label":label,"before":before,"after":after}),
+        prompter,
+        &{
+            let cancel = cancel.clone();
+            move |name, launch, bounds| {
+                Ok(Box::new(CuaClickPeer(
+                    open_session(name, launch, bounds)?,
+                    cancel.clone(),
+                )))
+            }
+        },
+    )
+}
+
+struct CuaClickPeer(Box<dyn Peer>, crate::CancelFlag);
+
+impl Peer for CuaClickPeer {
+    fn list(&mut self) -> std::result::Result<Vec<jean_mcp::ToolInfo>, jean_mcp::McpError> {
+        self.0.list()
+    }
+
+    fn call(
+        &mut self,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> std::result::Result<CallOutcome, jean_mcp::McpError> {
+        let target = serde_json::json!({
+            "pid": arguments["pid"], "window_id": arguments["window_id"],
+            "include_screenshot": false
+        });
+        let report = |text: &str, is_error| CallOutcome {
+            tool: tool.into(),
+            text: text.into(),
+            structured_content: None,
+            is_error,
+            bytes: text.len() as u64,
+            truncated: false,
+        };
+        let snapshot = self.0.call("get_window_state", &target)?;
+        let Some(elements) = cua_elements(&snapshot) else {
+            return Ok(report(
+                "Could not inspect the target window. No click sent.",
+                true,
+            ));
+        };
+        let mut matches = elements.iter().filter(|e| e["label"] == arguments["label"]);
+        let Some(control) = matches.next() else {
+            return Ok(report("Control not found. No click sent.", true));
+        };
+        if matches.next().is_some() {
+            return Ok(report("Control label is ambiguous. No click sent.", true));
+        }
+        let before = arguments["before"].as_str().unwrap_or_default();
+        let after = arguments["after"].as_str().unwrap_or_default();
+        if cua_witness_count(&snapshot, before) != 1 || cua_witness_count(&snapshot, after) != 0 {
+            return Ok(report(
+                "Initial witness did not match. No click sent.",
+                true,
+            ));
+        }
+        let Some(token) = control["element_token"].as_str() else {
+            return Ok(report(
+                "Control has no fresh element token. No click sent.",
+                true,
+            ));
+        };
+        if self.1.raised() {
+            return Ok(report("Cancelled before dispatch. No click sent.", true));
+        }
+        let click = self.0.call(
+            "click",
+            &serde_json::json!({
+                "pid": arguments["pid"], "window_id": arguments["window_id"], "element_token": token
+            }),
+        );
+        let readback = self.0.call("get_window_state", &target);
+        if click.is_ok_and(|r| !r.is_error)
+            && readback.is_ok_and(|snapshot| {
+                cua_elements(&snapshot).is_some()
+                    && cua_witness_count(&snapshot, after) == 1
+                    && cua_witness_count(&snapshot, before) == 0
+            })
+        {
+            return Ok(report(
+                "Click verified by independent window readback.",
+                false,
+            ));
+        }
+        Ok(report(
+            "Click outcome uncertain. Inspect the window before retrying.",
+            true,
+        ))
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+
+    fn close(&mut self) -> Option<i32> {
+        self.0.close()
+    }
+}
+
+fn cua_elements(snapshot: &CallOutcome) -> Option<&Vec<serde_json::Value>> {
+    if snapshot.is_error || snapshot.truncated {
+        return None;
+    }
+    let data = snapshot.structured_content.as_ref()?;
+    let elements = data["elements"].as_array()?;
+    if data["total_element_count"]
+        .as_u64()
+        .is_some_and(|n| n != elements.len() as u64)
+    {
+        return None;
+    }
+    Some(elements)
+}
+
+fn cua_witness_count(snapshot: &CallOutcome, label: &str) -> usize {
+    let indexed = cua_elements(snapshot).map_or(0, |elements| {
+        elements.iter().filter(|e| e["label"] == label).count()
+    });
+    // Cua omits non-actionable static text from elements, but includes it in tree_markdown.
+    let static_text = format!("- Text {}", serde_json::Value::String(label.into()));
+    indexed
+        + snapshot
+            .structured_content
+            .as_ref()
+            .and_then(|data| data["tree_markdown"].as_str())
+            .map_or(0, |tree| {
+                tree.lines()
+                    .filter(|line| line.trim() == static_text)
+                    .count()
+            })
+}
+
 /// The real opener — start the process, complete the handshake.
 pub fn open_session(server: &str, launch: &LaunchSpec, bounds: &Bounds) -> Result<Box<dyn Peer>> {
     McpSession::open(server, launch, bounds)
@@ -431,6 +593,7 @@ pub struct CallReport {
     pub state: TaskState,
     /// The result text, capped at `[mcp] max_result_bytes`.
     pub text: String,
+    pub structured_content: Option<serde_json::Value>,
     /// Bytes the server actually returned, before the cap.
     pub bytes: u64,
     pub truncated: bool,
@@ -535,6 +698,7 @@ fn decided_session(
         ctx.redactor.clone(),
     );
     let task_id = open_task(ctx, server, &operation, request)?;
+    (ctx.task_started)(&task_id);
     let actor = crate::intent::actor();
 
     if would_prompt(&policy, &ctx.store, &operation)? {
@@ -573,6 +737,7 @@ fn decided_session(
             decision,
             state: TaskState::Failed,
             text,
+            structured_content: None,
             bytes: 0,
             truncated: false,
             tool_error: false,
@@ -798,6 +963,7 @@ fn settle(
                     // Set below, from the verdict.
                     state: TaskState::Running,
                     text: call.text.clone(),
+                    structured_content: call.structured_content.clone(),
                     bytes: call.bytes,
                     truncated: call.truncated,
                     tool_error: call.is_error,
