@@ -1,9 +1,25 @@
 # JEAN Desktop — Voice Slice Status
 
+## Desktop model settings
+
+Open **Models** in the desktop overlay. **Main brain** configures chat and
+natural-language planning. **Decision model** configures the replacement-worker
+selector. Shadow mode observes its recommendation while Rust chooses the worker.
+**Listening** offers local Faster-Whisper, local Zipformer + Parakeet, and
+**Gemini 3.5 Transcribe Live** (`gemini-3.5-transcribe-live` in Google AI Studio).
+Gemini receives Talk audio during capture. The Windows voice selector controls
+spoken replies.
+
+Use an API key environment variable or enter a key in the masked field to save it
+in Windows Credential Manager. **Test selected tab** makes a synthetic provider
+request and **Save** applies the selections to new desktop requests. The desktop
+Python environment needs `PyQt6`, `keyring` for Windows credentials, and
+`websockets>=14` for Gemini Live.
+
 ## Push-to-talk and task controls
 
 Choose Chat or Task before pressing Talk. Press End recording to submit the
-clip for local transcription, or let speech endpointing end the capture.
+transcript, or let speech endpointing end the capture.
 Chat sends its transcript to the chat route. Task displays the transcript
 for editing and requires Run task before the controller receives it.
 Routine overlay audio is temporary. The overlay shows the recognizer and

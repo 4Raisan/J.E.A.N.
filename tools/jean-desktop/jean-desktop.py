@@ -7,7 +7,8 @@ meter drives it when audio plays through the default output device.
 Voice in: push Talk, speak, push Talk again (or stay silent past the
 endpoint). The captured 16 kHz WAV is decoded by the selected backend —
 project 9's Faster-Whisper base.en by default, or project 2's
-Zipformer+Parakeet hybrid — then routed by mode:
+Zipformer+Parakeet hybrid. Gemini Live streams PCM during capture. The
+transcript is then routed by mode:
 
   * Chat  → `jean chat <text>`        (read-only conversation, never a task)
   * Task  → the Rust desktop request router
@@ -35,10 +36,12 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import voice_bench
+import gemini_listening
+import model_settings
 from audio_meter import PlaybackMeter
 from workspace_trash import WorkspaceTrash
 
-from PyQt6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QObject, QProcess, QSettings, QUrl,
+from PyQt6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QObject, QProcess, QProcessEnvironment, QSettings, QUrl,
                           QAbstractNativeEventFilter, pyqtSignal)
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPainterPath, QRadialGradient, QPen, QDesktopServices
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -58,9 +61,8 @@ VK_CAPITAL = 0x14
 PROVIDER_NONE_MARKER = 'model.provider = "none"'
 CHAT_SETUP_TITLE = "Chat needs a model provider"
 CHAT_SETUP_HINT = (
-    'Set provider (e.g. "ollama"), model and base_url under [model] in '
-    "%LOCALAPPDATA%\\JEAN\\jean.toml (or <JEAN_DATA_DIR>\\jean.toml), "
-    "then verify with `jean model ping`. Tool and delegated worker tasks "
+    "Open Models → Main brain to choose a provider, model, URL and credential. "
+    "Tool and delegated worker tasks "
     "run without a provider; natural-language planning needs one."
 )
 
@@ -281,6 +283,7 @@ class VoiceTurn:
     abandoned: bool = False
     asr_fallback: bool = False
     approval: object = None
+    live: gemini_listening.Listening | None = None
 
 
 class Bridge(QObject):
@@ -523,7 +526,10 @@ class Overlay(QWidget):
         self.mode = "smart"
         data_dir = Path(os.environ.get("JEAN_DATA_DIR") or Path(os.environ["LOCALAPPDATA"]) / "JEAN")
         self.trash = WorkspaceTrash(data_dir / "workspace-trash")
-        self.backend = voice_bench.DEFAULT_BACKEND
+        self.voice_settings = QSettings("JEAN", "Desktop")
+        self.model_profiles = model_settings.read(self.voice_settings)
+        self.model_dialog = None
+        self.backend = self.model_profiles["listening"]["backend"]
         self.listening = False
         self.capture_proc = None
         self.voice_turn = None
@@ -592,10 +598,10 @@ class Overlay(QWidget):
         self.mode_btn.setToolTip("Switch between Smart, Task, and Chat")
         self.mode_btn.clicked.connect(self.toggle_mode)
         controls.addWidget(self.mode_btn)
-        self.backend_btn = QPushButton("ASR: Project 9")
+        self.backend_btn = QPushButton("Models")
         self.backend_btn.setObjectName("mini")
-        self.backend_btn.setToolTip("Voice decode backend: project 9 Faster-Whisper or project 2 Zipformer+Parakeet")
-        self.backend_btn.clicked.connect(self.toggle_backend)
+        self._update_models_tooltip()
+        self.backend_btn.clicked.connect(self.show_model_settings)
         controls.addWidget(self.backend_btn)
         self.stop_speech = QPushButton("Stop speech")
         self.stop_speech.setObjectName("mini")
@@ -614,7 +620,6 @@ class Overlay(QWidget):
         self.wake_button.toggled.connect(self._set_wake_enabled)
         voice_row = QHBoxLayout()
         voice_row.addWidget(self.wake_button)
-        self.voice_settings = QSettings("JEAN", "Desktop")
         self.voice_choice = QComboBox()
         self.voice_choice.setToolTip("Voice used for spoken replies")
         self.voice_choice.addItem("Voice: Windows default", "")
@@ -849,17 +854,107 @@ class Overlay(QWidget):
         self.stop_speech_playback()
         if self.voice_turn is not None:
             self.voice_turn.abandoned = True
+            if self.voice_turn.live:
+                self.voice_turn.live.cancelled.set()
             self._stop_capture()
         if self.foreground_cancel is not None:
             self.foreground_cancel.set()
         self._cancel_task()
         self.show_result("Terminate received", "Stopping active J.E.A.N. work.")
 
-    def toggle_backend(self):
-        self.backend = ("project9-whisper" if self.backend == "project2-hybrid"
-                        else "project2-hybrid")
-        self.backend_btn.setText("ASR: Project 9" if self.backend == "project9-whisper"
-                                 else "ASR: Project 2")
+    def _update_models_tooltip(self):
+        self.backend_btn.setToolTip(
+            f'Main brain, decision and listening settings · {model_settings.LISTENERS[self.backend]}'
+        )
+
+    def show_model_settings(self):
+        if self.model_dialog is None:
+            self.model_dialog = model_settings.ModelSettings(self, self.model_profiles)
+        self.model_dialog.show()
+        self.model_dialog.raise_()
+        self.model_dialog.activateWindow()
+
+    def save_model_settings(self, dialog):
+        try:
+            profiles = {role: dialog.values(role) for role in dialog.fields}
+            for role, config in profiles.items():
+                key = dialog.keys[role].replacement()
+                forget = dialog.forget[role].isChecked()
+                if key and forget:
+                    raise ValueError("Choose either a replacement key or removal.")
+                if key or forget:
+                    if not model_settings.origin(role, config):
+                        raise ValueError("Enter the endpoint before changing its stored credential.")
+                    if key and config["api_key_env"]:
+                        raise ValueError("Clear the environment variable field to use a saved key.")
+            for role, config in profiles.items():
+                key = dialog.keys[role].replacement()
+                if key or dialog.forget[role].isChecked():
+                    model_settings.store_credential(role, config, key)
+            self.voice_settings.setValue("models/v1", json.dumps(profiles))
+            self.voice_settings.sync()
+            if self.voice_settings.status() != QSettings.Status.NoError:
+                raise OSError("Windows could not save the desktop settings.")
+        except (OSError, RuntimeError, ValueError) as exc:
+            dialog.status.setText(str(exc))
+            return
+        self.model_profiles = profiles
+        self.backend = profiles["listening"]["backend"]
+        self._update_models_tooltip()
+        for role in profiles:
+            dialog.refresh_key(role, reset=True)
+            dialog.forget[role].setChecked(False)
+        dialog.status.setText("Saved. New requests use these settings.")
+        self.refresh()
+
+    def test_model_settings(self, dialog):
+        role = dialog.selected()
+        try:
+            config = dialog.values(role)
+            key = dialog.keys[role].replacement()
+            if key and config["api_key_env"]:
+                raise ValueError("Choose either an entered key or an environment variable.")
+            if not key and role == "listening" and config["backend"] == model_settings.GEMINI:
+                key = model_settings.credential(role, config)
+            if role == "main" and not config["provider"] and (key or model_settings.credential(role, config)):
+                config["provider"] = "openai_compatible"
+                model_settings.validate(role, config)
+            profiles = {**self.model_profiles, role: config}
+            env = model_settings.cli_environment(profiles, only=role, override=key)
+        except (OSError, RuntimeError, ValueError) as exc:
+            dialog.status.setText(str(exc))
+            return
+        dialog.test_button.setEnabled(False)
+        dialog.status.setText("Testing with synthetic input…")
+
+        def work():
+            try:
+                if role == "listening":
+                    message = model_settings.probe_listening(config, key)
+                else:
+                    command = "model" if role == "main" else "decision"
+                    output, error = self._jean([str(EXE), command, "ping"], timeout=45,
+                                               env=env, use_saved_models=False)
+                    if role == "main":
+                        _, marker, result = output.partition("\nping ")
+                        if marker:
+                            lines = result.strip().splitlines()
+                            if error:
+                                message = "\n".join(line.strip() for line in lines[:3])[:400]
+                            else:
+                                message = "\n".join(
+                                    [lines[0].strip(), *(line for line in lines[1:]
+                                                         if line.startswith("reported model"))]
+                                )
+                        else:
+                            message = error or output.strip()
+                    else:
+                        message = (error or output).strip()
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                message = str(exc)
+            dialog.tested.emit(role, message)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle_message(self):
         anchor = self._ring_position()
@@ -1017,11 +1112,20 @@ class Overlay(QWidget):
                 root / "clip.wav",
                 root / "stop.marker",
                 max_seconds=20.0, microphone=microphone)
+            if turn.backend == model_settings.GEMINI:
+                config = self.model_profiles["listening"]
+                key = model_settings.credential("listening", config)
+                if not key:
+                    raise ValueError("Enter a Google AI Studio key in Models → Listening.")
+                turn.live = gemini_listening.Listening(config["model"], key)
+                argv.append("--stream-pcm")
             proc = subprocess.Popen(
                 argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=NO_WINDOW)
-        except (RuntimeError, OSError) as exc:
+        except (RuntimeError, OSError, ValueError) as exc:
+            if turn.live:
+                turn.live.cancelled.set()
             directory.cleanup()
             self.show_result("Voice unavailable", str(exc))
             return
@@ -1079,6 +1183,9 @@ class Overlay(QWidget):
                         self.bridge.capture_ready.emit(turn)
                     elif line == "ENDED":
                         ended_at = time.monotonic()
+                    elif line.startswith("AUDIO ") and turn.live:
+                        if not turn.abandoned and not turn.live.result.done():
+                            turn.live.chunks.put(line[6:])
                     elif line.startswith("ERROR "):
                         error = line[6:]
                     elif line and not line.startswith(("SPEECH ", "DONE ")):
@@ -1091,6 +1198,10 @@ class Overlay(QWidget):
             error = str(exc)
         if not saw_ready or proc.returncode != 0:
             error = error or diagnostic or "microphone capture did not finish successfully"
+        if turn.live:
+            if error or turn.abandoned:
+                turn.live.cancelled.set()
+            turn.live.ended.set()
         self.bridge.capture_finished.emit(turn, error, ended_at)
 
     def _on_capture_finished(self, turn, error, ended_at):
@@ -1114,13 +1225,20 @@ class Overlay(QWidget):
 
         def work():
             try:
-                outcome = voice_bench.decode_clip(turn.backend, clip, timeout=240)
-                if (turn.backend == "project2-hybrid" and not turn.abandoned
-                        and "Expected one model under" in (outcome["error"] or "")):
-                    turn.asr_fallback = True
-                    turn.backend = "project9-whisper"
+                if turn.live:
+                    transcript, failure = turn.live.result.result(timeout=23), ""
+                else:
                     outcome = voice_bench.decode_clip(turn.backend, clip, timeout=240)
-                transcript, failure = outcome["transcript"].strip(), outcome["error"] or ""
+                    if (turn.backend == "project2-hybrid" and not turn.abandoned
+                            and "Expected one model under" in (outcome["error"] or "")):
+                        turn.asr_fallback = True
+                        turn.backend = "project9-whisper"
+                        outcome = voice_bench.decode_clip(turn.backend, clip, timeout=240)
+                    transcript, failure = outcome["transcript"].strip(), outcome["error"] or ""
+            except TimeoutError:
+                if turn.live:
+                    turn.live.cancelled.set()
+                transcript, failure = "", "Gemini Live transcription timed out."
             except (OSError, RuntimeError, ValueError) as exc:
                 transcript, failure = "", str(exc)
             finally:
@@ -1135,8 +1253,6 @@ class Overlay(QWidget):
             return
         if turn.asr_fallback:
             self._log_activity("Project 2 model unavailable. Retried this recording with Project 9.")
-            if self.backend == "project2-hybrid":
-                self.toggle_backend()
         if error or not transcript:
             self.show_result("Transcription failed", error or "empty transcript")
             self._finish_voice(turn)
@@ -1560,6 +1676,12 @@ class Overlay(QWidget):
         threading.Thread(target=work, daemon=True).start()
 
     def _run_task(self, text):
+        try:
+            environment = model_settings.cli_environment(self.model_profiles)
+        except (RuntimeError, OSError, ValueError) as exc:
+            self.show_result("Model settings unavailable", str(exc))
+            self._finish_busy()
+            return
         channel = secrets.token_hex(16)
         args = ["desktop-request", "--channel", channel]
         for name, value in (
@@ -1582,6 +1704,10 @@ class Overlay(QWidget):
         proc = QProcess(self)
         self.task_proc = proc
         proc.setWorkingDirectory(str(ROOT))
+        process_environment = QProcessEnvironment()
+        for key, value in environment.items():
+            process_environment.insert(key, value)
+        proc.setProcessEnvironment(process_environment)
         proc.readyReadStandardOutput.connect(self._read_task_output)
         proc.readyReadStandardError.connect(self._read_task_error)
         if text.split(maxsplit=1)[0] not in ("/review", "/apply", "/discard"):
@@ -1855,8 +1981,10 @@ class Overlay(QWidget):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _jean(self, argv, timeout, cancel=None, env=None):
+    def _jean(self, argv, timeout, cancel=None, env=None, use_saved_models=True):
         try:
+            if use_saved_models:
+                env = model_settings.cli_environment(self.model_profiles, env)
             with subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                   errors="replace", creationflags=NO_WINDOW, env=env) as proc:
@@ -1875,7 +2003,7 @@ class Overlay(QWidget):
                         break
                     except subprocess.TimeoutExpired:
                         continue
-        except OSError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             return "", str(exc)
         out = stdout + (("\n" + stderr) if stderr else "")
         if proc.returncode != 0:
@@ -1990,6 +2118,8 @@ class Overlay(QWidget):
     def closeEvent(self, event):
         if self.voice_turn is not None:
             self.voice_turn.abandoned = True
+            if self.voice_turn.live:
+                self.voice_turn.live.cancelled.set()
             self._stop_capture()
             self.show_result("Ending voice input", "Wait for the recording to close before closing J.E.A.N.")
             event.ignore()
@@ -2024,9 +2154,8 @@ class Overlay(QWidget):
             if not error:
                 for line in output.splitlines():
                     parts = line.split(None, 1)
-                    if parts and parts[0] == "provider":
-                        if parts[1].strip() == "none":
-                            self.bridge.chat_setup.emit(output.strip())
+                    if len(parts) == 2 and parts[0] == "provider":
+                        self.bridge.chat_setup.emit(output.strip() if parts[1].strip() == "none" else "")
                         break
             try:
                 result = subprocess.run([str(EXE), "status"], cwd=ROOT, capture_output=True,

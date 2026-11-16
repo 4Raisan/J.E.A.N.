@@ -24,6 +24,7 @@ when speech-endpointing triggers (speech heard, then --endpoint seconds of
 silence). It never transcribes and never touches the network.
 """
 import argparse
+import base64
 import sys
 import time
 import wave
@@ -42,6 +43,7 @@ def main(argv=None):
     parser.add_argument("--stop-file", type=Path, default=None,
                         help="capture ends as soon as this file exists")
     parser.add_argument("--microphone", help="verified Windows WASAPI microphone name")
+    parser.add_argument("--stream-pcm", action="store_true", help="emit PCM audio on stdout")
     parser.add_argument("--threshold", type=float, default=0.012,
                         help="RMS level that counts as speech for endpointing")
     parser.add_argument("--endpoint", type=float, default=1.4,
@@ -59,6 +61,7 @@ def main(argv=None):
         return 2
 
     blocks = []
+    pending = []
     peak = 0.0
     speech_at = None
 
@@ -71,6 +74,8 @@ def main(argv=None):
         if level >= args.threshold:
             speech_at = time.monotonic()
         blocks.append(chunk.copy())
+        if args.stream_pcm:
+            pending.append(blocks[-1])
         print(f"LEVEL {level:.4f}", flush=True)
         print(f"SPEECH {peak:.4f}", flush=True)
 
@@ -92,6 +97,16 @@ def main(argv=None):
                               callback=callback)
 
     rate = RATE
+
+    def emit_pending():
+        while pending:
+            samples = pending.pop(0)
+            if rate != RATE and len(samples):
+                positions = np.arange(round(len(samples) * RATE / rate)) * (rate / RATE)
+                samples = np.interp(positions, np.arange(len(samples)), samples)
+            pcm = (samples * 32767.0).clip(-32768, 32767).astype("<i2")
+            print("AUDIO " + base64.b64encode(pcm).decode("ascii"), flush=True)
+
     try:
         try:
             stream = open_stream(rate)
@@ -105,6 +120,7 @@ def main(argv=None):
             print("READY", flush=True)
             while True:
                 time.sleep(0.05)
+                emit_pending()
                 now = time.monotonic()
                 if args.stop_file is not None and args.stop_file.exists():
                     break
@@ -119,6 +135,7 @@ def main(argv=None):
         return 2
 
     print("ENDED", flush=True)
+    emit_pending()
     if not blocks:
         print("ERROR no audio captured", flush=True)
         return 2
