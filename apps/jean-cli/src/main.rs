@@ -876,6 +876,8 @@ enum ModelCommand {
 
 #[derive(Subcommand)]
 enum DecisionCommand {
+    /// Test the configured decision provider using synthetic choices.
+    Ping,
     /// Compare labeled shadow choices with the Rust fallback and show the activation gate.
     Report,
     /// Show recorded choices and outcome for a recovery task.
@@ -1134,6 +1136,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Decision { action } => {
             use jean_core::decision;
             match action {
+                DecisionCommand::Ping => println!("{}", decision::ping(&ctx)?),
                 DecisionCommand::Report => {
                     println!(
                         "{}",

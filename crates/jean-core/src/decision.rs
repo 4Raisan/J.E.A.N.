@@ -450,11 +450,15 @@ fn choose_recorded(
         reported_tokens: None,
         applied_choice: 1,
     };
-    let reply = if config.protocol == "system_one" {
-        system_one(config, &request, workers, cancel)
-    } else {
-        client.generate(&request, cancel)
-    };
+    let choices = workers.iter().enumerate().map(|(index, worker)| {
+        format!(
+            "Preference rank {}. Connector {}, sandbox {}.",
+            index + 1,
+            worker.kind,
+            worker.sandbox
+        )
+    });
+    let reply = request_choice(config, client.as_ref(), &request, choices, cancel);
     match reply {
         Ok(reply) => {
             outcome.reported_tokens = reply.tokens_used;
@@ -489,17 +493,49 @@ fn choose_recorded(
     Ok(outcome.applied_choice - 1)
 }
 
-fn system_one(
+/// Exercise the configured transport with synthetic choices, without recording a recovery.
+pub fn ping(ctx: &Context) -> Result<String> {
+    let config = &ctx.config.decision;
+    let client = jean_model::build(&config.transport())?;
+    let request = ChatRequest::new(
+        "Select the eligible worker. Return exactly {\"choice\":1}.",
+        "Worker 1 is ready. Worker 2 is unavailable.",
+    );
+    let reply = request_choice(
+        config,
+        client.as_ref(),
+        &request,
+        ["Ready".to_owned(), "Unavailable".to_owned()],
+        &AtomicBool::new(false),
+    )?;
+    if reply.model.as_deref() != Some(config.model.as_str())
+        || reply.truncated()
+        || parse_answer(&reply.content, 2).1 != Some(1)
+    {
+        return Err(error(
+            "decision probe returned an unexpected model or choice",
+        ));
+    }
+    Ok(format!("{} selected the eligible option", config.model))
+}
+
+fn request_choice(
     config: &DecisionConfig,
+    client: &dyn jean_model::ModelClient,
     request: &ChatRequest,
-    workers: &[&WorkerConfig],
+    choices: impl IntoIterator<Item = String>,
     cancel: &AtomicBool,
 ) -> jean_model::Result<jean_model::ChatReply> {
     use jean_model::http::{OutgoingRequest, Target};
     use std::time::Duration;
 
+    let route = match config.protocol.as_str() {
+        "system_one" => "/systemone",
+        "gateway_evaluate" => "/evaluate",
+        _ => return client.generate(request, cancel),
+    };
     let target = Target::parse(&config.base_url)?;
-    let path = target.join("/systemone");
+    let path = target.join(route);
     let mut headers = vec![("Content-Type".into(), "application/json".into())];
     if !config.api_key_env.is_empty() {
         let secret = jean_model::Secret::from_env(&config.api_key_env);
@@ -515,17 +551,8 @@ fn system_one(
         "0".into(),
         "Abstain; let the operator's standing preference decide.".into(),
     );
-    for (index, worker) in workers.iter().enumerate() {
-        criteria.insert(
-            (index + 1).to_string(),
-            format!(
-                "Preference rank {}. Connector {}, sandbox {}.",
-                index + 1,
-                worker.kind,
-                worker.sandbox
-            )
-            .into(),
-        );
+    for (index, description) in choices.into_iter().enumerate() {
+        criteria.insert((index + 1).to_string(), description.into());
     }
     let outgoing = OutgoingRequest {
         method: "POST",
@@ -546,11 +573,11 @@ fn system_one(
         return Err(ModelError::HttpStatus {
             status: response.status,
             endpoint: format!("{}{}", target.display(), outgoing.path),
-            detail: "System One rejected the request".into(),
+            detail: "decision endpoint rejected the request".into(),
         });
     }
     let shape = || ModelError::ResponseShape {
-        provider: "system_one",
+        provider: "structured decision",
         detail: "expected a numbered target choice".into(),
     };
     let value: serde_json::Value =
@@ -562,7 +589,12 @@ fn system_one(
     let usage = &value["usage"];
     let tokens_used = usage["input_tokens"]
         .as_u64()
-        .zip(usage["output_tokens"].as_u64())
+        .or_else(|| usage["inputTokens"].as_u64())
+        .zip(
+            usage["output_tokens"]
+                .as_u64()
+                .or_else(|| usage["outputTokens"].as_u64()),
+        )
         .map(|(input, output)| input.saturating_add(output));
     Ok(jean_model::ChatReply {
         content: serde_json::json!({"choice": choice}).to_string(),

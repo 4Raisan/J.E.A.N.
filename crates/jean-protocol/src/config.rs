@@ -1209,8 +1209,11 @@ impl DecisionConfig {
     }
 
     fn check(&self) -> std::result::Result<(), String> {
-        if !matches!(self.protocol.as_str(), "chat_completions" | "system_one") {
-            return Err("protocol must be chat_completions or system_one".into());
+        if !matches!(
+            self.protocol.as_str(),
+            "chat_completions" | "system_one" | "gateway_evaluate"
+        ) {
+            return Err("protocol must be chat_completions, system_one or gateway_evaluate".into());
         }
         if !(1..=10).contains(&self.timeout_secs)
             || !(1..=1_000).contains(&self.max_calls)
@@ -2947,6 +2950,23 @@ fn apply_env_overrides(
         }
     }
 
+    for (name, setting) in [
+        ("JEAN_MODEL_BASE_URL", &mut config.model.base_url),
+        ("JEAN_MODEL_API_KEY_ENV", &mut config.model.api_key_env),
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            *setting = value.trim().to_owned();
+            sources.push(ConfigSource::Env(name));
+        }
+    }
+    if let Ok(value) = std::env::var("JEAN_DECISION_CONFIG") {
+        config.decision = serde_json::from_str(&value).map_err(|_| ConfigError::Env {
+            name: "JEAN_DECISION_CONFIG",
+            reason: "expected a decision configuration object".into(),
+        })?;
+        sources.push(ConfigSource::Env("JEAN_DECISION_CONFIG"));
+    }
+
     Ok(())
 }
 
@@ -3460,12 +3480,15 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The variables `apply_env_overrides` consults.
-    const OVERRIDE_VARS: [&str; 5] = [
+    const OVERRIDE_VARS: [&str; 8] = [
         "JEAN_NO_VOICE",
         "JEAN_LOG_LEVEL",
         "JEAN_DATA_DIR",
         "JEAN_MODEL_PROVIDER",
         "JEAN_MODEL",
+        "JEAN_MODEL_BASE_URL",
+        "JEAN_MODEL_API_KEY_ENV",
+        "JEAN_DECISION_CONFIG",
     ];
 
     /// `load_layers` with the ambient overrides cleared and the environment lock

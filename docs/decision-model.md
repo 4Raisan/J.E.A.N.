@@ -25,8 +25,12 @@ endpoint. A remote endpoint requires verified HTTPS, the name of a
 credential environment variable, and a positive per-call reservation.
 For SoleAPI Jev, use `protocol = "system_one"` with
 `base_url = "https://soleapi.com/v1"` and the exact model ID.
+For Vercel AI Gateway models such as `nace-ai/drex-max-v1.1`, use
+`protocol = "gateway_evaluate"` and `base_url = "https://ai-gateway.vercel.sh/v1"`.
+The desktop **Models → Decision model** tab exposes these fields.
 
 ```text
+jean decision ping
 jean decision inspect <original-task-id>
 jean decision label <original-task-id> <expected-option-id>
 jean decision report
