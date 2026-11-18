@@ -304,12 +304,12 @@ impl Store {
              DELETE FROM events_fts;
              DELETE FROM saved_facts_fts;
              INSERT INTO tasks_fts(rowid, goal, outcome_detail)
-                 SELECT rowid, substr(goal, 1, 512),
-                        substr(COALESCE(outcome_detail, ''), 1, 512) FROM tasks;
+                 SELECT rowid, substr(jean_redact(goal), 1, 512),
+                        substr(jean_redact(outcome_detail), 1, 512) FROM tasks;
              INSERT INTO events_fts(rowid, detail)
-                 SELECT seq, substr(detail, 1, 512) FROM events;
+                 SELECT seq, substr(jean_event_text(kind, detail), 1, 512) FROM events;
              INSERT INTO saved_facts_fts(rowid, text)
-                 SELECT rowid, substr(text, 1, 512) FROM saved_facts;",
+                 SELECT rowid, jean_redact(text) FROM saved_facts;",
         )
         .map_err(StoreError::sqlite("rebuild history index"))?;
         tx.commit().map_err(StoreError::sqlite("commit rebuild"))?;
@@ -1184,5 +1184,123 @@ mod tests {
         store
             .add_saved_fact("f-after", "writes still work", None)
             .expect("a search must leave the connection writable");
+    }
+
+    #[test]
+    fn rebuild_history_index_matches_trigger_redaction_event_filtering_and_limits() {
+        use jean_protocol::event::{Event, EventKind};
+
+        let store = Store::open_in_memory().unwrap();
+        let secret = "sk-syntheticsecret9876543210";
+        store
+            .insert_task(&crate::TaskRecord::new(
+                "t-rebuild".into(),
+                format!("deploy service with Authorization: Bearer {secret}"),
+                Some("probe".into()),
+                "{}".into(),
+            ))
+            .unwrap();
+        store
+            .set_outcome(
+                "t-rebuild",
+                "succeeded",
+                &format!("finished with api_key={secret} and outcome_marker_alpha"),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "t-rebuild",
+                &Event::new(
+                    EventKind::WorkerProgress,
+                    format!("worker_only_token_xyz Authorization: Bearer {secret}"),
+                ),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "t-rebuild",
+                &Event::new(
+                    EventKind::ModelResponded,
+                    format!("model_only_token_uvw Authorization: Bearer {secret}"),
+                ),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "t-rebuild",
+                &Event::note(format!("verified_note_token_rst Authorization: Bearer {secret}")),
+            )
+            .unwrap();
+
+        let tail_fact = format!("{} tail_fact_token_beyond_512", "a".repeat(600));
+        store
+            .add_saved_fact("f-rebuild", &tail_fact, None)
+            .unwrap();
+        // Raw row in saved_facts to verify schema-level jean_redact during rebuild_history_index.
+        store
+            .conn
+            .execute(
+                "INSERT INTO saved_facts (id, text, scope, norm, source, created_at_ms, updated_at_ms)
+                 VALUES ('f-raw', ?1, '', 'raw', 'operator_command', 1, 1)",
+                rusqlite::params![format!("raw fact Authorization: Bearer {secret}")],
+            )
+            .unwrap();
+
+        let report = store.rebuild_history_index().unwrap();
+        assert!(report.is_consistent(), "{report:?}");
+
+        // Synthetic secret must never be indexed after rebuild.
+        let secret_hits = store
+            .search_history(&SearchOptions {
+                query: secret,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(secret_hits.is_empty(), "secret was indexed: {secret_hits:?}");
+        let fact_secret_hits = store.search_saved_facts(secret, None, 10).unwrap();
+        assert!(
+            fact_secret_hits.is_empty(),
+            "secret was indexed in facts: {fact_secret_hits:?}"
+        );
+
+        // WorkerProgress and ModelResponded events must stay excluded after rebuild.
+        for excluded in ["worker_only_token_xyz", "model_only_token_uvw"] {
+            let hits = store
+                .search_history(&SearchOptions {
+                    query: excluded,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(hits.is_empty(), "excluded event indexed for {excluded}: {hits:?}");
+        }
+
+        // Allowed task/event tokens and saved-fact content beyond 512 chars remain searchable.
+        assert_eq!(
+            store
+                .search_history(&SearchOptions {
+                    query: "outcome_marker_alpha",
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_history(&SearchOptions {
+                    query: "verified_note_token_rst",
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_saved_facts("tail_fact_token_beyond_512", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
