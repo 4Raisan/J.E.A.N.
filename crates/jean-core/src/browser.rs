@@ -409,6 +409,13 @@ fn workflow(
         std::thread::sleep(settle_delay(Duration::from_secs(
             config.action_timeout_secs,
         )));
+        if let Err(e) = browser.revalidate_origin(config) {
+            return stalled(steps, format!("navigation after click failed origin check: {e}"));
+        }
+    }
+
+    if let Err(e) = browser.revalidate_origin(config) {
+        return stalled(steps, format!("page origin check failed: {e}"));
     }
 
     let screenshot = artifact_dir.join("page.png");

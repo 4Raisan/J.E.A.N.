@@ -350,23 +350,34 @@ impl OwnedBrowser {
         Ok(tab)
     }
 
-    /// Navigate, and wait for the load event the page is expected to fire.
-    ///
-    /// The origin check happens **here**, on the URL string, before CDP sees it: an allowlist enforced
-    /// only by a listener inside the browser is a suggestion the browser can decline.
-    pub fn navigate(&mut self, config: &BrowserConfig, url: &str) -> Result<()> {
-        if !Origin::of(url)
-            .as_ref()
-            .is_some_and(|origin| origin.is_allowed_by(&config.allowed_origins))
-        {
+    /// Enforce that `url` stays within `[browser] allowed_origins`.
+    pub fn ensure_origin_allowed(config: &BrowserConfig, url: &str) -> Result<()> {
+        if !origin_permitted(config, url) {
             return Err(BrowserError::OriginDenied {
                 url: url.to_owned(),
                 allowed: config.allowed_origins.join(", "),
             });
         }
+        Ok(())
+    }
+
+    /// Verify that the browser's current URL is still within `[browser] allowed_origins`.
+    pub fn revalidate_origin(&mut self, config: &BrowserConfig) -> Result<String> {
+        let current = self.current_url()?;
+        Self::ensure_origin_allowed(config, &current)?;
+        Ok(current)
+    }
+
+    /// Navigate, and wait for the load event the page is expected to fire.
+    ///
+    /// The origin check happens **here**, on the URL string before CDP sees it, and again on the
+    /// resulting tab URL after navigation so a redirect cannot escape the allowlist.
+    pub fn navigate(&mut self, config: &BrowserConfig, url: &str) -> Result<()> {
+        Self::ensure_origin_allowed(config, url)?;
         let tab = self.tab()?;
         tab.navigate_to(url)?;
         tab.wait_until_navigated()?;
+        self.revalidate_origin(config)?;
         Ok(())
     }
 
@@ -793,5 +804,53 @@ mod tests {
             .expect("a profile that already holds something must be refused");
         assert!(matches!(error, BrowserError::ProfileNotEmpty(_)), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_discovery_continues_when_earlier_environment_variables_are_missing() {
+        let dir = std::env::temp_dir().join(format!("jean-browser-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let chrome = dir.join(r"Google\Chrome\Application\chrome.exe");
+        std::fs::create_dir_all(chrome.parent().unwrap()).unwrap();
+        std::fs::write(&chrome, b"stub").unwrap();
+
+        let found = detect_browser_with(|key| match key {
+            "PROGRAMFILES" | "PROGRAMFILES(X86)" => None,
+            "LOCALAPPDATA" => Some(dir.clone()),
+            _ => None,
+        });
+        assert_eq!(found.as_deref(), Some(chrome.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracketed_ipv6_urls_and_origin_revalidation_are_enforced() {
+        let ipv6_no_port = origin("http://[::1]/fixture?x=1");
+        assert_eq!(ipv6_no_port.scheme, "http");
+        assert_eq!(ipv6_no_port.host, "[::1]");
+        assert_eq!(ipv6_no_port.port, None);
+
+        let ipv6_with_port = origin("http://[2001:DB8::1]:8080/path");
+        assert_eq!(ipv6_with_port.scheme, "http");
+        assert_eq!(ipv6_with_port.host, "[2001:db8::1]");
+        assert_eq!(ipv6_with_port.port, Some(8080));
+
+        assert!(Origin::of("http://::1/unbracketed").is_none());
+        assert!(Origin::of("http://[::1]:notaport/x").is_none());
+
+        let allowed = config_with(&["http://[::1]"]);
+        assert!(origin_permitted(&allowed, "http://[::1]/fixture"));
+        assert!(origin_permitted(&allowed, "http://[::1]:43100/fixture"));
+        assert!(!origin_permitted(&allowed, "http://[2001:db8::1]/fixture"));
+
+        let pinned_ipv6 = config_with(&["http://[::1]:8080"]);
+        assert!(origin_permitted(&pinned_ipv6, "http://[::1]:8080/fixture"));
+        assert!(!origin_permitted(&pinned_ipv6, "http://[::1]:9090/fixture"));
+        assert!(!origin_permitted(&pinned_ipv6, "http://[::1]/fixture"));
+
+        assert!(OwnedBrowser::ensure_origin_allowed(&allowed, "http://[::1]:3000/ok").is_ok());
+        let denied = OwnedBrowser::ensure_origin_allowed(&allowed, "https://evil.example/landing")
+            .expect_err("redirect to unlisted origin must be denied");
+        assert!(matches!(denied, BrowserError::OriginDenied { .. }));
     }
 }
