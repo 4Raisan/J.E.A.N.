@@ -1823,6 +1823,7 @@ dependencies = [
  "anyhow",
  "muda",
  "tray-icon",
+ "windows 0.62.2",
 ]
 
 [[package]]

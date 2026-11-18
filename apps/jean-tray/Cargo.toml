@@ -13,3 +13,4 @@ path = "src/main.rs"
 muda = "0.21.2"
 tray-icon = "0.26.1"
 anyhow = "1.0"
+windows.workspace = true
