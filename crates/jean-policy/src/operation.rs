@@ -54,6 +54,10 @@ pub enum OperationKind {
     /// is a separate kind again — `InspectProcess` and `LocateFile` are read-only probes and a UIA tree
     /// read is not the same category of nothing as a button press.
     OperateDesktop,
+    /// Sending top-level workspace listings and text files to a model to complete a workspace goal.
+    WorkspaceGoalAccess,
+    /// Sending one window's accessibility labels and control state to a model to complete an app goal.
+    DesktopGoalObservation,
 }
 
 impl OperationKind {
@@ -73,7 +77,18 @@ impl OperationKind {
             Self::McpCall => "mcp_call",
             Self::DriveBrowser => "drive_browser",
             Self::OperateDesktop => "operate_desktop",
+            Self::WorkspaceGoalAccess => "workspace_goal_access",
+            Self::DesktopGoalObservation => "desktop_goal_observation",
         }
+    }
+
+    /// Operations that send workspace contents or live desktop accessibility state to a model
+    /// always require an explicit per-task confirmation and are never remembered in the ledger.
+    pub const fn requires_explicit_approval(self) -> bool {
+        matches!(
+            self,
+            Self::WorkspaceGoalAccess | Self::DesktopGoalObservation
+        )
     }
 }
 

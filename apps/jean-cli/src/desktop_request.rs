@@ -150,6 +150,52 @@ fn route(
 ) -> anyhow::Result<ExitCode> {
     let goal = options.goal.trim();
     let (command, arguments) = split_first(goal);
+    if command == "/workspace" {
+        let root = options.workspace.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Select a workspace with Browse first."))?;
+        return crate::workspace_goal::run(ctx, root, arguments, prompt, cancel);
+    }
+    if command == "/desktop" {
+        let task = serde_json::from_str(arguments)?;
+        return crate::desktop_goal::run(ctx, task, prompt, cancel);
+    }
+    if command == "/browse" {
+        anyhow::ensure!(
+            arguments.starts_with("https://") || arguments.starts_with("http://"),
+            "Enter a browser URL (example: /browse https://example.com/)."
+        );
+        let request = jean_core::browser::BrowserRequest {
+            url: arguments.to_owned(),
+            inspect: None,
+            r#type: None,
+            click: None,
+            expect: None,
+        };
+        let report = jean_core::browser::run(ctx, &request, prompt)?;
+        if !report.title.is_empty() {
+            println!("result: {}\n{}", report.title, report.url);
+            if let Some(path) = &report.screenshot {
+                println!("Screenshot: {}", path.display());
+            }
+        } else {
+            println!("reason: {}", report.verdict.detail());
+        }
+        return Ok(ExitCode::from(crate::phase3::browser_exit(&report) as u8));
+    }
+    if command == "/windows" {
+        let report = jean_core::mcp::call_tool(ctx, "cua", "list_windows", json!({}), prompt)?;
+        if matches!(report.decision, jean_policy::Decision::Denied(_)) || report.tool_error {
+            let reason = report
+                .notes
+                .last()
+                .cloned()
+                .unwrap_or_else(|| report.decision.to_string());
+            println!("reason: {reason}");
+        } else {
+            println!("result: {}", report.text.trim());
+        }
+        return Ok(ExitCode::from(report.exit_status() as u8));
+    }
     if command == "/click" {
         let (pid, window_id, label, before, after): (u32, u64, String, String, String) =
             serde_json::from_str(arguments).map_err(|_| {
@@ -245,7 +291,7 @@ fn route(
     anyhow::ensure!(!goal.is_empty(), "enter the goal for the worker");
     anyhow::ensure!(
         !goal.starts_with('/'),
-        "unknown task command; use /tool, /delegate, /resume, /review, /apply, or /discard"
+        "unknown task command; use /desktop, /tool, /delegate, /resume, /review, /apply, or /discard"
     );
     if explicit_delegate
         || requested_worker.is_some()
@@ -278,7 +324,10 @@ fn route(
         );
         ctx.config.workspace.root = workspace.display().to_string();
     }
-    crate::phase2::do_with_prompt(
+    if let Some(task) = crate::desktop_goal::opening_request(goal) {
+        return crate::desktop_goal::run(ctx, task, prompt, cancel);
+    }
+    let result = crate::phase2::do_with_prompt(
         ctx,
         crate::phase2::DoOptions {
             goal: goal.into(),
@@ -287,7 +336,16 @@ fn route(
         },
         prompt,
         cancel,
-    )
+    );
+    if result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<jean_core::CoreError>(),
+            Some(jean_core::CoreError::PlanRejected { .. })
+        )
+    }) {
+        println!("next: For an open app, choose More → Work in an app. For a code change, select a workspace and use /delegate followed by the goal.");
+    }
+    result
 }
 
 fn split_first(text: &str) -> (&str, &str) {

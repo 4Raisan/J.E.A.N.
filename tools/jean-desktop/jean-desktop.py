@@ -868,7 +868,33 @@ class Overlay(QWidget):
             action.setChecked(key in self.open_sections)
             action.toggled.connect(lambda visible, key=key: self._toggle_section(key, visible))
         self.more_menu.addSeparator()
+        self.more_menu.addAction("Work in an app…", self._work_in_app)
+        self.more_menu.addAction("Work in a workspace…", self._work_in_workspace)
         self.more_menu.addAction("Edit layout…", self._edit_layout)
+
+    def _work_in_app(self):
+        if self.busy or self.voice_turn is not None:
+            return
+        window, accepted = QInputDialog.getText(self, "Work in an app", "Open app or window title")
+        if not accepted or not window.strip():
+            return
+        goal, accepted = QInputDialog.getText(self, "Work in an app", "What should J.E.A.N. do?",
+                                              text=self.entry.text())
+        if accepted and goal.strip():
+            self.entry.clear()
+            self.busy = True
+            self._run_task("/desktop " + json.dumps({"window": window.strip(), "goal": goal.strip()}))
+
+    def _work_in_workspace(self):
+        if self.busy or self.voice_turn is not None:
+            return
+        goal, accepted = QInputDialog.getText(self, "Work in a workspace",
+                                              "What should J.E.A.N. do in the workspace selected with Browse?",
+                                              text=self.entry.text())
+        if accepted and goal.strip():
+            self.entry.clear()
+            self.busy = True
+            self._run_task("/workspace " + goal.strip())
 
     def _toggle_section(self, key, visible):
         anchor = self._ring_position()
@@ -1823,7 +1849,7 @@ class Overlay(QWidget):
         process = self.task_proc
         if process is None or self.cancel_sent:
             return
-        if self.yolo.isChecked():
+        if self.yolo.isChecked() and event["operation"] not in ("desktop_goal_observation", "workspace_goal_access"):
             self._log_activity(f'YOLO approved {event["operation"]}: {event["summary"]}')
             self._send_task_input({"kind": "approve", "id": event["id"], "allow": True})
             return
@@ -1831,6 +1857,7 @@ class Overlay(QWidget):
             self.approval.reject()
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Approve J.E.A.N. action")
+        dialog.setProperty("operation", event["operation"])
         dialog.setModal(False)
         dialog.setTextFormat(Qt.TextFormat.PlainText)
         dialog.setText(event["summary"])

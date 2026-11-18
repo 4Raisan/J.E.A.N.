@@ -1692,7 +1692,7 @@ fn process_target(request: &ProcessRequest) -> String {
 /// The username, from the environment, with a fallback that says the lookup failed
 /// rather than inventing `unknown`: the audit line is the record of who authorised an
 /// act, and a made-up author is worse than a missing one.
-pub(crate) fn actor() -> String {
+pub fn actor() -> String {
     for name in ["USERNAME", "USER", "LOGON_USER"] {
         if let Ok(value) = std::env::var(name) {
             if !value.trim().is_empty() {

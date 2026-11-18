@@ -79,6 +79,8 @@ use jean_protocol::ipc::validate_task_id;
 use jean_store::{format_ms, EventRecord, TaskFilter, ToolRunRecord};
 use jean_tools::SortKey;
 
+mod desktop_goal;
+mod workspace_goal;
 mod desktop_request;
 mod memory;
 mod owner_preferences;

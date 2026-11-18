@@ -125,38 +125,47 @@ impl Policy {
 
         // 3. The capabilities that need asking. A tool with no declared
         //    capabilities has nothing in `require_approval` to match, and lands on
-        //    the owner-command authority below.
+        //    the owner-command authority below — except for operations whose kind
+        //    always requires explicit per-task approval before sending observations
+        //    to a model (`WorkspaceGoalAccess`, `DesktopGoalObservation`).
+        let explicit = op.kind.requires_explicit_approval();
         let sensitive: Vec<String> = op
             .capabilities
             .iter()
-            .filter(|c| self.requires_approval(c))
+            .filter(|c| explicit || self.requires_approval(c))
             .cloned()
             .collect();
 
-        if sensitive.is_empty() {
+        if !explicit && sensitive.is_empty() {
             return Ok(Decision::allowed(Authority::OwnerCommand));
         }
 
         // 4. The operator's own run, for exactly this step of exactly this plan at exactly this
         //    resolved scope. Consulted before the ledger and before the prompt; unable to reach
-        //    anything the two checks above refused.
-        if let Some(scope) = scope {
-            if scope.grant.covers(scope.plan_id, scope.step_key, op) {
-                return Ok(Decision::allowed(Authority::RunScope));
+        //    anything the two checks above refused, and never bypasses explicit model-observation
+        //    consent.
+        if !explicit {
+            if let Some(scope) = scope {
+                if scope.grant.covers(scope.plan_id, scope.step_key, op) {
+                    return Ok(Decision::allowed(Authority::RunScope));
+                }
             }
         }
 
         // 5. Already agreed to — for exactly this operation with exactly these
         //    arguments. The digest is the whole lookup; nothing else matches.
         let digest = op.scope_digest();
-        if let Some(found) = store.find_approval(&digest)? {
-            store.touch_approval(found.id)?;
-            return Ok(Decision::allowed(Authority::Remembered {
-                id: found.id,
-                granted_at_ms: found.granted_at_ms,
-            }));
+        if !explicit {
+            if let Some(found) = store.find_approval(&digest)? {
+                store.touch_approval(found.id)?;
+                return Ok(Decision::allowed(Authority::Remembered {
+                    id: found.id,
+                    granted_at_ms: found.granted_at_ms,
+                }));
+            }
         }
 
+        let allow_remember = self.config.allow_remember && !explicit;
         let answer = {
             // Built inside this block: `Prompt` borrows `op` and `sensitive`, and
             // `digest` is moved into the ledger below.
@@ -166,7 +175,7 @@ impl Policy {
                 tool_id: op.tool_id.as_deref(),
                 tier: op.tier.as_str(),
                 capabilities: &sensitive,
-                allow_remember: self.config.allow_remember,
+                allow_remember,
             };
             prompter.ask(&prompt)?
         };
@@ -175,7 +184,7 @@ impl Policy {
             Answer::Denied(reason) => Ok(Decision::Denied(reason)),
             Answer::ApproveOnce => Ok(Decision::allowed(Authority::ApprovedThisTime)),
             Answer::ApproveAndRemember => {
-                if !self.config.allow_remember {
+                if !allow_remember {
                     // An answer that was not offered is a prompter bug, not an
                     // operator's wish. Refuse rather than silently widening it.
                     return Err(PolicyError::RememberNotAllowed);

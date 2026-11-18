@@ -793,7 +793,7 @@ fn cmd_browser_run(
 /// Proven is 0, an expectation that did not hold is 1, and a run that could not be judged is 3 — the
 /// same vocabulary `jean delegate` uses, so a script does not have to learn a second one. A refusal is
 /// 4: nothing about the page was wrong, the operator said no.
-fn browser_exit(report: &jean_core::browser::BrowserReport) -> i32 {
+pub(crate) fn browser_exit(report: &jean_core::browser::BrowserReport) -> i32 {
     match (report.state, report.verdict.label()) {
         (_, "proven") => 0,
         (jean_protocol::TaskState::NeedsAttention, _) => 3,

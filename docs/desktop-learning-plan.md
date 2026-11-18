@@ -1,5 +1,19 @@
 # J.E.A.N. desktop learning
 
+## Give J.E.A.N. a new task
+
+Choose **More → Work in an app…**, enter the title of an open window, and describe
+the outcome. J.E.A.N. uses the main model and the current window's accessibility
+controls to pick the next action. It asks before sharing the control labels and
+task with the configured model. Each action uses native accessibility patterns
+and checks for a change before continuing. The run stops on missing or ambiguous
+controls, an unconfirmed change, or after six actions.
+
+In Task mode, a request such as `Open Spotify and play a Michael Jackson song`
+can also launch the named app. Playback depends on the controls and verification
+state that the installed app exposes. For a coding task, select a workspace and
+use `/delegate` followed by the requested change.
+
 J.E.A.N. learns reusable actions by storing structured local workflows. A workflow records an action and its arguments. A future workflow can also record how to resolve its target and how to verify the result. External coding agents can build and test this feature with synthetic data.
 
 ## Try the first stage
