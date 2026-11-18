@@ -120,10 +120,42 @@ pub struct Origin {
     pub port: Option<u16>,
 }
 
+fn split_host_port(authority: &str) -> Option<(String, Option<u16>)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (ipv6, tail) = rest.split_once(']')?;
+        if ipv6.is_empty() {
+            return None;
+        }
+        let host = format!("[{}]", ipv6.to_ascii_lowercase());
+        if tail.is_empty() {
+            return Some((host, None));
+        }
+        let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+        Some((host, Some(port)))
+    } else {
+        if authority.contains(']') {
+            return None;
+        }
+        match authority.rsplit_once(':') {
+            Some((h, p)) => {
+                if h.contains(':') {
+                    return None;
+                }
+                let port = p.parse::<u16>().ok()?;
+                Some((h.to_ascii_lowercase(), Some(port)))
+            }
+            None => Some((authority.to_ascii_lowercase(), None)),
+        }
+    }
+}
+
 impl Origin {
     /// The origin of an absolute URL, or `None` when it has no scheme to ask about.
     pub fn of(url: &str) -> Option<Origin> {
         let (scheme, rest) = url.split_once("://")?;
+        if scheme.is_empty() {
+            return None;
+        }
         let authority = rest
             .split(['/', '?', '#'])
             .next()
@@ -131,13 +163,10 @@ impl Origin {
             .rsplit('@')
             .next()
             .unwrap_or_default();
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (h.to_owned(), p.parse::<u16>().ok()),
-            None => (authority.to_owned(), None),
-        };
+        let (host, port) = split_host_port(authority)?;
         Some(Origin {
             scheme: scheme.to_ascii_lowercase(),
-            host: host.to_ascii_lowercase(),
+            host,
             port,
         })
     }
@@ -150,14 +179,13 @@ impl Origin {
     pub fn is_allowed_by(&self, allowed: &[String]) -> bool {
         allowed.iter().any(|entry| {
             let entry = entry.trim();
-            if let Some((scheme, authority)) = entry.split_once("://") {
-                let (host, port) = match authority.rsplit_once(':') {
-                    Some((h, p)) => (h.to_ascii_lowercase(), p.parse::<u16>().ok()),
-                    None => (authority.to_ascii_lowercase(), None),
+            if entry.contains("://") {
+                let Some(want) = Self::of(entry) else {
+                    return false;
                 };
-                self.scheme == scheme.to_ascii_lowercase()
-                    && self.host == host
-                    && port.is_none_or(|want| self.port == Some(want))
+                self.scheme == want.scheme
+                    && self.host == want.host
+                    && want.port.is_none_or(|port| self.port == Some(port))
             } else {
                 // A bare scheme (`file`): there is no host to check, so the scheme is the whole bound.
                 self.scheme == entry.to_ascii_lowercase()
@@ -168,21 +196,11 @@ impl Origin {
 
 /// The debugging endpoint, once it has been read and checked.
 fn endpoint_is_loopback(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("ws://") else {
+    let Some(origin) = Origin::of(url) else {
         return false;
     };
-    let host = rest
-        .split(['/', '?'])
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
-    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
-    host.eq_ignore_ascii_case("127.0.0.1")
-        || host.eq_ignore_ascii_case("localhost")
-        || host.eq_ignore_ascii_case("[::1]")
-        || host == "::1"
+    origin.scheme == "ws"
+        && matches!(origin.host.as_str(), "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// A browser this process started, with the handles that make that claim true.
@@ -603,10 +621,16 @@ pub const KNOWN_BROWSERS: &[&str] = &[
 /// blocker; nothing here downloads or installs a browser, which is the difference between a driver and
 /// an installer.
 pub fn detect_browser() -> Option<PathBuf> {
+    detect_browser_with(|key| std::env::var_os(key).map(PathBuf::from))
+}
+
+fn detect_browser_with(lookup: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
     KNOWN_BROWSERS.iter().find_map(|relative| {
         for key in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
-            let root = std::env::var(key).ok()?;
-            let candidate = Path::new(&root).join(relative);
+            let Some(root) = lookup(key) else {
+                continue;
+            };
+            let candidate = root.join(relative);
             if candidate.is_file() {
                 return Some(candidate);
             }
