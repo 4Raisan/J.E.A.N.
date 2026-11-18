@@ -136,6 +136,13 @@ pub fn capture_once(
         let _ = events.send(RecognitionEvent::Failed { activation, reason });
         return;
     }
+    struct ResetOnExit<'a>(&'a mut dyn crate::speech::Recognizer);
+    impl Drop for ResetOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.reset();
+        }
+    }
+    let guard = ResetOnExit(recognizer);
     let device_rate = capture.format().sample_rate;
     let mut resampler = Resampler::new(device_rate, config.sample_rate);
     let mut buffer = BoundedPcm::for_duration(config.sample_rate, config.capture_buffer_ms);
@@ -154,7 +161,7 @@ pub fn capture_once(
                         sample_rate: config.sample_rate,
                         samples: frames,
                     };
-                    if let Err(reason) = recognizer.feed(&chunk, cancel) {
+                    if let Err(reason) = guard.0.feed(&chunk, cancel) {
                         if cancel.is_cancelled() {
                             return;
                         }
@@ -186,11 +193,14 @@ pub fn capture_once(
             sample_rate: config.sample_rate,
             samples: tail,
         };
-        if recognizer.feed(&chunk, cancel).is_err() && cancel.is_cancelled() {
+        if let Err(reason) = guard.0.feed(&chunk, cancel) {
+            if !cancel.is_cancelled() {
+                let _ = events.send(RecognitionEvent::Failed { activation, reason });
+            }
             return;
         }
     }
-    match recognizer.finish(cancel) {
+    match guard.0.finish(cancel) {
         Ok(_) if cancel.is_cancelled() => {
             // A release that was cancelled mid-flush produces no transcript, even
             // from an engine that finished anyway: the operator already let go of

@@ -29,7 +29,10 @@ use jean_protocol::config::{SpeechRecognizer, VoiceConfig};
 use crate::assets;
 use crate::audio::Pcm;
 use crate::device::CancelFlag;
-use crate::speech::{EngineFactory, Recognizer, Synthesizer};
+use crate::speech::{
+    EngineFactory, OfflineDecoder, OfflineSherpaRecognizer, OnlineDecoder, OnlineStreamBackend,
+    Recognizer, SherpaRecognizer, Synthesizer, VadBackend,
+};
 
 /// Silero v5 runs at 16 kHz with a 512-sample window. At any other engine rate
 /// the VAD is skipped rather than fed audio it cannot interpret.
@@ -265,171 +268,79 @@ impl SherpaEngine {
     }
 }
 
-struct SherpaRecognizer {
-    recognizer: OnlineRecognizer,
-    vad: Option<VoiceActivityDetector>,
-    stream: Option<sherpa_onnx::OnlineStream>,
-    sample_rate: u32,
-}
-
-/// Parakeet TDT is an offline model: collect the bounded press, then decode it
-/// once on release. This implements the same worker interface as Zipformer.
-struct OfflineSherpaRecognizer {
-    recognizer: OfflineRecognizer,
-    samples: Vec<f32>,
-    sample_rate: u32,
-    max_frames: usize,
-    active: bool,
-}
-
-impl Recognizer for OfflineSherpaRecognizer {
-    fn begin(&mut self) -> Result<(), String> {
-        if self.active {
-            return Err("Parakeet recognizer is already capturing".into());
-        }
-        self.samples.clear();
-        self.active = true;
-        Ok(())
+impl OnlineStreamBackend for sherpa_onnx::OnlineStream {
+    fn accept_waveform(&self, sample_rate: i32, samples: &[f32]) {
+        sherpa_onnx::OnlineStream::accept_waveform(self, sample_rate, samples);
     }
 
-    fn feed(&mut self, pcm: &Pcm, cancel: &CancelFlag) -> Result<(), String> {
-        if cancel.is_cancelled() {
-            return Err("recognition cancelled".into());
-        }
-        if !self.active {
-            return Err("audio arrived before push-to-talk activation".into());
-        }
-        if pcm.sample_rate != self.sample_rate {
-            return Err(format!(
-                "Parakeet expects {} Hz PCM, got {} Hz",
-                self.sample_rate, pcm.sample_rate
-            ));
-        }
-        if self.samples.len().saturating_add(pcm.samples.len()) > self.max_frames {
-            return Err("Parakeet capture exceeded voice.capture_timeout_ms".into());
-        }
-        self.samples.extend_from_slice(&pcm.samples);
-        Ok(())
+    fn input_finished(&self) {
+        sherpa_onnx::OnlineStream::input_finished(self);
+    }
+}
+
+impl OnlineDecoder for OnlineRecognizer {
+    type Stream = sherpa_onnx::OnlineStream;
+
+    fn create_stream(&self) -> Self::Stream {
+        OnlineRecognizer::create_stream(self)
     }
 
-    fn finish(&mut self, cancel: &CancelFlag) -> Result<String, String> {
+    fn is_ready(&self, stream: &Self::Stream) -> bool {
+        OnlineRecognizer::is_ready(self, stream)
+    }
+
+    fn decode(&self, stream: &Self::Stream) {
+        OnlineRecognizer::decode(self, stream);
+    }
+
+    fn get_result(&self, stream: &Self::Stream) -> Option<String> {
+        OnlineRecognizer::get_result(self, stream).map(|result| result.text)
+    }
+}
+
+impl VadBackend for VoiceActivityDetector {
+    fn reset(&self) {
+        VoiceActivityDetector::reset(self);
+    }
+
+    fn accept_waveform(&self, samples: &[f32]) {
+        VoiceActivityDetector::accept_waveform(self, samples);
+    }
+
+    fn is_empty(&self) -> bool {
+        VoiceActivityDetector::is_empty(self)
+    }
+
+    fn front_samples(&self) -> Option<Vec<f32>> {
+        VoiceActivityDetector::front(self).map(|segment| segment.samples().to_vec())
+    }
+
+    fn pop(&self) {
+        VoiceActivityDetector::pop(self);
+    }
+
+    fn flush(&self) {
+        VoiceActivityDetector::flush(self);
+    }
+}
+
+impl OfflineDecoder for OfflineRecognizer {
+    fn decode(
+        &self,
+        sample_rate: u32,
+        samples: &[f32],
+        cancel: &CancelFlag,
+    ) -> Result<String, String> {
+        let stream = self.create_stream();
+        stream.accept_waveform(sample_rate as i32, samples);
+        OfflineRecognizer::decode(self, &stream);
         if cancel.is_cancelled() {
-            return Err("recognition cancelled".into());
-        }
-        if !std::mem::take(&mut self.active) {
-            return Err("Parakeet recognizer was not capturing".into());
-        }
-        if self.samples.is_empty() {
-            return Err("Parakeet capture contained no audio frames".into());
-        }
-        let stream = self.recognizer.create_stream();
-        stream.accept_waveform(self.sample_rate as i32, &self.samples);
-        self.recognizer.decode(&stream);
-        if cancel.is_cancelled() {
-            self.samples.clear();
             return Err("recognition cancelled".into());
         }
         let result = stream
             .get_result()
             .ok_or_else(|| "sherpa-onnx returned no Parakeet result".to_owned())?;
-        self.samples.clear();
         Ok(result.text.trim().to_owned())
-    }
-}
-
-impl SherpaRecognizer {
-    fn decode_ready(&mut self, cancel: &CancelFlag) -> Result<(), String> {
-        let stream = self
-            .stream
-            .as_ref()
-            .ok_or("recognition has no active stream")?;
-        while self.recognizer.is_ready(stream) {
-            if cancel.is_cancelled() {
-                return Err("recognition cancelled".into());
-            }
-            self.recognizer.decode(stream);
-        }
-        Ok(())
-    }
-
-    fn accept(&mut self, samples: &[f32], cancel: &CancelFlag) -> Result<(), String> {
-        let stream = self
-            .stream
-            .as_ref()
-            .ok_or("recognition has no active stream")?;
-        match self.vad.as_ref() {
-            Some(vad) => {
-                vad.accept_waveform(samples);
-                while !vad.is_empty() {
-                    if cancel.is_cancelled() {
-                        return Err("recognition cancelled".into());
-                    }
-                    if let Some(segment) = vad.front() {
-                        stream.accept_waveform(self.sample_rate as i32, segment.samples());
-                    }
-                    vad.pop();
-                }
-            }
-            None => stream.accept_waveform(self.sample_rate as i32, samples),
-        }
-        self.decode_ready(cancel)
-    }
-}
-
-impl Recognizer for SherpaRecognizer {
-    fn begin(&mut self) -> Result<(), String> {
-        if self.stream.is_some() {
-            return Err("a recognition stream is already open".into());
-        }
-        if let Some(vad) = self.vad.as_ref() {
-            vad.reset();
-        }
-        self.stream = Some(self.recognizer.create_stream());
-        Ok(())
-    }
-
-    fn feed(&mut self, pcm: &Pcm, cancel: &CancelFlag) -> Result<(), String> {
-        if cancel.is_cancelled() {
-            return Err("recognition cancelled".into());
-        }
-        self.accept(&pcm.samples, cancel)
-    }
-
-    fn finish(&mut self, cancel: &CancelFlag) -> Result<String, String> {
-        if cancel.is_cancelled() {
-            return Err("recognition cancelled".into());
-        }
-        if let Some(vad) = self.vad.as_ref() {
-            vad.flush();
-            while !vad.is_empty() {
-                if let Some(segment) = vad.front() {
-                    if let Some(stream) = self.stream.as_ref() {
-                        stream.accept_waveform(self.sample_rate as i32, segment.samples());
-                    }
-                }
-                vad.pop();
-            }
-        }
-        // Tail padding lets the transducer emit its last frames, and the length is
-        // measured rather than guessed: at 0.3 s the bundle's 8 kHz clip lost its final
-        // word (`…APPREHENS`) while adding 100 ms of silence to the file recovered it,
-        // so the model wants roughly 0.4 s of trailing audio after the speech. 0.wav and
-        // 1.wav need nothing because they end in their own recorded silence. Bounded, so
-        // a release cannot turn into an unbounded decode.
-        let tail = (self.sample_rate as f32 * 0.5).round() as usize;
-        if let Some(stream) = self.stream.as_ref() {
-            stream.accept_waveform(self.sample_rate as i32, &vec![0.0; tail]);
-            stream.input_finished();
-        }
-        self.decode_ready(cancel)?;
-        let text = self
-            .stream
-            .as_ref()
-            .and_then(|stream| self.recognizer.get_result(stream))
-            .map(|result| result.text.trim().to_owned())
-            .unwrap_or_default();
-        self.stream = None;
-        Ok(text)
     }
 }
 
