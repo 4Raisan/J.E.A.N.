@@ -49,6 +49,8 @@ def main(argv=None):
     parser.add_argument("--endpoint", type=float, default=1.4,
                         help="seconds of silence after speech that ends capture; "
                              "0 disables endpointing")
+    parser.add_argument("--idle", type=float, default=0,
+                        help="seconds to wait for initial speech; 0 uses the hard cap")
     args = parser.parse_args(argv)
     if not 1 <= args.max <= 30:
         parser.error("--max must be between 1 and 30 seconds")
@@ -125,6 +127,8 @@ def main(argv=None):
                 if args.stop_file is not None and args.stop_file.exists():
                     break
                 if now - started >= args.max:
+                    break
+                if args.idle > 0 and speech_at is None and now - started >= args.idle:
                     break
                 if (args.endpoint > 0 and speech_at is not None
                         and now - speech_at >= args.endpoint

@@ -283,10 +283,23 @@ class ModelSettings(QDialog):
                 line("reserve_per_call_micros", "Per-call reserve (millionths of USD)")
                 line("budget_micros", "Total reserve budget (millionths of USD)")
             hint = QLabel({
-                "main": "Test can check the saved API key and model here. Select OpenAI-compatible and save to use these settings for chat and planning.",
+                "main": "",
                 "decision": "Used only to choose among eligible workers during checkpoint recovery.",
                 "listening": "In Google AI Studio choose Gemini 3.5 Transcribe Live. Talk audio streams to Google with this backend.",
             }[role])
+            if role == "main":
+                provider = self.fields[role]["provider"]
+
+                def update_main_hint():
+                    hint_text = {
+                        "": "Chat and task planning inherit the JEAN configuration. The API URL and model shown here are inactive while this provider is selected.",
+                        "none": "The desktop main model is disabled.",
+                    }.get(provider.currentData(), "Save to use this provider and model for chat and task planning.")
+                    main_hint.setText(hint_text)
+
+                main_hint = hint
+                provider.currentIndexChanged.connect(update_main_hint)
+                update_main_hint()
             hint.setWordWrap(True)
             form.addRow(hint)
         self.status = QLabel()

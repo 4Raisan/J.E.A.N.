@@ -68,7 +68,9 @@ CHAT_SETUP_HINT = (
 )
 
 WAKE_NAME = r"(?:j\.?\s*e\.?\s*a\.?\s*n\.?|gene|dean|gee|g)"
-WAKE_ADDRESS = re.compile(rf"^(?:hey\s+)?{WAKE_NAME}(?:[\s,.:!?]+|$)", re.IGNORECASE)
+WAKE_ADDRESS = re.compile(
+    rf"^(?:hey\s+)?(?:{WAKE_NAME}(?:[\s,.:!?]+|$)|ji[,.:!?]+\s*)", re.IGNORECASE
+)
 REQUEST_PREFIX = re.compile(
     r"^(?:(?:please|can you|could you|would you|"
     r"i want you to|i need you to|i would like you to|i'd like you to)[, ]+)+",
@@ -76,7 +78,7 @@ REQUEST_PREFIX = re.compile(
 )
 ACTION_REQUEST = re.compile(
     r"(?:open|browse|navigate|go to|visit|search|look up|run|execute|build|test|"
-    r"create|write|edit|fix|update|install|remove|delete|move|copy|launch|start|"
+    r"create|make|add|write|edit|fix|update|install|remove|delete|move|copy|launch|start|"
     r"check|implement|find|delegate|play|watch|put on|clean|empty|restore)\b", re.IGNORECASE
 )
 BROWSER_PHRASE = (
@@ -98,6 +100,12 @@ def site_request_text(text):
 def web_request(text):
     text = site_request_text(text)
     text = re.sub(r"\byou\s+tube\b", "YouTube", text, flags=re.IGNORECASE)
+    if re.fullmatch(
+        r"play (?:anything|any video) on (?:my |the )?youtube(?:\.com)?"
+        r"(?:[?.!]\s+open (?:that|it) on the browser(?: as well)?)?[.?!]?",
+        text, re.IGNORECASE,
+    ):
+        return "https://www.youtube.com/"
     if re.fullmatch(r"YouTube(?: please)?\.?", text, re.IGNORECASE):
         return "https://www.youtube.com/"
     match = SITE_REQUEST.fullmatch(text)
@@ -271,8 +279,16 @@ def request_mode(mode, text):
     if mode != "smart":
         return mode
     return ("task" if text.startswith("/") or web_request(text) or gmail_request(text)
+            or youtube_tab_playback(text)
             or ACTION_REQUEST.match(REQUEST_PREFIX.sub("", WAKE_ADDRESS.sub("", text)))
             or trash_request(text) else "chat")
+
+
+def youtube_tab_playback(text):
+    return bool(re.search(
+        r"\b(?:youtube|you tube)\b.*\bplay\b.*\b(?:open |current |that )?tab\b"
+        r"|\bplay\b.*\b(?:youtube|you tube)\b.*\btab\b", text, re.IGNORECASE
+    ))
 
 @dataclass
 class VoiceTurn:
@@ -281,6 +297,8 @@ class VoiceTurn:
     task: object
     directory: tempfile.TemporaryDirectory
     released_at: float | None = None
+    conversational: bool = False
+    heard_speech: bool = False
     abandoned: bool = False
     asr_fallback: bool = False
     approval: object = None
@@ -537,6 +555,8 @@ class Overlay(QWidget):
         self.listening = False
         self.capture_proc = None
         self.voice_turn = None
+        self.voice_session = False
+        self.voice_reply = None
         self.mic_level = 0.0
         self.speaking_proc = None
         self._stopped_speech = set()
@@ -837,7 +857,8 @@ class Overlay(QWidget):
         self.badge.setText("✦  JEAN · YOLO" if enabled else "✦  JEAN")
         self.voice_settings.setValue("yolo", enabled)
         self._log_activity(f"YOLO {'enabled' if enabled else 'disabled'}")
-        if enabled and self.approval is not None:
+        if (enabled and self.approval is not None
+                and self.approval.property("operation") not in ("desktop_goal_observation", "workspace_goal_access")):
             self._answer_approval("task approved", self.approval)
 
     def toggle_mode(self):
@@ -953,6 +974,7 @@ class Overlay(QWidget):
         self.activity_window.raise_()
 
     def _terminate(self):
+        self.voice_session = False
         self.stop_speech_playback()
         if self.voice_turn is not None:
             self.voice_turn.abandoned = True
@@ -1107,6 +1129,7 @@ class Overlay(QWidget):
 
     def _wake_idle(self):
         return (self.wake_button.isChecked() and self.voice_turn is None
+                and self.voice_reply is None
                 and not self.busy and self.task_proc is None
                 and self.approval is None and self.speaking_proc is None
                 and time.monotonic() >= self.output_quiet_at)
@@ -1131,6 +1154,12 @@ class Overlay(QWidget):
             self._stop_wake_listener()
             return
         terminate_only = not self._wake_idle()
+        if self.voice_session and not terminate_only:
+            self._stop_wake_listener()
+            self._start_capture(conversational=True)
+            if self.voice_turn is None:
+                self.voice_session = False
+            return
         approval = self.approval if self.voice_turn is None else None
         if approval is not None and approval is self.approval_listener_failed:
             approval = None
@@ -1195,9 +1224,13 @@ class Overlay(QWidget):
                 approval.setInformativeText("Use Talk, type “task approved”, or click Yes.")
         elif code or "WAKE" not in output:
             self.wake_button.setChecked(False)
-            self.show_result("Wake listener unavailable", error or proc.errorString())
+            self._show_wake_error(error or proc.errorString())
         elif not self._playback_blocks_wake() and self._wake_idle():
-            self._activate_talk()
+            self.voice_session = True
+            if not self.card.isVisible():
+                self.toggle_message()
+            self.raise_()
+            self._sync_wake_listener()
 
     def toggle_listen(self):
         if self.listening:
@@ -1205,7 +1238,7 @@ class Overlay(QWidget):
         else:
             self._start_capture()
 
-    def _start_capture(self):
+    def _start_capture(self, *, conversational=False):
         task = self.task_proc if self.cancel_task_button.isEnabled() else None
         if self.voice_turn is not None or (self.busy and task is None and self.approval is None):
             self.bridge.result.emit("JEAN needs a moment",
@@ -1214,18 +1247,21 @@ class Overlay(QWidget):
         self._stop_wake_listener()
         self.stop_speech_playback()
         try:
-            microphone = self._microphone()
+            microphone = self._microphone(wake=conversational)
             directory = tempfile.TemporaryDirectory(prefix="jean-voice-", ignore_cleanup_errors=True)
         except OSError as exc:
             self.show_result("Voice unavailable", str(exc))
             return
         root = Path(directory.name)
-        turn = VoiceTurn(self.mode, self.backend, task, directory, approval=self.approval)
+        turn = VoiceTurn(self.mode, self.backend, task, directory,
+                         conversational=conversational, approval=self.approval)
         try:
             argv, cwd = voice_bench.capture_command(
                 root / "clip.wav",
                 root / "stop.marker",
-                max_seconds=20.0, microphone=microphone)
+                max_seconds=30.0 if conversational else 20.0, microphone=microphone)
+            if conversational:
+                argv.extend(["--idle", "15"])
             if turn.backend == model_settings.GEMINI:
                 config = self.model_profiles["listening"]
                 key = model_settings.credential("listening", config)
@@ -1262,6 +1298,7 @@ class Overlay(QWidget):
         self.show_result("Microphone is listening", (
             'Say “task approved” or “deny task”.' if turn.approval is not None
             else 'Say “task status” or “cancel task”.' if turn.task is not None
+            else 'Speak now or say “Stop JEAN” to end the conversation.' if turn.conversational
             else "Speak now, then click End recording."
         ))
 
@@ -1295,6 +1332,11 @@ class Overlay(QWidget):
                     elif line == "READY":
                         saw_ready = True
                         self.bridge.capture_ready.emit(turn)
+                    elif line.startswith("SPEECH "):
+                        try:
+                            turn.heard_speech |= float(line[7:]) >= 0.012
+                        except ValueError:
+                            pass
                     elif line == "ENDED":
                         ended_at = time.monotonic()
                     elif line.startswith("AUDIO ") and turn.live:
@@ -1313,7 +1355,7 @@ class Overlay(QWidget):
         if not saw_ready or proc.returncode != 0:
             error = error or diagnostic or "microphone capture did not finish successfully"
         if turn.live:
-            if error or turn.abandoned:
+            if error or turn.abandoned or (turn.conversational and not turn.heard_speech):
                 turn.live.cancelled.set()
             turn.live.ended.set()
         self.bridge.capture_finished.emit(turn, error, ended_at)
@@ -1328,6 +1370,12 @@ class Overlay(QWidget):
         self.talk.setText("● Talk")
         self.talk.setEnabled(True)
         clip = Path(turn.directory.name) / "clip.wav"
+        if turn.conversational and (error or turn.abandoned or not turn.heard_speech):
+            self.voice_session = False
+            if not error and not turn.abandoned:
+                self.show_result("Conversation ended", "Say JEAN to start again.")
+                self._finish_voice(turn)
+                return
         if turn.abandoned or error or not clip.is_file():
             if not turn.abandoned:
                 self.show_result("Microphone failed", error or "no WAV was produced")
@@ -1368,8 +1416,21 @@ class Overlay(QWidget):
         if turn.asr_fallback:
             self._log_activity("Project 2 model unavailable. Retried this recording with Project 9.")
         if error or not transcript:
+            if turn.conversational:
+                self.voice_session = False
             self.show_result("Transcription failed", error or "empty transcript")
             self._finish_voice(turn)
+            self._speak_async("I couldn't understand that. Please try again.", False)
+            return
+        if turn.conversational and voice_bench.normalize_tokens(transcript) in {
+            "stop jean", "close jean", "stop gene", "close gene",
+            "jean stop", "jean close", "gene stop", "gene close",
+            "stop", "close",
+        }:
+            self.voice_session = False
+            self.show_result("Conversation ended", "Say JEAN to start again.")
+            self._finish_voice(turn)
+            self._speak_async("Okay. Say JEAN when you need me.", False)
             return
         address = WAKE_ADDRESS.match(transcript)
         if address and voice_bench.normalize_tokens(transcript[address.end():]) == "terminate":
@@ -1386,6 +1447,7 @@ class Overlay(QWidget):
         self.show_result("Heard you", f"{transcript}\n{turn.backend} · {elapsed_ms} ms to text")
         if self._answer_approval(transcript, turn.approval):
             self._finish_voice(turn)
+            self._speak_async("I received your approval response.", False)
             return
         mode = request_mode(turn.mode, transcript)
         if turn.task is not None:
@@ -1393,7 +1455,8 @@ class Overlay(QWidget):
         else:
             self._finish_voice(turn)
             self.busy = True
-            self._submit_request(mode, transcript)
+            self.voice_reply = ["I finished handling your request. Check the activity panel for details."]
+            self._submit_request(mode, transcript, spoken=True)
 
     def _finish_voice(self, turn):
         turn.directory.cleanup()
@@ -1404,7 +1467,8 @@ class Overlay(QWidget):
     def _voice_task_control(self, turn, transcript):
         words = voice_bench.normalize_tokens(transcript)
         if self.task_proc is not turn.task:
-            self.show_result("Task already finished", "Start a new recording for another request.")
+            reply = "That task already finished. Start a new recording for another request."
+            self.show_result("Task already finished", reply)
         elif words in {"task status", "status", "what is it doing", "what s it doing", "whats it doing"}:
             self._finish_voice(turn)
             self._request_task_status(speak=True, task_id=self.active_task_id)
@@ -1412,12 +1476,15 @@ class Overlay(QWidget):
         elif words in {"cancel task", "cancel the task"}:
             self._finish_voice(turn)
             self._cancel_task()
+            self._speak_async("I requested task cancellation.", False)
             return
         else:
-            self.show_result("Task still running", 'Say “task status” or “cancel task”.')
+            reply = "The task is still running. Say task status or cancel task."
+            self.show_result("Task still running", reply)
         self._finish_voice(turn)
+        self._speak_async(reply, False)
 
-    def _submit_request(self, mode, text):
+    def _submit_request(self, mode, text, *, spoken=False):
         desktop_request = voice_bench.normalize_tokens(site_request_text(text))
         if desktop_request in {
             "desktop windows", "list windows", "show open windows",
@@ -1426,7 +1493,6 @@ class Overlay(QWidget):
             self._list_desktop_windows()
             return
         if self._handle_memory(text) or self._handle_workflow(text):
-            self._finish_busy_ui()
             return
         scope = clock_request(text)
         if scope:
@@ -1445,6 +1511,26 @@ class Overlay(QWidget):
         mode = request_mode(mode, text)
         if mode == "task":
             self.last_local_step = None
+            request = site_request_text(text).rstrip(".").strip()
+            if youtube_tab_playback(text):
+                self._run_task("/desktop " + json.dumps({
+                    "window": "YouTube", "goal": text, "launch": False,
+                }))
+                return
+            if re.fullmatch(r"(?:create|add|make)\s+(?:a\s+|new\s+|a new\s+)?section", request, re.I):
+                self.entry.setText(text + " ")
+                self.show_result("Where should the section go?",
+                                 "Name the app, document or workspace, and give the section a heading.")
+                self._finish_busy_ui()
+                return
+            spotify = re.fullmatch(r"((?:play|search|find|pause)\b.*?)\s+(?:on|in)\s+Spotify", request, re.I)
+            if spotify:
+                self._run_task("/desktop " + json.dumps({
+                    "window": "Spotify", "goal": spotify[1].strip(), "launch": True,
+                }))
+                return
+            if request != text and re.match(r"(?:open|launch|start)\s+", request, re.I):
+                text = request
         self._log_activity(f"{mode.capitalize()} request: {text}")
         command, _, task_id = text.partition(" ")
         if command.lower() == "/status":
@@ -1457,8 +1543,9 @@ class Overlay(QWidget):
             return
         elif mode == "task" and gmail_request(text):
             self._open_gmail()
-            self._finish_busy_ui()
-        elif mode == "task" and self._open_requested_site(text):
+        elif mode == "task" and (
+                self._open_requested_site(text, spoken=True) if spoken
+                else self._open_requested_site(text)):
             self._finish_busy_ui()
         elif mode == "task" and command.lower() == "/browse":
             self._browse(task_id.strip())
@@ -1475,6 +1562,13 @@ class Overlay(QWidget):
         self.foreground_cancel = None
         self.busy = False
         self._update_status()
+        if self.voice_reply is not None:
+            pending = self.voice_reply
+            QTimer.singleShot(0, lambda: self._finish_voice_reply(pending))
+
+    def _finish_voice_reply(self, pending):
+        if self.voice_reply is pending and not self.busy:
+            self._speak_async(pending[0], False)
 
     def _update_status(self):
         if self.listening:
@@ -1513,6 +1607,7 @@ class Overlay(QWidget):
                 return
             if error:
                 self.bridge.result.emit("Chat failed", error)
+                self.bridge.speak_requested.emit("I couldn't get a response from the main model.", False)
             elif re.search(r'\brun as["”]? (?:a )?task\b', reply, re.IGNORECASE):
                 self.bridge.task_retry.emit(text)
             else:
@@ -1528,6 +1623,7 @@ class Overlay(QWidget):
         if not self.entry.text().strip():
             self.entry.setText(text)
         self.show_result("Run this as a task", "Choose Mode: Task, then press Send to retry.")
+        self._speak_async("Switch to Task mode, then press Send to retry.", False)
 
     def _chat_idle(self):
         return not self.busy and self.voice_turn is None and self.task_proc is None
@@ -1546,7 +1642,7 @@ class Overlay(QWidget):
         if directory:
             self.workspace.setText(directory)
 
-    def _open_requested_site(self, text):
+    def _open_requested_site(self, text, *, spoken=False):
         address = web_request(text)
         remainder = ""
         if address is None:
@@ -1556,12 +1652,16 @@ class Overlay(QWidget):
                 if requested and requested["browser"]:
                     self.show_result("Which website?", f'I heard “{requested["destination"]}”. '
                                      "Say the site name again or enter its URL.")
+                    if spoken:
+                        self._speak_async("Which website should I open?", False)
                     return True
                 return False
             address = "https://www.youtube.com/"
             remainder = "\nPlease repeat the second request separately."
         if not valid_web_url(address):
             self.show_result("Browser request failed", "Enter a valid web URL.")
+            if spoken:
+                self._speak_async("I need a valid web address.", False)
             return True
         opened = QDesktopServices.openUrl(QUrl(address))
         if opened:
@@ -1569,6 +1669,13 @@ class Overlay(QWidget):
             self.last_open_step = self.last_local_step
         self.show_result("Sent to your browser" if opened else "Could not open browser",
                          QUrl(address).toDisplayString() + (remainder if opened else ""))
+        if spoken:
+            reply = "I couldn't open your browser."
+            if opened:
+                reply = "I sent YouTube to your browser." if address == "https://www.youtube.com/" else "I sent that to your browser."
+                if remainder:
+                    reply += " Please repeat the second request separately."
+            self._speak_async(reply, False)
         return True
 
     def _app_discovery_env(self, base=None):
@@ -2201,7 +2308,9 @@ class Overlay(QWidget):
     def _speak_async(self, text, task_result):
         if not text or self.voice_turn is not None:
             return
+        self.voice_reply = None
         self.stop_speech_playback()
+        self._stop_wake_listener()
         argv = [str(EXE), "speak"]
         argv.extend(["--rate", str(self.voice_rate.currentData())])
         if self.voice_choice.currentData():
@@ -2316,8 +2425,14 @@ class Overlay(QWidget):
         if not self.task_id.text() and not self.busy:
             self.task_id.setText(task_id)
 
-    def show_result(self, title, detail):
-        self._log_activity(f"{title}: {detail}")
+    def show_result(self, title, detail, *, log=True):
+        if self.voice_reply is not None:
+            self.voice_reply[0] = (
+                detail if title in {"JEAN", CHAT_SETUP_TITLE, "Where should the section go?"} and detail
+                else title + "."
+            )
+        if log:
+            self._log_activity(f"{title}: {detail}")
         self.title.setText(title)
         self.detail.setText(detail)
         self.detail.setToolTip(detail if len(detail) > 180 else "")
