@@ -48,7 +48,7 @@ from PyQt6.QtGui import QBrush, QColor, QPainter, QPainterPath, QRadialGradient,
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QLineEdit, QFrame,
                              QGraphicsDropShadowEffect, QComboBox, QFileDialog,
-                             QMessageBox, QDialog, QMenu, QPlainTextEdit)
+                             QMessageBox, QDialog, QInputDialog, QMenu, QPlainTextEdit)
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -301,6 +301,7 @@ class Bridge(QObject):
     task_status = pyqtSignal(str, str)
     latest_task = pyqtSignal(str)
     chat_setup = pyqtSignal(str)     # full provider diagnostic; empty = configured
+    gmail_discovered = pyqtSignal(list, str, str, object)
 
 
 class TalkHotkey(QAbstractNativeEventFilter):
@@ -523,6 +524,7 @@ class Overlay(QWidget):
         # Voice state
         self.foreground_cancel = None
         self.activity_lines = []
+        self.wake_error = None
         self.last_local_step = None
         self.last_open_step = None
         self.mode = "smart"
@@ -1569,30 +1571,68 @@ class Overlay(QWidget):
                          QUrl(address).toDisplayString() + (remainder if opened else ""))
         return True
 
-    def _open_gmail(self):
-        output, error = self._jean([
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            "Get-StartApps | Where-Object Name -eq 'Gmail' | Select-Object -ExpandProperty AppID",
-        ], timeout=5)
-        apps = sorted({line.strip() for line in output.splitlines()
-                       if re.fullmatch(r"[\w.!-]+", line.strip())})
+    def _app_discovery_env(self, base=None):
+        source = os.environ if base is None else base
+        blocked = {
+            model_settings.MAIN_KEY,
+            model_settings.DECISION_KEY,
+            "JEAN_MODEL_API_KEY",
+            "JEAN_DECISION_API_KEY",
+            "JEAN_MODEL_API_KEY_ENV",
+            "JEAN_DECISION_CONFIG",
+            *(
+                config.get("api_key_env", "")
+                for config in self.model_profiles.values()
+                if isinstance(config, dict) and config.get("api_key_env")
+            ),
+        }
+        return {
+            key: value
+            for key, value in source.items()
+            if key not in blocked and not key.endswith("_API_KEY")
+        }
+
+    def _open_gmail(self, on_done=None):
         remembered = self.voice_settings.value("gmail_app", "")
+        env = self._app_discovery_env()
+
+        def work():
+            output, error = self._jean([
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                "Get-StartApps | Where-Object Name -eq 'Gmail' | Select-Object -ExpandProperty AppID",
+            ], timeout=5, env=env, use_saved_models=False)
+            apps = sorted({line.strip() for line in output.splitlines()
+                           if re.fullmatch(r"[\w.!-]+", line.strip())})
+            self.bridge.gmail_discovered.emit(apps, error, remembered, on_done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_gmail_discovered(self, apps, error, remembered, on_done):
         app = remembered if remembered in apps else apps[0] if len(apps) == 1 else None
+        opened = False
         if error or app is None:
             self.show_result("Could not open Gmail", error or (
                 "Windows lists multiple Gmail apps." if apps else "Windows did not list a Gmail app."
             ))
-            return False
-        try:
-            subprocess.Popen(["explorer.exe", rf"shell:AppsFolder\{app}"], creationflags=NO_WINDOW)
-        except OSError as exc:
-            self.show_result("Could not open Gmail", str(exc))
-            return False
-        self.voice_settings.setValue("gmail_app", app)
-        self.last_local_step = ["gmail", ""]
-        self.last_open_step = self.last_local_step
-        self.show_result("Sent to Gmail app", "Opening your installed Gmail app.")
-        return True
+        else:
+            try:
+                subprocess.Popen(
+                    ["explorer.exe", rf"shell:AppsFolder\{app}"],
+                    creationflags=NO_WINDOW,
+                    env=self._app_discovery_env(),
+                )
+            except OSError as exc:
+                self.show_result("Could not open Gmail", str(exc))
+            else:
+                self.voice_settings.setValue("gmail_app", app)
+                self.last_local_step = ["gmail", ""]
+                self.last_open_step = self.last_local_step
+                self.show_result("Sent to Gmail app", "Opening your installed Gmail app.")
+                opened = True
+        if callable(on_done):
+            on_done(opened)
+        else:
+            self._finish_busy_ui()
 
     def _handle_workflow(self, text):
         text = site_request_text(text).rstrip(".").strip()
@@ -1603,6 +1643,7 @@ class Overlay(QWidget):
             finally:
                 self.voice_settings.endGroup()
             self.show_result("Saved workflows", ", ".join(names) or "No workflows saved yet.")
+            self._finish_busy_ui()
             return True
         teach = WORKFLOW_TEACH.fullmatch(text)
         remember = re.fullmatch(rf"remember this as (?P<name>{WORKFLOW_NAME})", text, re.IGNORECASE)
@@ -1614,6 +1655,7 @@ class Overlay(QWidget):
             step = self.last_open_step if repeat == "open it again" else self.last_local_step
             if step is None:
                 self.show_result("Nothing to repeat", "Run a browser, Gmail, or clock action first.")
+                self._finish_busy_ui()
             else:
                 self._run_workflow("Last action", [step])
             return True
@@ -1659,6 +1701,8 @@ class Overlay(QWidget):
                 self.show_result("Workflow needs input", str(exc))
             else:
                 self._run_workflow(name, steps)
+                return True
+        self._finish_busy_ui()
         return True
 
     def _save_workflow(self, key, revisions):
@@ -1678,37 +1722,61 @@ class Overlay(QWidget):
             args = ["list", "--limit", "10"]
         else:
             return False
-        output, error = self._jean([str(EXE), "memory", *args], timeout=5)
-        if error:
-            self.show_result("Memory request failed", error)
-        else:
-            title = "Memory saved" if remember else "Local memory"
-            self.show_result(title, output.strip() or "No matching memories.")
+        title = "Memory saved" if remember else "Local memory"
+
+        def work():
+            try:
+                output, error = self._jean(
+                    [str(EXE), "memory", *args], timeout=5, use_saved_models=False
+                )
+                if error:
+                    self.bridge.result.emit("Memory request failed", error)
+                else:
+                    self.bridge.result.emit(title, output.strip() or "No matching memories.")
+            finally:
+                self._finish_busy()
+
+        threading.Thread(target=work, daemon=True).start()
         return True
 
     def _run_workflow(self, name, steps):
         results = []
-        for kind, value in steps:
-            if kind == "clock":
-                try:
-                    result = clock_answer(value)
-                except (OSError, subprocess.SubprocessError):
-                    self.show_result("Workflow stopped", f"{name}: Windows could not read the clock.")
+
+        def run_from(index):
+            while index < len(steps):
+                kind, value = steps[index]
+                if kind == "clock":
+                    try:
+                        result = clock_answer(value)
+                    except (OSError, subprocess.SubprocessError):
+                        self.show_result("Workflow stopped", f"{name}: Windows could not read the clock.")
+                        self._finish_busy_ui()
+                        return
+                elif kind == "gmail":
+                    def after_gmail(opened, next_index=index + 1):
+                        if not opened:
+                            self._finish_busy_ui()
+                            return
+                        results.append("Sent to Gmail app.")
+                        run_from(next_index)
+
+                    self._open_gmail(on_done=after_gmail)
                     return
-            elif kind == "gmail":
-                if not self._open_gmail():
-                    return
-                result = "Sent to Gmail app."
-            else:
-                if not QDesktopServices.openUrl(QUrl(value)):
-                    self.show_result("Workflow stopped", f"{name}: browser handoff failed.")
-                    return
-                result = f"Sent to browser: {value}"
-            self.last_local_step = [kind, value]
-            if kind != "clock":
-                self.last_open_step = self.last_local_step
-            results.append(result)
-        self.show_result("Workflow ran", f"{name}\n" + "\n".join(results))
+                else:
+                    if not QDesktopServices.openUrl(QUrl(value)):
+                        self.show_result("Workflow stopped", f"{name}: browser handoff failed.")
+                        self._finish_busy_ui()
+                        return
+                    result = f"Sent to browser: {value}"
+                self.last_local_step = [kind, value]
+                if kind != "clock":
+                    self.last_open_step = self.last_local_step
+                results.append(result)
+                index += 1
+            self.show_result("Workflow ran", f"{name}\n" + "\n".join(results))
+            self._finish_busy_ui()
+
+        run_from(0)
 
     def _expire_trash(self):
         if self.trash.directory.is_dir():
@@ -1758,38 +1826,13 @@ class Overlay(QWidget):
             self.show_result("Enter a browser URL", "Example: /browse https://example.com/")
             self._finish_busy_ui()
             return
-        self.status.setText("●  BROWSING")
-        self.show_result("Opening page", url)
-        cancel = self.foreground_cancel = threading.Event()
+        self._run_task(f"/browse {url}")
 
-        def work():
-            try:
-                output, error = self._jean(
-                    [str(EXE), "browser", "run", "--json", "--", url], timeout=75,
-                    cancel=cancel,
-                )
-                if cancel.is_set():
-                    return
-                try:
-                    report, _ = json.JSONDecoder().raw_decode(output.lstrip())
-                except ValueError:
-                    self.bridge.result.emit("Browser request failed", error or output.strip())
-                    return
-                if report.get("title"):
-                    detail = f'{report["title"]}\n{report["url"]}'
-                    if report.get("screenshot"):
-                        detail += f'\nScreenshot: {report["screenshot"]}'
-                    self.bridge.result.emit("Page opened", detail)
-                else:
-                    self.bridge.result.emit("Browser request failed", report.get("detail") or error)
-            finally:
-                self._finish_busy()
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _run_task(self, text):
+    def _run_task(self, text, *, extra_env=None):
         try:
             environment = model_settings.cli_environment(self.model_profiles)
+            if extra_env:
+                environment.update(extra_env)
         except (RuntimeError, OSError, ValueError) as exc:
             self.show_result("Model settings unavailable", str(exc))
             self._finish_busy()
@@ -2067,32 +2110,19 @@ class Overlay(QWidget):
         ]
         summary = ("\n".join(result_lines[-5:]) or self.task_error.strip()
                    or output[-600:] or f"Exit code {code}")
+        next_step = next((line.removeprefix("next: ") for line in self.task_output
+                          if line.startswith("next: ")), "")
+        if code and next_step:
+            summary = next_step + "\n" + summary
         self.show_result(title, summary[:600])
         self.detail.setToolTip(output[-8000:])
         self._speak_async(f"{title}. {summary}", True)
 
     def _list_desktop_windows(self):
-        self.show_result("Reading open windows", "Checking the live Windows session with Cua.")
-        cancel = self.foreground_cancel = threading.Event()
-
-        def work():
-            try:
-                output, error = self._jean(
-                    [str(EXE), "mcp", "call", "cua", "list_windows"],
-                    timeout=20, cancel=cancel,
-                    env={**os.environ, "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0"},
-                )
-                if not cancel.is_set():
-                    if error:
-                        self.bridge.result.emit("Desktop observation failed", error)
-                    else:
-                        _, separator, listing = output.partition("\nresult   (")
-                        details = listing.partition("\n")[2].strip() if separator else output.strip()
-                        self.bridge.result.emit("Open windows", details)
-            finally:
-                self._finish_busy()
-
-        threading.Thread(target=work, daemon=True).start()
+        self._run_task(
+            "/windows",
+            extra_env={"CUA_DRIVER_RS_TELEMETRY_ENABLED": "0"},
+        )
 
     def _jean(self, argv, timeout, cancel=None, env=None, use_saved_models=True):
         try:
