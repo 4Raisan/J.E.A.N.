@@ -248,7 +248,7 @@ def bind_workflow(steps, supplied, value):
 
 
 def trash_request(text):
-    text = REQUEST_PREFIX.sub("", text.strip())
+    text = REQUEST_PREFIX.sub("", WAKE_ADDRESS.sub("", text.strip()))
     command = text.rstrip(".?!").casefold()
     if command in {"/trash", "/trash list", "show trash", "list trash", "show the trash",
                    "what is in the trash", "what's in the trash"}:
@@ -259,7 +259,7 @@ def trash_request(text):
     for pattern, action in (
         (r"/trash restore\s+(.+)", "restore"),
         (r"/trash put\s+(.+)", "put"),
-        (r"delete\s+(?:(?:the\s+)?(?:file|folder)\s+)?(.+)", "put"),
+        (r"delete\s+(?:the\s+)?(?:file|folder)\s+(.+)", "put"),
     ):
         match = re.fullmatch(pattern, text, re.IGNORECASE)
         if match:
