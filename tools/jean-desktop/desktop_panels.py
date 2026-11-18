@@ -4,7 +4,7 @@ import json
 
 from PyQt6.QtCore import QSignalBlocker, Qt, QTimer
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QDialogButtonBox, QGridLayout, QLabel,
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QGridLayout, QLabel,
     QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
@@ -60,10 +60,13 @@ class LayoutEditor(QDialog):
 
 
 class AudioControls(QWidget):
-    def __init__(self, meter, open_devices, wake, voice, pace):
+    def __init__(self, meter, open_devices, wake, voice, pace, switch_device):
         super().__init__()
         self.meter = meter
         self.rows = {}
+        self.selectors = {}
+        self.device_lists = {}
+        self.switch_device = switch_device
         grid = QGridLayout(self)
         grid.setContentsMargins(0, 0, 0, 0)
         for index, (capture, title) in enumerate(((True, "Microphone"), (False, "Speaker"))):
@@ -78,23 +81,31 @@ class AudioControls(QWidget):
             mute.setAccessibleName(title + " mute")
             mute.clicked.connect(lambda checked, capture=capture: self._change(capture, muted=checked))
             self.rows[capture] = label, slider, mute
-            grid.addWidget(label, index, 0)
-            grid.addWidget(slider, index, 1)
-            grid.addWidget(mute, index, 2)
+            selector = QComboBox()
+            selector.setMinimumContentsLength(12)
+            selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            selector.setAccessibleName(title + " device")
+            selector.setToolTip("Changes the Windows default and communications device")
+            selector.activated.connect(lambda _, capture=capture: self._select(capture))
+            self.selectors[capture] = selector
+            grid.addWidget(label, index * 2, 0)
+            grid.addWidget(selector, index * 2, 1, 1, 2)
+            grid.addWidget(slider, index * 2 + 1, 0, 1, 2)
+            grid.addWidget(mute, index * 2 + 1, 2)
         settings = QPushButton("Windows audio devices…")
         settings.setObjectName("mini")
         devices = QMenu(settings)
         devices.addAction("Recording devices", lambda: open_devices(True))
         devices.addAction("Playback devices", lambda: open_devices(False))
         settings.setMenu(devices)
-        grid.addWidget(wake, 2, 0)
-        grid.addWidget(settings, 2, 1, 1, 2)
-        grid.addWidget(voice, 3, 0, 1, 2)
-        grid.addWidget(pace, 3, 2)
+        grid.addWidget(wake, 4, 0)
+        grid.addWidget(settings, 4, 1, 1, 2)
+        grid.addWidget(voice, 5, 0, 1, 2)
+        grid.addWidget(pace, 5, 2)
         self.error = QLabel()
         self.error.setWordWrap(True)
         self.error.hide()
-        grid.addWidget(self.error, 4, 0, 1, 3)
+        grid.addWidget(self.error, 6, 0, 1, 3)
         self.poll = QTimer(self)
         self.poll.setInterval(750)
         self.poll.timeout.connect(self.refresh)
@@ -110,6 +121,7 @@ class AudioControls(QWidget):
 
     def refresh(self):
         for capture, (label, slider, mute) in self.rows.items():
+            self._refresh_selector(capture)
             title = "Microphone" if capture else "Speaker"
             try:
                 if self.meter is None:
@@ -130,6 +142,38 @@ class AudioControls(QWidget):
                     slider.setValue(level)
                 mute.setChecked(muted)
                 mute.setText("Unmute" if muted else "Mute")
+
+    def _refresh_selector(self, capture):
+        selector = self.selectors[capture]
+        if selector.view().isVisible():
+            return
+        try:
+            devices = self.meter.endpoints(capture) if self.meter else []
+            selected = self.meter.default_endpoint(capture) if devices else None
+        except OSError:
+            devices, selected = [], None
+        with QSignalBlocker(selector):
+            if self.device_lists.get(capture) != devices:
+                selector.clear()
+                selector.setPlaceholderText("Choose a device" if devices else "No audio devices")
+                for endpoint, name in devices:
+                    selector.addItem(name, endpoint)
+                self.device_lists[capture] = devices
+            selector.setCurrentIndex(selector.findData(selected))
+            selector.setEnabled(bool(devices))
+
+    def _select(self, capture):
+        endpoint = self.selectors[capture].currentData()
+        if endpoint is None:
+            return
+        try:
+            self.switch_device(capture, endpoint)
+        except OSError as exc:
+            self.error.setText(str(exc))
+            self.error.show()
+        else:
+            self.error.hide()
+        self.refresh()
 
     def _change(self, capture, *, value=None, muted=None):
         if self.meter is None:

@@ -518,6 +518,7 @@ class Overlay(QWidget):
         self.bridge.latest_task.connect(self._show_latest_task)
         self.bridge.chat_setup.connect(self._on_chat_setup)
         self.bridge.task_retry.connect(self._offer_task_retry)
+        self.bridge.gmail_discovered.connect(self._on_gmail_discovered)
 
         # Voice state
         self.foreground_cancel = None
@@ -728,7 +729,8 @@ class Overlay(QWidget):
         actions.setLayout(action_row)
         self.sections = {
             "audio": ("Audio", AudioControls(self.playback_meter, self._open_audio_devices,
-                                             self.wake_button, self.voice_choice, self.voice_rate)),
+                                             self.wake_button, self.voice_choice, self.voice_rate,
+                                             self._switch_audio_device)),
             "models": ("Models", self.backend_btn),
             "setup": ("Task setup", self.task_options),
             "tasks": ("Task actions", task_actions),
@@ -852,6 +854,15 @@ class Overlay(QWidget):
             subprocess.Popen(["control.exe", f"mmsys.cpl,,{int(capture)}"], creationflags=NO_WINDOW)
         except OSError as exc:
             self.show_result("Windows audio devices unavailable", str(exc))
+
+    def _switch_audio_device(self, capture, endpoint):
+        if self.voice_turn is not None:
+            raise OSError("Finish the current voice turn before switching audio devices.")
+        self._stop_wake_listener()
+        try:
+            self.playback_meter.set_default_endpoint(capture, endpoint)
+        finally:
+            self._sync_wake_listener()
 
     def _apply_section_layout(self):
         self.more_menu.clear()
@@ -1108,6 +1119,8 @@ class Overlay(QWidget):
         return self.playback_meter.microphone(verify_all_roles=wake)
 
     def _set_wake_enabled(self, enabled):
+        if not enabled:
+            self.voice_session = False
         self.wake_button.setText("Wake: On" if enabled else "Wake: Off")
         self._sync_wake_listener()
 
@@ -1127,7 +1140,7 @@ class Overlay(QWidget):
             self._microphone(wake=True)
         except OSError as exc:
             self.wake_button.setChecked(False)
-            self.show_result("Wake listener unavailable", str(exc))
+            self._show_wake_error(str(exc))
             return
         proc = QProcess(self)
         self.wake_proc = proc
@@ -1153,6 +1166,11 @@ class Overlay(QWidget):
                 proc.waitForFinished(500)
             proc.deleteLater()
 
+    def _show_wake_error(self, detail):
+        repeated = detail == self.wake_error
+        self.wake_error = detail
+        self.show_result("Wake listener unavailable", detail, log=not repeated)
+
     def _wake_finished(self, proc, code):
         if self.wake_proc is not proc:
             return
@@ -1161,6 +1179,8 @@ class Overlay(QWidget):
         approval = self.wake_approval
         self.wake_proc = None
         proc.deleteLater()
+        if not code and any(item in output for item in ("WAKE", "TERMINATE", "APPROVE", "DENY")):
+            self.wake_error = None
         if approval is not None and ("APPROVE" in output or "DENY" in output):
             if not code and not self._playback_blocks_wake() and self._can_listen_for_stop():
                 self._answer_approval("task approved" if "APPROVE" in output else "deny task", approval)
