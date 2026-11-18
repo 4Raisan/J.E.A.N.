@@ -19,7 +19,7 @@ use crate::{ChatRequest, Context, CoreError, ModelError, Result};
 pub(crate) const MAX_CHOICES: usize = 8;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 const MAX_RESERVATIONS: usize = 1000;
-const PROMPT: &str = "Choose one eligible replacement worker for an interrupted task. +Return exactly one JSON object {\"choice\":N}. N must be a supplied numeric option ID, +or 0 to abstain. Options are ordered by the operator's standing preference. +Abstain unless the supplied connector and sandbox facts justify a choice. +You cannot authorize, execute, or invent an option.";
+const PROMPT: &str = "Choose one eligible replacement worker for an interrupted task. Return exactly one JSON object {\"choice\":N}. N must be a supplied numeric option ID, or 0 to abstain. Options are ordered by the operator's standing preference. Abstain unless the supplied connector and sandbox facts justify a choice. You cannot authorize, execute, or invent an option.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -625,5 +625,33 @@ mod tests {
         ] {
             assert_eq!(parse_answer(invalid, 2), ("invalid_response", None));
         }
+    }
+
+    #[test]
+    fn decision_prompt_contains_no_diff_markers_and_updates_cohort_hash() {
+        assert!(!PROMPT.contains('+'), "PROMPT had stray diff marker: {PROMPT}");
+        assert!(PROMPT.contains(r#"{"choice":N}"#));
+        assert!(PROMPT.contains("0 to abstain"));
+        assert!(PROMPT.contains("You cannot authorize, execute, or invent an option."));
+
+        let cfg = DecisionConfig::default();
+        let legacy_prompt = "Choose one eligible replacement worker for an interrupted task. +Return exactly one JSON object {\"choice\":N}. N must be a supplied numeric option ID, +or 0 to abstain. Options are ordered by the operator's standing preference. +Abstain unless the supplied connector and sandbox facts justify a choice. +You cannot authorize, execute, or invent an option.";
+        let legacy_contract = serde_json::json!([
+            "replacement-worker-v2",
+            legacy_prompt,
+            cfg.base_url,
+            cfg.protocol,
+            cfg.model,
+            cfg.api_key_env,
+            cfg.timeout_secs,
+            cfg.transport().max_output_tokens,
+        ]);
+        let legacy_hash: String = Sha256::digest(legacy_contract.to_string().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let current_hash = cohort(&cfg);
+        assert_ne!(current_hash, legacy_hash);
+        assert_eq!(current_hash.len(), 64);
     }
 }
