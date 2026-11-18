@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use jean_process::{channel::Channel, LaunchSpec, TerminalMode};
-use jean_protocol::config::VoiceConfig;
+use jean_protocol::config::{DecisionMode, VoiceConfig};
 use jean_protocol::interaction::{
     self as wire, Envelope, OwnerCommand, OwnerReply, RequestGate, Role, Snapshot, TaskView,
     WorkerCommand as Command, WorkerEvent as Event,
@@ -20,35 +20,91 @@ pub struct Settings {
     pub task_timeout: Duration,
 }
 
+pub(crate) fn build_task_worker_env(
+    ctx: &Context,
+    parent: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let (mut task_env, _) = crate::env::build_child_env(
+        &ctx.config.process.env_allowlist,
+        &BTreeMap::new(),
+        parent,
+    );
+    task_env.insert(
+        "JEAN_DATA_DIR".into(),
+        ctx.paths.data_dir.to_string_lossy().into_owned(),
+    );
+    for name in [
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "JEAN_LOG_LEVEL",
+        "JEAN_MODEL_PROVIDER",
+        "JEAN_MODEL",
+        "JEAN_MODEL_BASE_URL",
+        "JEAN_MODEL_API_KEY_ENV",
+        "JEAN_DECISION_CONFIG",
+    ] {
+        if let Some(value) = parent.get(name) {
+            task_env.insert(name.into(), value.clone());
+        }
+    }
+
+    if ctx.config.model.provider != "none" || parent.contains_key("JEAN_MODEL_PROVIDER") {
+        task_env.insert(
+            "JEAN_MODEL_PROVIDER".into(),
+            ctx.config.model.provider.clone(),
+        );
+    }
+    if ctx.config.model.provider != "none" {
+        task_env.insert("JEAN_MODEL".into(), ctx.config.model.model.clone());
+        task_env.insert(
+            "JEAN_MODEL_BASE_URL".into(),
+            ctx.config.model.base_url.clone(),
+        );
+        task_env.insert(
+            "JEAN_MODEL_API_KEY_ENV".into(),
+            ctx.config.model.api_key_env.clone(),
+        );
+    }
+    if ctx.config.decision.mode != DecisionMode::Off || parent.contains_key("JEAN_DECISION_CONFIG")
+    {
+        if let Ok(serialized) = serde_json::to_string(&ctx.config.decision) {
+            task_env.insert("JEAN_DECISION_CONFIG".into(), serialized);
+        }
+    }
+
+    // Forward only the credentials required by the selected providers.
+    let main_key_env = ctx.config.model.api_key_env.trim();
+    if !main_key_env.is_empty() {
+        task_env.remove(main_key_env);
+    }
+    let decision_key_env = ctx.config.decision.api_key_env.trim();
+    if !decision_key_env.is_empty() {
+        task_env.remove(decision_key_env);
+    }
+
+    if ctx.config.model.provider == "openai_compatible" && !main_key_env.is_empty() {
+        if let Some(value) = parent.get(main_key_env) {
+            task_env.insert(main_key_env.into(), value.clone());
+        }
+    }
+    if ctx.config.decision.mode != DecisionMode::Off && !decision_key_env.is_empty() {
+        if let Some(value) = parent.get(decision_key_env) {
+            task_env.insert(decision_key_env.into(), value.clone());
+        }
+    }
+
+    task_env
+}
+
 impl Settings {
     pub fn from_context(ctx: &Context) -> io::Result<Self> {
         let exe = std::env::current_exe()?;
         let dir = exe
             .parent()
             .ok_or_else(|| io::Error::other("executable has no directory"))?;
-        let parent = std::env::vars().collect();
-        let (mut task_env, _) = crate::env::build_child_env(
-            &ctx.config.process.env_allowlist,
-            &BTreeMap::new(),
-            &parent,
-        );
-        task_env.insert(
-            "JEAN_DATA_DIR".into(),
-            ctx.paths.data_dir.to_string_lossy().into_owned(),
-        );
-        for name in [
-            "LOCALAPPDATA",
-            "APPDATA",
-            "USERPROFILE",
-            "JEAN_MODEL_PROVIDER",
-            "JEAN_MODEL",
-            "JEAN_LOG_LEVEL",
-            ctx.config.model.api_key_env.as_str(),
-        ] {
-            if let Ok(value) = std::env::var(name) {
-                task_env.insert(name.into(), value);
-            }
-        }
+        let parent: BTreeMap<String, String> = std::env::vars().collect();
+        let task_env = build_task_worker_env(ctx, &parent);
         let voice_env = ["SystemRoot", "PATH", "TEMP", "TMP"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
@@ -963,5 +1019,97 @@ impl ClientOutput {
 impl Drop for ClientOutput {
     fn drop(&mut self) {
         let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_worker_receives_configured_model_settings_and_only_required_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "jean-interact-env-test-{}-{}",
+            std::process::id(),
+            jean_store::now_ms()
+        ));
+        let mut ctx = Context::for_test(&dir);
+        ctx.config.model.provider = "openai_compatible".into();
+        ctx.config.model.base_url = "https://api.example.invalid/v1".into();
+        ctx.config.model.model = "synthetic-planner-v1".into();
+        ctx.config.model.api_key_env = "DUMMY_MAIN_API_KEY".into();
+        ctx.config.decision.mode = DecisionMode::Off;
+        ctx.config.decision.base_url = "https://decision.example.invalid/v1".into();
+        ctx.config.decision.model = "synthetic-selector-v1".into();
+        ctx.config.decision.api_key_env = "DUMMY_DECISION_API_KEY".into();
+
+        let main_secret = "sk-dummy-main-secret-1234567890";
+        let decision_secret = "sk-dummy-decision-secret-1234567890";
+        let mut parent = BTreeMap::new();
+        parent.insert("DUMMY_MAIN_API_KEY".into(), main_secret.into());
+        parent.insert("DUMMY_DECISION_API_KEY".into(), decision_secret.into());
+        parent.insert("UNRELATED_SECRET".into(), "do-not-forward".into());
+
+        // Case 1: main provider is openai_compatible, decision mode is Off.
+        let env = build_task_worker_env(&ctx, &parent);
+        assert_eq!(
+            env.get("JEAN_MODEL_PROVIDER").map(String::as_str),
+            Some("openai_compatible")
+        );
+        assert_eq!(
+            env.get("JEAN_MODEL_BASE_URL").map(String::as_str),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(
+            env.get("JEAN_MODEL").map(String::as_str),
+            Some("synthetic-planner-v1")
+        );
+        assert_eq!(
+            env.get("JEAN_MODEL_API_KEY_ENV").map(String::as_str),
+            Some("DUMMY_MAIN_API_KEY")
+        );
+        assert_eq!(
+            env.get("DUMMY_MAIN_API_KEY").map(String::as_str),
+            Some(main_secret)
+        );
+        assert!(
+            !env.contains_key("DUMMY_DECISION_API_KEY"),
+            "decision credential must not be forwarded when decision mode is Off"
+        );
+        assert!(!env.contains_key("UNRELATED_SECRET"));
+
+        // Case 2: main provider is ollama (no API key needed), decision mode is Shadow.
+        ctx.config.model.provider = "ollama".into();
+        ctx.config.decision.mode = DecisionMode::Shadow;
+        let env = build_task_worker_env(&ctx, &parent);
+        assert!(
+            !env.contains_key("DUMMY_MAIN_API_KEY"),
+            "main credential must not be forwarded for ollama"
+        );
+        assert_eq!(
+            env.get("DUMMY_DECISION_API_KEY").map(String::as_str),
+            Some(decision_secret)
+        );
+        let decision_json = env
+            .get("JEAN_DECISION_CONFIG")
+            .expect("decision config forwarded");
+        assert!(decision_json.contains("synthetic-selector-v1"));
+        assert!(!decision_json.contains(decision_secret));
+
+        // Case 3: main provider is none, decision mode is Off -> zero credentials forwarded.
+        ctx.config.model.provider = "none".into();
+        ctx.config.decision.mode = DecisionMode::Off;
+        let env = build_task_worker_env(&ctx, &parent);
+        assert!(!env.contains_key("DUMMY_MAIN_API_KEY"));
+        assert!(!env.contains_key("DUMMY_DECISION_API_KEY"));
+
+        // Confirm redactor strips dummy secrets from any log line.
+        let sample_log = format!(
+            "Authorization: Bearer {main_secret} api_key={decision_secret}"
+        );
+        let redacted = ctx.redactor.redact(&sample_log);
+        assert!(!redacted.contains(main_secret));
+        assert!(!redacted.contains(decision_secret));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

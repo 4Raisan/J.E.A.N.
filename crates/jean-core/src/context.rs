@@ -113,6 +113,33 @@ impl Context {
     pub fn output_cap(&self) -> u64 {
         self.config.process.capture_output_max_bytes
     }
+
+    pub fn for_test(data_dir: &Path) -> Self {
+        let _ = std::fs::create_dir_all(data_dir);
+        let config = AppConfig::default();
+        let paths = Paths {
+            data_dir: data_dir.to_path_buf(),
+            database: data_dir.join("jean.db"),
+            log_dir: data_dir.join("logs"),
+            artifacts: data_dir.join("artifacts"),
+            tools: data_dir.join("tools.toml"),
+            audit: data_dir.join("audit.jsonl"),
+            config_dir: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory test store");
+        let redactor = Redactor::new(&config.process.redact_patterns);
+        Self {
+            preference_base: config.clone(),
+            config,
+            paths,
+            store,
+            tools: ToolRegistry::empty(),
+            redactor,
+            sources: vec![ConfigSource::CompiledDefaults],
+            warnings: Vec::new(),
+            task_started: |_| {},
+        }
+    }
 }
 
 fn apply_stored_preferences(store: &Store, config: &mut AppConfig) -> Vec<String> {
