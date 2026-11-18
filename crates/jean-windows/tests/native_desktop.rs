@@ -1916,3 +1916,49 @@ fn the_ocr_backend_that_is_not_configured_refuses_instead_of_inventing_text() {
         "an unconfigured backend is not a capability"
     );
 }
+
+#[test]
+fn resolve_reports_depth_relative_to_search_root_for_subtree_and_multi_step_queries() {
+    let _guard = lock_desktop();
+    let fixture = Fixture::start("normal", None);
+
+    // Search root itself (index 0 of Subtree) has depth 0.
+    let root_matches = accessibility::resolve(fixture.id(), Locator::Index(0), settings(), None)
+        .expect("root index resolves");
+    assert_eq!(root_matches.len(), 1);
+    assert_eq!(root_matches[0].depth, Some(0));
+
+    // Direct child ("Send" button, id 1002; "Workspace A" group, id 1010) has depth 1.
+    let send = accessibility::resolve(fixture.id(), Fixture::by_id(1002), settings(), None)
+        .expect("direct child resolves");
+    assert_eq!(send.len(), 1);
+    assert_eq!(send[0].depth, Some(1));
+
+    // Deeper descendant ("Continue" button id 1008 inside "Workspace A" group) has depth 2
+    // for both flat subtree lookup and multi-step Path lookup.
+    let continue_subtree =
+        accessibility::resolve(fixture.id(), Fixture::by_id(1008), settings(), None)
+            .expect("grandchild subtree lookup resolves");
+    assert_eq!(continue_subtree.len(), 1);
+    assert_eq!(continue_subtree[0].depth, Some(2));
+
+    let continue_path = accessibility::resolve(
+        fixture.id(),
+        Locator::Path(vec![
+            Locator::Name {
+                name: "Workspace A".to_owned(),
+                control_type: Some(ControlKind::Group),
+            },
+            Locator::Name {
+                name: "Continue".to_owned(),
+                control_type: Some(ControlKind::Button),
+            },
+        ]),
+        settings(),
+        None,
+    )
+    .expect("two-step path lookup resolves");
+    assert_eq!(continue_path.len(), 1);
+    assert_eq!(continue_path[0].automation_id, "1008");
+    assert_eq!(continue_path[0].depth, Some(2));
+}

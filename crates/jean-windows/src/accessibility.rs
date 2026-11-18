@@ -209,6 +209,13 @@ impl ControlKind {
         }
     }
 
+    pub fn same_type(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Other { id: a, .. }, Self::Other { id: b, .. }) => a == b,
+            _ => self == other,
+        }
+    }
+
     /// A control that is only chrome around content.
     ///
     /// Used by [`TreeExplanation`] to say "nothing interactive was found" instead of "nothing was found",
@@ -353,11 +360,15 @@ pub struct Control {
     /// a real thing that happens, and the only way to know is to ask. Empty unless
     /// [`Settings::probe_patterns`] was set or this control was the target of an action.
     pub patterns: Vec<Pattern>,
-    /// Depth from the window root, when the read computed it.
+    /// Pattern state read when [`Settings::probe_patterns`] is enabled, with password values redacted.
+    #[serde(default)]
+    pub state: Readback,
+    /// Depth relative to the search root (`0` for the search root itself, `1` for direct children,
+    /// `2` for children of direct children, etc.), when the read computed it.
     ///
-    /// `None` for the flat subtree read, which asks UIA for every descendant in one call and therefore
-    /// does not see the parent links. A path resolution does compute it, and the difference is reported
-    /// rather than being papered over with a `0` that would look like "this is the root".
+    /// `None` for the flat [`read_tree`] walk, which asks UIA for every descendant in one call and
+    /// does not walk parent links. [`resolve`] computes the depth of each matched element relative to
+    /// the window search root for both subtree and multi-step path queries.
     pub depth: Option<usize>,
 }
 
@@ -410,17 +421,30 @@ impl Control {
     /// Does this control match a single-step locator?
     pub fn matches(&self, locator: &Locator) -> bool {
         match locator {
-            Locator::AutomationId(id) => self.automation_id == *id,
+            Locator::AutomationId(id) => self.automation_id.to_lowercase() == id.to_lowercase(),
             Locator::Name { name, control_type } => {
-                self.name.eq_ignore_ascii_case(name)
+                self.name.to_lowercase() == name.to_lowercase()
                     && control_type
                         .as_ref()
-                        .map(|want| want == &self.kind)
+                        .map(|want| want.same_type(&self.kind))
                         .unwrap_or(true)
             }
             // Only meaningful once a list exists; the backend applies it after collecting.
             Locator::Index(_) | Locator::Path(_) => true,
         }
+    }
+}
+
+/// Convert a raw UIA `ValuePattern` value into a [`Readback`] `(value, value_redacted)` pair.
+///
+/// For password controls (`is_password = true`), the plaintext is immediately replaced by a masked
+/// placeholder of the same character count so that length changes remain detectable while the
+/// plaintext never enters [`Readback`], worker IPC, logs, model prompts, or persisted state.
+pub fn readback_value(raw: &str, is_password: bool) -> (Option<String>, bool) {
+    if is_password {
+        (Some("*".repeat(raw.chars().count())), true)
+    } else {
+        (Some(bound_name(raw).0), false)
     }
 }
 
@@ -1043,4 +1067,53 @@ pub(crate) fn looks_like_web_content(class: &str) -> bool {
         || lowered.contains("electron")
         || lowered.contains("sun_awt_frame")
         || lowered.contains("wxwindowclass")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_readback_detects_masked_length_changes_without_retaining_plaintext() {
+        let empty_secret = "";
+        let first_secret = "correct-horse-1";
+        let second_secret = "correct-horse-battery-staple";
+
+        let (val0, red0) = readback_value(empty_secret, true);
+        let (val1, red1) = readback_value(first_secret, true);
+        let (val2, red2) = readback_value(second_secret, true);
+
+        let r0 = Readback {
+            value: val0,
+            value_redacted: red0,
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let r1 = Readback {
+            value: val1,
+            value_redacted: red1,
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let r2 = Readback {
+            value: val2,
+            value_redacted: red2,
+            enabled: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(r0.digest(), "value=0 chars (redacted) enabled=true");
+        assert_eq!(r1.digest(), "value=15 chars (redacted) enabled=true");
+        assert_eq!(r2.digest(), "value=28 chars (redacted) enabled=true");
+        assert_ne!(r0.digest(), r1.digest());
+        assert_ne!(r1.digest(), r2.digest());
+
+        for state in [&r0, &r1, &r2] {
+            let serialized = serde_json::to_string(state).unwrap();
+            assert!(!serialized.contains(first_secret));
+            assert!(!serialized.contains(second_secret));
+            assert!(!state.digest().contains(first_secret));
+            assert!(!state.digest().contains(second_secret));
+        }
+    }
 }

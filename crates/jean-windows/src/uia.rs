@@ -175,6 +175,7 @@ fn to_control(element: &UIElement, depth: Option<usize>) -> Control {
         rect,
         runtime_id: element.get_runtime_id().unwrap_or_default(),
         patterns: Vec::new(),
+        state: Readback::default(),
         depth,
     }
 }
@@ -233,14 +234,10 @@ fn read_state(element: &UIElement, control: &Control) -> Readback {
     };
     if let Ok(pattern) = element.get_pattern::<uiautomation::patterns::UIValuePattern>() {
         if let Ok(value) = pattern.get_value() {
-            if control.is_password {
-                state.value_redacted = true;
-                // The length is kept and the content is not: "the field is empty" and "the field has four
-                // characters in it" are operationally different and neither is private.
-                state.value = Some("".repeat(value.chars().count()));
-            } else {
-                state.value = Some(bound_name(&value).0);
-            }
+            let (stored, redacted) =
+                crate::accessibility::readback_value(&value, control.is_password);
+            state.value = stored;
+            state.value_redacted = redacted;
         }
     }
     if let Ok(pattern) = element.get_pattern::<uiautomation::patterns::UITogglePattern>() {
@@ -317,9 +314,22 @@ fn resolve_in(
                     Some(PropertyConditionFlags::IgnoreCase),
                 )
                 .map_err(|error| uia_error("create_property_condition(Name)", error))?;
-            let found = scope
+            let mut found = scope
                 .find_all(TreeScope::Subtree, &condition)
                 .map_err(|error| uia_error("FindAll(Name)", error))?;
+            if found.is_empty() && name.chars().count() >= crate::accessibility::MAX_NAME_CHARS {
+                let target_lower = bound_name(name).0.to_lowercase();
+                let (all, _) = descendants_from(session, scope, max_nodes)?;
+                found = all
+                    .into_iter()
+                    .filter(|element| {
+                        element
+                            .get_name()
+                            .map(|live| bound_name(&live).0.to_lowercase() == target_lower)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+            }
             let kept = capped(found, max_nodes);
             match control_type {
                 None => Ok(kept),
@@ -328,7 +338,7 @@ fn resolve_in(
                     .filter(|element| {
                         element
                             .get_control_type()
-                            .map(|kind| ControlKind::from_uia(kind as i32, "") == *want)
+                            .map(|kind| ControlKind::from_uia(kind as i32, "").same_type(want))
                             .unwrap_or(false)
                     })
                     .collect()),
@@ -370,18 +380,30 @@ fn capped(mut found: Vec<UIElement>, max_nodes: usize) -> Vec<UIElement> {
     found
 }
 
-/// The depth of each element, when a path walk made it knowable.
-///
-/// A path resolution produces a per-step list, so the step number is the depth and is worth reporting;
-/// the flat subtree read has no such number and reports `None`.
-fn with_depth(controls: Vec<Control>, depth: usize) -> Vec<Control> {
-    controls
-        .into_iter()
-        .map(|mut control| {
-            control.depth = Some(depth);
-            control
-        })
-        .collect()
+/// Depth of `element` relative to the search root `root` (`Some(0)` for `root` itself,
+/// `Some(1)` for direct children of `root`, `Some(2)` for children of direct children, etc.).
+fn depth_from_root(session: &Session, root: &UIElement, element: &UIElement) -> Option<usize> {
+    let root_id = root.get_runtime_id().ok()?;
+    if root_id.is_empty() {
+        return None;
+    }
+    let walker = session.automation.get_raw_view_walker().ok()?;
+    let mut current = element.clone();
+    for depth in 0..=64 {
+        let current_id = current.get_runtime_id().ok()?;
+        if current_id == root_id {
+            return Some(depth);
+        }
+        current = walker.get_parent(&current).ok()?;
+    }
+    None
+}
+
+fn fallback_locator_depth(locator: &Locator) -> Option<usize> {
+    match locator {
+        Locator::Path(steps) if !steps.is_empty() => Some(steps.len()),
+        _ => None,
+    }
 }
 
 impl AccessibilityBackend for UiaBackend {
@@ -406,6 +428,7 @@ impl AccessibilityBackend for UiaBackend {
         if settings.probe_patterns {
             for (control, element) in controls.iter_mut().zip(found.iter()) {
                 control.patterns = probe_patterns(element);
+                control.state = read_state(element, control);
             }
         }
         let explanation = explain(&controls, truncated);
@@ -429,17 +452,19 @@ impl AccessibilityBackend for UiaBackend {
             return Ok(Vec::new());
         };
         let found = resolve_in(&session, &root, locator, settings.max_nodes)?;
+        let fallback_depth = fallback_locator_depth(locator);
         let mut controls: Vec<Control> = found
             .iter()
-            .map(|element| to_control(element, Some(0)))
+            .map(|element| {
+                let depth = depth_from_root(&session, &root, element).or(fallback_depth);
+                to_control(element, depth)
+            })
             .collect();
         if settings.probe_patterns {
             for (control, element) in controls.iter_mut().zip(found.iter()) {
                 control.patterns = probe_patterns(element);
+                control.state = read_state(element, control);
             }
-        }
-        if locator.is_path() {
-            controls = with_depth(controls, 1);
         }
         Ok(controls)
     }

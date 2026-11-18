@@ -95,6 +95,11 @@ pub const TOOL_ID: &str = "desktop.native";
 /// The mechanism's vocabulary, re-exported so `jean-cli` and any later planner name one set of types
 /// rather than a second set that can drift from the crate that performs the call.
 pub type DesktopAction = accessibility::Action;
+pub type DesktopControl = accessibility::Control;
+pub type DesktopControlKind = accessibility::ControlKind;
+pub type DesktopPattern = accessibility::Pattern;
+pub type DesktopReadback = accessibility::Readback;
+pub const MAX_CONTROL_NAME_CHARS: usize = accessibility::MAX_NAME_CHARS;
 pub type DesktopInput = input::Input;
 pub type MouseButton = input::Button;
 pub type ScrollAmount = input::Scroll;
@@ -179,6 +184,11 @@ pub enum ControlSelector {
     AutomationId(String),
     /// The accessible name.
     Name(String),
+    /// The accessible name narrowed to one control type.
+    TypedName {
+        name: String,
+        kind: accessibility::ControlKind,
+    },
 }
 
 impl ControlSelector {
@@ -188,6 +198,10 @@ impl ControlSelector {
             Self::Name(name) => accessibility::Locator::Name {
                 name: name.clone(),
                 control_type: None,
+            },
+            Self::TypedName { name, kind } => accessibility::Locator::Name {
+                name: name.clone(),
+                control_type: Some(kind.clone()),
             },
         }
     }
@@ -937,6 +951,7 @@ where
         ctx.redactor.clone(),
     );
     let task_id = open_task(ctx, &operation, request_json)?;
+    (ctx.task_started)(&task_id);
     let actor = crate::intent::actor();
 
     if would_prompt(&policy, &ctx.store, &operation)? {
@@ -1312,7 +1327,14 @@ fn resolve_window(selector: &WindowSelector) -> Result<identity::WindowIdentity>
                 ),
             });
         }
-        return Ok(identity::read_identity(id));
+        let found = identity::read_identity(id);
+        if selector.pid.is_some_and(|pid| pid != found.pid) {
+            return Err(CoreError::Intent {
+                reason: "The selected window changed processes. Select it again before acting."
+                    .into(),
+            });
+        }
+        return Ok(found);
     }
 
     let all = identity::enumerate().map_err(intent_of)?;
@@ -2410,6 +2432,7 @@ mod tests {
                 rect: None,
                 runtime_id: Vec::new(),
                 patterns: vec![Pattern::Invoke],
+                state: Readback::default(),
                 depth: None,
             },
             action: accessibility::Action::Invoke,
@@ -2575,6 +2598,7 @@ mod tests {
             rect: None,
             runtime_id: vec![1, 2],
             patterns: vec![accessibility::Pattern::Value],
+            state: accessibility::Readback::default(),
             depth: None,
         };
 
