@@ -27,7 +27,7 @@ pub struct Migration {
 /// Hard-coded rather than derived so a truncated or reordered list is caught by
 /// the `schema_version_matches_the_last_migration` test instead of silently
 /// leaving databases half-migrated.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Every migration, oldest first.
 pub const MIGRATIONS: &[Migration] = &[
@@ -55,6 +55,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "phase_five_history_search_and_memory",
         sql: V5_PHASE_FIVE,
+    },
+    Migration {
+        version: 6,
+        name: "phase_six_cognitive_memory_and_playbooks",
+        sql: V6_PHASE_SIX,
     },
 ];
 
@@ -535,6 +540,190 @@ CREATE TABLE memory_changes (
 );
 ";
 
+/// Phase 6: episodic memory, self-updating consolidated memory notes, dreaming
+/// cycle logs, and typed procedural playbooks for known/learned tasks.
+///
+/// Kept strictly additive alongside v5 `saved_facts` so explicit operator facts
+/// preserve their original table and CHECK invariants, while JEAN gains bounded,
+/// redacted, auditable cognitive memory and reusable task skills.
+const V6_PHASE_SIX: &str = "\
+CREATE TABLE memory_episodes (
+    id             TEXT PRIMARY KEY NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN
+                     ('conversation','task_success','task_failure',
+                      'correction','preference_signal','observation')),
+    scope          TEXT NOT NULL DEFAULT '' CHECK (length(scope) <= 260),
+    summary        TEXT NOT NULL CHECK (length(summary) BETWEEN 1 AND 1000),
+    tags           TEXT NOT NULL DEFAULT '' CHECK (length(tags) <= 260),
+    salience       INTEGER NOT NULL DEFAULT 50 CHECK (salience BETWEEN 0 AND 100),
+    task_id        TEXT,
+    consolidated   INTEGER NOT NULL DEFAULT 0 CHECK (consolidated IN (0, 1)),
+    created_at_ms  INTEGER NOT NULL,
+    last_recalled_ms INTEGER,
+    recall_count   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_memory_episodes_unconsolidated
+    ON memory_episodes (consolidated, created_at_ms DESC);
+CREATE INDEX idx_memory_episodes_scope
+    ON memory_episodes (scope, created_at_ms DESC);
+
+CREATE VIRTUAL TABLE memory_episodes_fts USING fts5(
+    summary,
+    tags,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER memory_episodes_fts_after_insert AFTER INSERT ON memory_episodes BEGIN
+    INSERT INTO memory_episodes_fts(rowid, summary, tags)
+    VALUES (new.rowid, substr(jean_redact(new.summary), 1, 512),
+            substr(jean_redact(new.tags), 1, 512));
+END;
+
+CREATE TRIGGER memory_episodes_fts_after_update AFTER UPDATE OF summary, tags ON memory_episodes BEGIN
+    DELETE FROM memory_episodes_fts WHERE rowid = new.rowid;
+    INSERT INTO memory_episodes_fts(rowid, summary, tags)
+    VALUES (new.rowid, substr(jean_redact(new.summary), 1, 512),
+            substr(jean_redact(new.tags), 1, 512));
+END;
+
+CREATE TRIGGER memory_episodes_fts_after_delete AFTER DELETE ON memory_episodes BEGIN
+    DELETE FROM memory_episodes_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TABLE memory_notes (
+    id             TEXT PRIMARY KEY NOT NULL,
+    category       TEXT NOT NULL DEFAULT 'fact' CHECK (category IN
+                     ('fact','preference','project','person','lesson','procedure','environment','summary')),
+    scope          TEXT NOT NULL DEFAULT '' CHECK (length(scope) <= 260),
+    topic_key      TEXT NOT NULL DEFAULT '' CHECK (length(topic_key) <= 160),
+    text           TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 1000),
+    norm           TEXT NOT NULL,
+    confidence     INTEGER NOT NULL DEFAULT 80 CHECK (confidence BETWEEN 0 AND 100),
+    salience       INTEGER NOT NULL DEFAULT 60 CHECK (salience BETWEEN 0 AND 100),
+    origin         TEXT NOT NULL DEFAULT 'self_update' CHECK (origin IN
+                     ('operator','self_update','dream_consolidation','task_reflection')),
+    status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN
+                     ('active','superseded','archived')),
+    superseded_by  TEXT,
+    evidence_count INTEGER NOT NULL DEFAULT 1,
+    recall_count   INTEGER NOT NULL DEFAULT 0,
+    last_recalled_ms INTEGER,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX idx_memory_notes_active
+    ON memory_notes (status, scope, salience DESC, updated_at_ms DESC);
+CREATE INDEX idx_memory_notes_topic
+    ON memory_notes (scope, topic_key, status);
+
+CREATE VIRTUAL TABLE memory_notes_fts USING fts5(
+    text,
+    topic_key,
+    category,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER memory_notes_fts_after_insert AFTER INSERT ON memory_notes BEGIN
+    INSERT INTO memory_notes_fts(rowid, text, topic_key, category)
+    VALUES (new.rowid, substr(jean_redact(new.text), 1, 512),
+            substr(jean_redact(new.topic_key), 1, 160), new.category);
+END;
+
+CREATE TRIGGER memory_notes_fts_after_update AFTER UPDATE OF text, topic_key, category ON memory_notes BEGIN
+    DELETE FROM memory_notes_fts WHERE rowid = new.rowid;
+    INSERT INTO memory_notes_fts(rowid, text, topic_key, category)
+    VALUES (new.rowid, substr(jean_redact(new.text), 1, 512),
+            substr(jean_redact(new.topic_key), 1, 160), new.category);
+END;
+
+CREATE TRIGGER memory_notes_fts_after_delete AFTER DELETE ON memory_notes BEGIN
+    DELETE FROM memory_notes_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TABLE dream_cycles (
+    id                 TEXT PRIMARY KEY NOT NULL,
+    mode               TEXT NOT NULL CHECK (mode IN ('deterministic','model_assisted')),
+    scope              TEXT NOT NULL DEFAULT '' CHECK (length(scope) <= 260),
+    episodes_scanned   INTEGER NOT NULL DEFAULT 0,
+    tasks_scanned      INTEGER NOT NULL DEFAULT 0,
+    notes_created      INTEGER NOT NULL DEFAULT 0,
+    notes_updated      INTEGER NOT NULL DEFAULT 0,
+    notes_superseded   INTEGER NOT NULL DEFAULT 0,
+    notes_archived     INTEGER NOT NULL DEFAULT 0,
+    playbooks_promoted INTEGER NOT NULL DEFAULT 0,
+    summary            TEXT NOT NULL CHECK (length(summary) BETWEEN 1 AND 1000),
+    created_at_ms      INTEGER NOT NULL
+);
+
+CREATE INDEX idx_dream_cycles_created ON dream_cycles (created_at_ms DESC);
+
+CREATE TABLE playbooks (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    name                TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 80),
+    display_name        TEXT NOT NULL CHECK (length(display_name) BETWEEN 1 AND 120),
+    description         TEXT NOT NULL CHECK (length(description) BETWEEN 1 AND 500),
+    triggers_json       TEXT NOT NULL DEFAULT '[]',
+    scope               TEXT NOT NULL DEFAULT '' CHECK (length(scope) <= 260),
+    parameters_json     TEXT NOT NULL DEFAULT '[]',
+    steps_json          TEXT NOT NULL,
+    version             INTEGER NOT NULL DEFAULT 1,
+    previous_steps_json TEXT,
+    source              TEXT NOT NULL DEFAULT 'taught' CHECK (source IN
+                          ('taught','learned_from_task','dream_promoted','migrated')),
+    verified_successes  INTEGER NOT NULL DEFAULT 0,
+    failures            INTEGER NOT NULL DEFAULT 0,
+    last_used_ms        INTEGER,
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX idx_playbooks_scope ON playbooks (scope, verified_successes DESC, updated_at_ms DESC);
+
+CREATE VIRTUAL TABLE playbooks_fts USING fts5(
+    name,
+    display_name,
+    description,
+    triggers_json,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER playbooks_fts_after_insert AFTER INSERT ON playbooks BEGIN
+    INSERT INTO playbooks_fts(rowid, name, display_name, description, triggers_json)
+    VALUES (new.rowid, substr(jean_redact(new.name), 1, 80),
+            substr(jean_redact(new.display_name), 1, 120),
+            substr(jean_redact(new.description), 1, 512),
+            substr(jean_redact(new.triggers_json), 1, 512));
+END;
+
+CREATE TRIGGER playbooks_fts_after_update AFTER UPDATE OF name, display_name, description, triggers_json ON playbooks BEGIN
+    DELETE FROM playbooks_fts WHERE rowid = new.rowid;
+    INSERT INTO playbooks_fts(rowid, name, display_name, description, triggers_json)
+    VALUES (new.rowid, substr(jean_redact(new.name), 1, 80),
+            substr(jean_redact(new.display_name), 1, 120),
+            substr(jean_redact(new.description), 1, 512),
+            substr(jean_redact(new.triggers_json), 1, 512));
+END;
+
+CREATE TRIGGER playbooks_fts_after_delete AFTER DELETE ON playbooks BEGIN
+    DELETE FROM playbooks_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TABLE playbook_runs (
+    id          INTEGER PRIMARY KEY,
+    playbook_id TEXT NOT NULL REFERENCES playbooks (id) ON DELETE CASCADE,
+    task_id     TEXT,
+    outcome     TEXT NOT NULL CHECK (outcome IN
+                  ('dispatched','verified_success','failed','uncertain','cancelled')),
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    notes       TEXT NOT NULL DEFAULT '',
+    at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX idx_playbook_runs_playbook ON playbook_runs (playbook_id, at_ms DESC);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,5 +1130,31 @@ mod tests {
         );
         assert!(v5.contains("CHECK (length(text) BETWEEN 1 AND 1000)"));
         assert!(v5.contains("CHECK (length(scope) <= 260)"));
+    }
+
+    #[test]
+    fn phase_six_adds_cognitive_memory_and_playbooks_append_only() {
+        let v6 = MIGRATIONS[5].sql;
+        for required in [
+            "CREATE TABLE memory_episodes (",
+            "CREATE VIRTUAL TABLE memory_episodes_fts USING fts5(",
+            "CREATE TABLE memory_notes (",
+            "CREATE VIRTUAL TABLE memory_notes_fts USING fts5(",
+            "CREATE TABLE dream_cycles (",
+            "CREATE TABLE playbooks (",
+            "CREATE VIRTUAL TABLE playbooks_fts USING fts5(",
+            "CREATE TABLE playbook_runs (",
+        ] {
+            assert!(v6.contains(required), "v6 is missing {required:?}");
+        }
+        for forbidden in ["ALTER TABLE", "DROP TABLE", "DROP INDEX"] {
+            assert!(!v6.contains(forbidden), "v6 must not contain {forbidden:?}");
+        }
+        for source in ["memory_episodes", "memory_notes", "playbooks"] {
+            for event in ["insert", "update", "delete"] {
+                let needle = format!("CREATE TRIGGER {source}_fts_after_{event}");
+                assert!(v6.contains(&needle), "v6 is missing trigger {needle}");
+            }
+        }
     }
 }

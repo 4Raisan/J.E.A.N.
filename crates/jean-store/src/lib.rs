@@ -36,9 +36,14 @@ use jean_protocol::{Event, EventKind, PlanStepState, TransitionError};
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
+pub mod cognitive;
 pub mod memory;
 pub mod migrations;
 
+pub use cognitive::{
+    DreamCycleRecord, MemoryEpisode, MemoryNote, MemoryNoteHit, MemoryNoteUpsert, NewMemoryEpisode,
+    NewMemoryNote, NewPlaybook, PlaybookRecord, PlaybookRunRecord,
+};
 pub use memory::{
     FactAddOutcome, FactHit, HistoryHit, HistoryIndexReport, HistorySource, Preference, SavedFact,
     SearchOptions, DEFAULT_SEARCH_LIMIT, MAX_FACT_CHARS, MAX_LISTED_FACTS, MAX_QUERY_CHARS,
