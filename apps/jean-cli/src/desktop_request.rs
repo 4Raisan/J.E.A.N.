@@ -150,6 +150,104 @@ fn route(
 ) -> anyhow::Result<ExitCode> {
     let goal = options.goal.trim();
     let (command, arguments) = split_first(goal);
+    if command == "/dream" {
+        let deep = arguments.split_whitespace().any(|tok| tok == "--deep");
+        let scope = options
+            .workspace
+            .as_deref()
+            .map(|p| p.display().to_string());
+        let model = if deep && ctx.config.model.planning_enabled() {
+            Some(jean_core::build_model(&ctx.config.model)?)
+        } else {
+            None
+        };
+        let report = jean_core::dream::dream(
+            ctx,
+            model.as_deref(),
+            scope.as_deref(),
+            cancel.atomic(),
+        )?;
+        println!("result: {}", report.cycle.summary);
+        for pb in &report.promoted_playbooks {
+            println!("promoted playbook: {pb}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if command == "/recall" {
+        let scope = options
+            .workspace
+            .as_deref()
+            .map(|p| p.display().to_string());
+        let recalled = jean_core::dream::recall_context(
+            ctx,
+            arguments,
+            scope.as_deref(),
+            jean_core::dream::DEFAULT_RECALL_CHARS,
+        )?;
+        println!("result: {}", recalled.render_spoken_summary());
+        return Ok(ExitCode::SUCCESS);
+    }
+    if command == "/playbook" {
+        let (sub, rest) = split_first(arguments);
+        match sub {
+            "" | "list" => {
+                let scope = options
+                    .workspace
+                    .as_deref()
+                    .map(|p| p.display().to_string());
+                let list = ctx.store.list_playbooks(scope.as_deref(), 50)?;
+                if list.is_empty() {
+                    println!("result: No playbooks saved yet.");
+                } else {
+                    let names: Vec<String> = list
+                        .iter()
+                        .map(|pb| format!("{} (v{}, verified {}x)", pb.name, pb.version, pb.verified_successes))
+                        .collect();
+                    println!("result: {}", names.join(", "));
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            "run" => {
+                let Some(matched) = jean_core::playbooks::match_known_task(
+                    ctx,
+                    &format!("run playbook {rest}"),
+                    options
+                        .workspace
+                        .as_deref()
+                        .map(|p| p.to_string_lossy())
+                        .as_deref(),
+                )?
+                else {
+                    anyhow::bail!("No saved playbook matched {rest:?}.");
+                };
+                return crate::playbook::execute_playbook(
+                    ctx,
+                    &matched.record,
+                    &matched.steps,
+                    options.workspace.as_deref(),
+                    prompt,
+                    cancel,
+                );
+            }
+            "undo" => {
+                let restored = ctx
+                    .store
+                    .undo_playbook(rest)?
+                    .ok_or_else(|| anyhow::anyhow!("Playbook {rest:?} not found."))?;
+                println!("result: Restored playbook {} to v{}.", restored.name, restored.version);
+                return Ok(ExitCode::SUCCESS);
+            }
+            "forget" => {
+                let removed = ctx
+                    .store
+                    .forget_playbook(rest)?
+                    .ok_or_else(|| anyhow::anyhow!("Playbook {rest:?} not found."))?;
+                println!("result: Removed playbook {}.", removed.name);
+                return Ok(ExitCode::SUCCESS);
+            }
+            _ => anyhow::bail!("Use /playbook list, /playbook run <name>, /playbook undo <name>, or /playbook forget <name>."),
+        }
+    }
     if command == "/workspace" {
         let root = options.workspace.as_deref()
             .ok_or_else(|| anyhow::anyhow!("Select a workspace with Browse first."))?;

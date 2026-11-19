@@ -89,6 +89,7 @@ mod phase2;
 mod phase3;
 mod phase4;
 mod phase5;
+mod playbook;
 mod spoken_reply;
 
 #[derive(Parser)]
@@ -129,6 +130,11 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: memory::Memory,
+    },
+    /// Manage saved and learned playbooks (known tasks) with live verification.
+    Playbook {
+        #[command(subcommand)]
+        command: playbook::Playbook,
     },
     /// Manage the four supported runtime preferences.
     Preferences {
@@ -1010,6 +1016,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Speak { .. } => unreachable!("speech is handled before loading context"),
         Command::History { command } => memory::history(&mut ctx, command),
         Command::Memory { command } => memory::facts(&mut ctx, command),
+        Command::Playbook { command } => playbook::run_command(&mut ctx, command),
         Command::Preferences { command } => memory::preferences(&mut ctx, command),
         Command::Preference { command } => {
             owner_preferences::command(&ctx.paths.data_dir, &ctx.store, command)?;
