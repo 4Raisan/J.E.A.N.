@@ -163,12 +163,26 @@ impl Origin {
             .rsplit('@')
             .next()
             .unwrap_or_default();
-        let (host, port) = split_host_port(authority)?;
-        Some(Origin {
-            scheme: scheme.to_ascii_lowercase(),
-            host,
-            port,
-        })
+        let (host, raw_port) = split_host_port(authority)?;
+        let scheme = scheme.to_ascii_lowercase();
+        let port = match (scheme.as_str(), raw_port) {
+            ("http", Some(80)) | ("https", Some(443)) => None,
+            _ => raw_port,
+        };
+        Some(Origin { scheme, host, port })
+    }
+
+    /// Canonical string representation of this origin (`scheme://host[:port]`).
+    pub fn canonical(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}://{}:{}", self.scheme, self.host, port),
+            None => format!("{}://{}", self.scheme, self.host),
+        }
+    }
+
+    /// Whether this origin uses `http` or `https` with a non-empty host.
+    pub fn is_http_or_https(&self) -> bool {
+        matches!(self.scheme.as_str(), "http" | "https") && !self.host.is_empty()
     }
 
     /// Whether this origin is one the operator listed.
@@ -362,10 +376,21 @@ impl OwnedBrowser {
     }
 
     /// Verify that the browser's current URL is still within `[browser] allowed_origins`.
+    ///
+    /// Checks both CDP's target URL and `window.location.href` so neither HTTP redirects nor
+    /// client-side SPA navigations can slip past the allowlist.
     pub fn revalidate_origin(&mut self, config: &BrowserConfig) -> Result<String> {
-        let current = self.current_url()?;
-        Self::ensure_origin_allowed(config, &current)?;
-        Ok(current)
+        let tab_url = self.current_url()?;
+        Self::ensure_origin_allowed(config, &tab_url)?;
+        if let Ok(val) = self.eval_json("String(window.location.href || '')") {
+            if let Some(href) = val.as_str() {
+                if !href.is_empty() && href != "about:blank" {
+                    Self::ensure_origin_allowed(config, href)?;
+                    return Ok(href.to_owned());
+                }
+            }
+        }
+        Ok(tab_url)
     }
 
     /// Navigate, and wait for the load event the page is expected to fire.
@@ -376,7 +401,24 @@ impl OwnedBrowser {
         Self::ensure_origin_allowed(config, url)?;
         let tab = self.tab()?;
         tab.navigate_to(url)?;
-        tab.wait_until_navigated()?;
+        if let Err(err) = tab.wait_until_navigated() {
+            // Heavy SPAs such as YouTube can keep `load` pending on background resources while
+            // the document and video player are already active. Always revalidate the current
+            // origin first so a slow redirect can never slip past the allowlist.
+            let current = self.current_url().unwrap_or_default();
+            if current.is_empty() || current == "about:blank" {
+                return Err(BrowserError::from(err));
+            }
+            Self::ensure_origin_allowed(config, &current)?;
+            let has_doc = self
+                .eval_json("Boolean(document && document.documentElement)")
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !has_doc {
+                return Err(BrowserError::from(err));
+            }
+        }
         self.revalidate_origin(config)?;
         Ok(())
     }
@@ -852,5 +894,34 @@ mod tests {
         let denied = OwnedBrowser::ensure_origin_allowed(&allowed, "https://evil.example/landing")
             .expect_err("redirect to unlisted origin must be denied");
         assert!(matches!(denied, BrowserError::OriginDenied { .. }));
+    }
+
+    #[test]
+    fn default_ports_normalize_canonically_without_relaxing_non_default_ports() {
+        let bing_default = origin("https://www.bing.com:443/?toWww=1");
+        assert_eq!(bing_default.port, None);
+        assert_eq!(bing_default.canonical(), "https://www.bing.com");
+        assert!(bing_default.is_http_or_https());
+
+        let http_default = origin("http://example.com:80/page");
+        assert_eq!(http_default.port, None);
+        assert_eq!(http_default.canonical(), "http://example.com");
+
+        let allowed = config_with(&["https://www.bing.com"]);
+        assert!(origin_permitted(&allowed, "https://www.bing.com:443/search?q=rust"));
+        assert!(origin_permitted(&allowed, "https://www.bing.com/search?q=rust"));
+        assert!(!origin_permitted(&allowed, "https://bing.com/search?q=rust"));
+        assert!(!origin_permitted(&allowed, "https://www.youtube.com/"));
+
+        let pinned = config_with(&["https://www.bing.com:8443"]);
+        assert!(origin_permitted(&pinned, "https://www.bing.com:8443/"));
+        assert!(!origin_permitted(&pinned, "https://www.bing.com/"));
+        assert!(!origin_permitted(&pinned, "https://www.bing.com:443/"));
+
+        assert!(is_youtube_url("https://www.youtube.com/watch?v=jNQXAC9IVRw"));
+        assert!(is_youtube_url("https://youtube.com/"));
+        assert!(is_youtube_url("https://m.youtube.com/results?search_query=test"));
+        assert!(!is_youtube_url("https://www.bing.com/search?q=youtube"));
+        assert!(!is_youtube_url("file:///C:/youtube.html"));
     }
 }

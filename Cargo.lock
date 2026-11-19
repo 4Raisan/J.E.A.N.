@@ -1672,6 +1672,7 @@ dependencies = [
  "headless_chrome",
  "jean-process",
  "jean-protocol",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
 ]

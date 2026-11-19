@@ -339,7 +339,7 @@ api_key_env = "JEAN_MODEL_API_KEY"
 request_timeout_secs = 120
 max_response_bytes = 1048576
 max_prompt_bytes = 262144
-max_output_tokens = 2048
+max_output_tokens = 8192
 # REFUSED: above 0.3. A plan is a decision, and a decision that cannot be reproduced
 # from the record cannot be audited afterwards.
 temperature = 0.0

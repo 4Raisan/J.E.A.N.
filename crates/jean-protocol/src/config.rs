@@ -1106,7 +1106,7 @@ const fn d_model_max_prompt_bytes() -> usize {
     256 * 1024
 }
 const fn d_model_max_output_tokens() -> u32 {
-    2_048
+    8_192
 }
 const fn d_model_temperature() -> f32 {
     0.0
