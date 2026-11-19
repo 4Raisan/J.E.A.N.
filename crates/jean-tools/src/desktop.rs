@@ -477,10 +477,11 @@ fn top_level_windows() -> Result<Vec<RawWindow>> {
 
     let status = unsafe { EnumWindows(Some(visit), LPARAM(&mut walk as *mut Walk as isize)) };
 
-    // A callback that returned `false` (the row bound) makes `EnumWindows` report
-    // failure. Only an *unexpected* failure is an error.
+    // A callback that returned `false` (the row bound) makes `EnumWindows` report failure,
+    // and Windows can also return `FALSE` with `ERROR_SUCCESS` (`0x00000000`) when a window
+    // closes mid-walk. Only a genuine non-zero Win32 error is a failure.
     if let Err(e) = status {
-        if !walk.capped {
+        if !walk.capped && e.code().0 != 0 {
             return Err(ToolError::ProcessQuery {
                 pid: 0,
                 reason: format!("EnumWindows failed: {e}"),
