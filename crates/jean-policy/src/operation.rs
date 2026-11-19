@@ -46,6 +46,10 @@ pub enum OperationKind {
     /// digest is the origin that will be loaded, so an approval given for a local fixture must not be
     /// the reason a signed-in session gets driven later.
     DriveBrowser,
+    /// Approving browser access to one specific `http`/`https` origin that is not listed in
+    /// `[browser] allowed_origins`. The scope digest is bound to that single canonical origin so
+    /// approving one site never authorizes redirects or other domains.
+    BrowserOriginAccess,
     /// Acting on a window that already belongs to the operator's desktop.
     ///
     /// Its own kind, and its own digest target, for the reason `DriveBrowser` has one: the thing being
@@ -76,6 +80,7 @@ impl OperationKind {
             Self::DelegatedAction => "delegated_action",
             Self::McpCall => "mcp_call",
             Self::DriveBrowser => "drive_browser",
+            Self::BrowserOriginAccess => "browser_origin_access",
             Self::OperateDesktop => "operate_desktop",
             Self::WorkspaceGoalAccess => "workspace_goal_access",
             Self::DesktopGoalObservation => "desktop_goal_observation",
@@ -89,6 +94,13 @@ impl OperationKind {
             self,
             Self::WorkspaceGoalAccess | Self::DesktopGoalObservation
         )
+    }
+
+    /// Operations that must never be silently allowed via `OwnerCommand` or `RunScope` even if
+    /// `[policy] require_approval` is customized. Unlike `requires_explicit_approval`, a
+    /// specific-origin grant may still be remembered in the ledger strictly for its exact origin.
+    pub const fn always_requires_approval(self) -> bool {
+        self.requires_explicit_approval() || matches!(self, Self::BrowserOriginAccess)
     }
 }
 

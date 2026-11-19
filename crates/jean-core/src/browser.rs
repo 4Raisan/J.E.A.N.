@@ -14,9 +14,11 @@
 //!             → start JEAN's own browser → navigate → read → act → read again → verify → close
 //! ```
 //!
-//! Two gates run before a process exists, because both are things the operator decided in configuration
-//! rather than things a prompt can undo: a disabled subsystem, and an origin outside the allowlist. A
-//! refusal at either point produces no task row, no browser, and one sentence saying why.
+//! Two gates run before a process exists: a disabled subsystem is always refused, and an unlisted
+//! `http`/`https` origin requires explicit per-origin approval scoped strictly to that single
+//! canonical origin (with redirect checks still enforced against only allowlisted origins plus that
+//! approved origin). A refusal at either point produces no task row, no browser, and one sentence
+//! saying why.
 //!
 //! ## Why the verification is a second read
 //!
@@ -56,6 +58,9 @@ mod profile;
 /// The capability a browser workflow declares, and the name it is approved and audited under.
 pub const BROWSER_CAPABILITY: &str = "browser.drive";
 
+/// The capability requested when approving a single browser origin outside `[browser] allowed_origins`.
+pub const BROWSER_ORIGIN_CAPABILITY: &str = "network_egress_new_domain";
+
 /// How long to wait for the page to settle after an interaction before reading the check.
 ///
 /// A click that starts an animation or a `setTimeout` needs one beat, and a workflow that read the DOM
@@ -67,7 +72,7 @@ fn settle_delay(action_timeout: Duration) -> Duration {
 /// One browser workflow, stated as data before any of it runs.
 #[derive(Debug, Clone, Default)]
 pub struct BrowserRequest {
-    /// The page to open. Must be covered by `[browser] allowed_origins`.
+    /// The page to open. Covered by `[browser] allowed_origins` or approved for that specific origin.
     pub url: String,
     /// Read this element's text **before** acting, so "what changed" has a baseline.
     pub inspect: Option<String>,
@@ -122,32 +127,61 @@ pub fn run(
     prompter: &mut dyn Prompter,
 ) -> Result<BrowserReport> {
     ctx.prepare_for_writing()?;
-    let config = ctx.config.browser.clone();
+    let mut config = ctx.config.browser.clone();
     require_enabled(&config)?;
 
-    // The origin gate is first, before the executable is even chosen: `allowed_origins` is the
-    // operator's boundary, and crossing it is not a thing a yes at a prompt can authorise.
-    if !jean_browser::origin_permitted(&config, &request.url) {
-        return Err(CoreError::Intent {
-            reason: format!(
-                "{} is outside [browser] allowed_origins ({:?}); J.E.A.N. will not open a page it has \
-                 no rule for",
-                request.url, config.allowed_origins
-            ),
-        });
-    }
-    let executable = resolve_browser(&config)?;
-    profile::sweep(&ctx.paths.artifacts, &ctx.store);
-
-    let operation = browser_operation(ctx, &executable, request);
     let policy = Policy::new(ctx.config.policy.clone());
     let audit = AuditWriter::new(
         ctx.paths.audit.clone(),
         ctx.config.policy.audit_enabled,
         ctx.redactor.clone(),
     );
-    let task_id = open_task(ctx, &operation, request)?;
     let actor = crate::intent::actor();
+
+    // The origin gate runs before the executable is chosen or a task row is opened. Unlisted
+    // `http`/`https` origins require explicit per-origin approval scoped strictly to that single
+    // canonical origin; all redirect checks still run against `config.allowed_origins`.
+    if !jean_browser::origin_permitted(&config, &request.url) {
+        let Some(origin) =
+            jean_browser::Origin::of(&request.url).filter(|origin| origin.is_http_or_https())
+        else {
+            return Err(CoreError::Intent {
+                reason: format!(
+                    "{} is outside [browser] allowed_origins ({:?}); J.E.A.N. only prompts to \
+                     approve http:// or https:// origins",
+                    request.url, config.allowed_origins
+                ),
+            });
+        };
+        let origin_str = origin.canonical();
+        let origin_op = origin_access_operation(ctx, &origin_str);
+        let origin_decision = policy
+            .decide(&origin_op, &ctx.store, prompter)
+            .map_err(CoreError::Policy)?;
+        audit
+            .record(
+                &AuditEvent::for_decision(&origin_op, &origin_decision, actor.clone())
+                    .with_working_dir(current_directory()),
+            )
+            .map_err(CoreError::Policy)?;
+        if let Decision::Denied(reason) = &origin_decision {
+            let detail = AuditEvent::denial_text(reason);
+            return Err(CoreError::Intent {
+                reason: format!(
+                    "{} is outside [browser] allowed_origins ({:?}) and approval for {} was \
+                     denied: {detail}",
+                    request.url, config.allowed_origins, origin_str
+                ),
+            });
+        }
+        config.allowed_origins.push(origin_str);
+    }
+
+    let executable = resolve_browser(&config)?;
+    profile::sweep(&ctx.paths.artifacts, &ctx.store);
+
+    let operation = browser_operation(ctx, &executable, request);
+    let task_id = open_task(ctx, &operation, request)?;
 
     if would_prompt(&policy, &ctx.store, &operation)? {
         ctx.store.transition(
@@ -594,6 +628,27 @@ fn require_enabled(config: &BrowserConfig) -> Result<()> {
     }
 }
 
+fn origin_access_operation(ctx: &Context, origin: &str) -> Operation {
+    let summary = ctx.redactor.redact(&format!(
+        "allow unlisted browser origin {origin} (outside [browser] allowed_origins; redirects to \
+         other origins remain blocked)"
+    ));
+    Operation {
+        kind: OperationKind::BrowserOriginAccess,
+        tool_id: Some("browser.local".to_owned()),
+        tier: PolicyTier::Normal,
+        capabilities: vec![
+            BROWSER_ORIGIN_CAPABILITY.to_owned(),
+            BROWSER_CAPABILITY.to_owned(),
+        ],
+        summary,
+        scope: Scope::new(
+            origin.to_owned(),
+            vec!["allow_origin".to_owned(), origin.to_owned()],
+        ),
+    }
+}
+
 fn browser_operation(ctx: &Context, executable: &Path, request: &BrowserRequest) -> Operation {
     // The summary is redacted because a URL can carry a session token in its query string, and the
     // summary is what a prompt shows and what the approvals ledger keeps.
@@ -628,13 +683,8 @@ fn browser_operation(ctx: &Context, executable: &Path, request: &BrowserRequest)
 }
 
 fn origin_of(url: &str) -> String {
-    jean_browser::Origin::of(url).map_or_else(
-        || url.to_owned(),
-        |origin| match origin.port {
-            Some(port) => format!("{}://{}:{}", origin.scheme, origin.host, port),
-            None => format!("{}://{}", origin.scheme, origin.host),
-        },
-    )
+    jean_browser::Origin::of(url)
+        .map_or_else(|| url.to_owned(), |origin| origin.canonical())
 }
 
 fn open_task(ctx: &mut Context, operation: &Operation, request: &BrowserRequest) -> Result<String> {

@@ -126,25 +126,26 @@ impl Policy {
         // 3. The capabilities that need asking. A tool with no declared
         //    capabilities has nothing in `require_approval` to match, and lands on
         //    the owner-command authority below — except for operations whose kind
-        //    always requires explicit per-task approval before sending observations
-        //    to a model (`WorkspaceGoalAccess`, `DesktopGoalObservation`).
+        //    always requires approval (`WorkspaceGoalAccess`, `DesktopGoalObservation`,
+        //    and `BrowserOriginAccess` for unlisted browser origins).
         let explicit = op.kind.requires_explicit_approval();
+        let always_ask = op.kind.always_requires_approval();
         let sensitive: Vec<String> = op
             .capabilities
             .iter()
-            .filter(|c| explicit || self.requires_approval(c))
+            .filter(|c| always_ask || self.requires_approval(c))
             .cloned()
             .collect();
 
-        if !explicit && sensitive.is_empty() {
+        if !always_ask && sensitive.is_empty() {
             return Ok(Decision::allowed(Authority::OwnerCommand));
         }
 
         // 4. The operator's own run, for exactly this step of exactly this plan at exactly this
         //    resolved scope. Consulted before the ledger and before the prompt; unable to reach
         //    anything the two checks above refused, and never bypasses explicit model-observation
-        //    consent.
-        if !explicit {
+        //    consent or unlisted browser origin approval.
+        if !always_ask {
             if let Some(scope) = scope {
                 if scope.grant.covers(scope.plan_id, scope.step_key, op) {
                     return Ok(Decision::allowed(Authority::RunScope));
