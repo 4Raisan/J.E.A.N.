@@ -279,7 +279,7 @@ def request_mode(mode, text):
     if mode != "smart":
         return mode
     return ("task" if text.startswith("/") or web_request(text) or gmail_request(text)
-            or youtube_tab_playback(text)
+            or youtube_tab_playback(text) or controlled_browser_task_request(text)
             or ACTION_REQUEST.match(REQUEST_PREFIX.sub("", WAKE_ADDRESS.sub("", text)))
             or trash_request(text) else "chat")
 
@@ -289,6 +289,33 @@ def youtube_tab_playback(text):
         r"\b(?:youtube|you tube)\b.*\bplay\b.*\b(?:open |current |that )?tab\b"
         r"|\bplay\b.*\b(?:youtube|you tube)\b.*\btab\b", text, re.IGNORECASE
     ))
+
+
+def controlled_browser_task_request(text):
+    """Requests that must run through JEAN's controlled browser with per-origin approval,
+    redirect enforcement, and independent verification (YouTube video playback, Bing search)."""
+    cleaned = site_request_text(text).rstrip(".!?").strip()
+    cleaned = re.sub(r"\byou\s+tube\b", "YouTube", cleaned, flags=re.IGNORECASE)
+    if re.search(r"https?://(?:www\.|m\.)?youtube\.com/\S+", cleaned, re.IGNORECASE):
+        return bool(re.search(r"\b(?:play|watch|verify)\b", cleaned, re.IGNORECASE))
+    if re.fullmatch(
+        r"(?:play|watch|put on)(?:\s+me)?\s+.+?\s+(?:on|in)\s+(?:my\s+|the\s+)?youtube(?:\.com)?",
+        cleaned, re.IGNORECASE,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:open|go to)\s+youtube(?:\.com)?\s+and\s+(?:play|watch)\s+.+",
+        cleaned, re.IGNORECASE,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:search(?:\s+for)?|look\s+up|find)\s+.+?\s+(?:on|in|using|with)\s+bing(?:\.com)?"
+        r"|(?:open|go to)\s+bing(?:\.com)?(?:\s+and\s+(?:search(?:\s+for)?|look\s+up)\s+.+)?"
+        r"|bing\s+(?:search(?:\s+for)?\s+)?.+",
+        cleaned, re.IGNORECASE,
+    ):
+        return True
+    return False
 
 @dataclass
 class VoiceTurn:
@@ -1529,7 +1556,7 @@ class Overlay(QWidget):
                     "window": "Spotify", "goal": spotify[1].strip(), "launch": True,
                 }))
                 return
-            if request != text and re.match(r"(?:open|launch|start)\s+", request, re.I):
+            if request and not text.lstrip().startswith("/") and request != text:
                 text = request
         self._log_activity(f"{mode.capitalize()} request: {text}")
         command, _, task_id = text.partition(" ")
@@ -1543,6 +1570,8 @@ class Overlay(QWidget):
             return
         elif mode == "task" and gmail_request(text):
             self._open_gmail()
+        elif mode == "task" and controlled_browser_task_request(text):
+            self._run_task(text)
         elif mode == "task" and (
                 self._open_requested_site(text, spoken=True) if spoken
                 else self._open_requested_site(text)):
@@ -1929,7 +1958,8 @@ class Overlay(QWidget):
         return True
 
     def _browse(self, url):
-        if not url or not url.startswith(("https://", "http://")):
+        target = url[len("--verify-video "):].strip() if url.startswith("--verify-video ") else url
+        if not target or not target.startswith(("https://", "http://")):
             self.show_result("Enter a browser URL", "Example: /browse https://example.com/")
             self._finish_busy_ui()
             return

@@ -258,19 +258,38 @@ fn route(
         return crate::desktop_goal::run(ctx, task, prompt, cancel);
     }
     if command == "/browse" {
+        let (verify_video, url) = if let Some(rest) = arguments.strip_prefix("--verify-video ") {
+            (true, rest.trim())
+        } else {
+            (false, arguments.trim())
+        };
         anyhow::ensure!(
-            arguments.starts_with("https://") || arguments.starts_with("http://"),
+            url.starts_with("https://") || url.starts_with("http://"),
             "Enter a browser URL (example: /browse https://example.com/)."
         );
+        let expect_non_empty = (!verify_video && url.to_ascii_lowercase().contains("bing.com/search"))
+            .then(|| "#b_results".to_owned());
         let request = jean_core::browser::BrowserRequest {
-            url: arguments.to_owned(),
-            inspect: None,
+            url: url.to_owned(),
+            inspect: expect_non_empty.clone(),
             r#type: None,
             click: None,
             expect: None,
+            expect_non_empty,
+            verify_video,
+            video_query: None,
+            allow_audio: verify_video,
         };
         let report = jean_core::browser::run(ctx, &request, prompt)?;
-        if !report.title.is_empty() {
+        if let Some(pb) = &report.playback {
+            println!(
+                "result: Playing {} ({:.2}s -> {:.2}s, {}x{})\n{}",
+                pb.video_title, pb.start_secs, pb.end_secs, pb.video_width, pb.video_height, report.url
+            );
+            if let Some(path) = &report.screenshot {
+                println!("Screenshot: {}", path.display());
+            }
+        } else if !report.title.is_empty() {
             println!("result: {}\n{}", report.title, report.url);
             if let Some(path) = &report.screenshot {
                 println!("Screenshot: {}", path.display());
