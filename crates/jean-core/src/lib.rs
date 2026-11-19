@@ -60,6 +60,7 @@ pub mod owner;
 pub mod paths;
 pub mod plan_runner;
 pub mod planner;
+pub mod playbooks;
 pub mod reconcile;
 pub mod resolve;
 pub mod runner;
