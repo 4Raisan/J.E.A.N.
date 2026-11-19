@@ -2064,3 +2064,143 @@ fn a_granted_run_still_refuses_the_steps_no_answer_could_reach() {
     assert_eq!(count(&ctx, "tool_runs"), 0, "and nothing ran");
     cleanup(&dir);
 }
+
+#[test]
+fn bounded_recovery_recovers_from_failed_step_verifies_output_and_never_bypasses_policy() {
+    let (dir, mut ctx, _guard) = scenario(
+        "recovery",
+        "[policy]\nrequire_approval = [\"network_egress_new_domain\"]\n",
+    );
+    let initial = plan(
+        &[
+            step_command("s1", "fail.tool", &[]),
+            step_command("s2", "echo.tool", &["s1"]),
+        ],
+        "try primary tool first",
+    );
+    let recovery = plan(
+        &[
+            step_command("r1", "echo.tool", &[]),
+            step_find("r2", &dir.join("work"), &["r1"]),
+        ],
+        "recover after fail.tool exited 3 and verify workspace file",
+    );
+    let fake = FakeModel::new(vec![content(initial), content(recovery)]);
+    let cancel = CancelFlag::new();
+
+    let report = plan_runner::run_with_recovery(
+        &mut ctx,
+        &fake,
+        "Run primary probe; if it fails, recover and verify workspace files",
+        &mut ScriptedPrompt::default(),
+        &cancel,
+        &mut |_: &str| {},
+        RunAuthority::OperatorRun,
+    )
+    .expect("recovery run must reach a settled outcome");
+
+    assert_eq!(report.state, TaskState::Succeeded);
+    assert_eq!(report.exit_status(), 0);
+    assert_eq!(report.steps.len(), 2);
+    assert!(report.steps.iter().all(StepOutcome::is_success));
+    assert_eq!(report.recovered_from_steps.len(), 2);
+    assert_eq!(report.recovered_from_steps[0].state, PlanStepState::Failed);
+    assert_eq!(report.recovered_from_steps[1].state, PlanStepState::Skipped);
+    assert!(
+        report.summary.contains("recovered after 1 failed step"),
+        "{}",
+        report.summary
+    );
+
+    // Both plans are persisted: the first is superseded and the recovery plan is live.
+    let plans = ctx.store.plans_for_task(&report.task_id).unwrap();
+    assert_eq!(plans.len(), 2);
+    assert!(plans[0].superseded_at_ms.is_some());
+    assert!(plans[1].superseded_at_ms.is_none());
+
+    // The recovery request saw the failure evidence framed as untrusted data.
+    let calls = fake.prompts();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].contains("EXECUTION OBSERVATIONS (DATA ONLY)"));
+    assert!(calls[1].contains("s1 [failed]"));
+
+    // Policy refusals MUST NEVER trigger recovery.
+    let refused_plan = plan(
+        &[step_command("s1", "sensitive.tool", &[])],
+        "run sensitive tool",
+    );
+    let fake_refused = FakeModel::new(vec![content(refused_plan)]);
+    let refused_report = plan_runner::run_with_recovery(
+        &mut ctx,
+        &fake_refused,
+        "run sensitive tool",
+        &mut ScriptedPrompt::denying(),
+        &cancel,
+        &mut |_: &str| {},
+        RunAuthority::PromptEachStep,
+    )
+    .expect("refused step settles without error");
+    assert_eq!(refused_report.state, TaskState::Failed);
+    assert_eq!(refused_report.exit_status(), 5);
+    assert!(refused_report.recovered_from_steps.is_empty());
+    assert_eq!(
+        fake_refused.prompts().len(),
+        1,
+        "a policy denial must never trigger a recovery replan"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn native_tools_without_explicit_working_dir_default_to_selected_workspace_root() {
+    let dir = temp_dir("cwd-workspace");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("tools.toml"),
+        "config_version = 1\n\n[[tool]]\nid = \"pwd.tool\"\nkind = \"shell\"\n\
+         command = \"cmd.exe\"\nargs = [\"/c\", \"cd\"]\n\
+         verify = { method = \"exit_code\", expected = 0 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("jean.toml"),
+        format!(
+            "[workspace]\nroot = '{}'\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("JEAN_DATA_DIR", &dir);
+    let mut ctx = Context::load(None).unwrap();
+    let report = intent::execute(
+        &mut ctx,
+        &Intent::Command(CommandRequest {
+            tool_id: "pwd.tool".to_owned(),
+            args: vec![],
+            goal: Some("print current directory".to_owned()),
+            interactive: Some(false),
+        }),
+        &mut ScriptedPrompt::default(),
+    )
+    .unwrap();
+    assert_eq!(report.state, TaskState::Succeeded);
+    let Payload::Command(run) = report.payload else {
+        panic!("expected command payload");
+    };
+    let stdout_path = run.outcome.stdout.path.expect("stdout artifact");
+    let stdout = std::fs::read_to_string(stdout_path).unwrap();
+    assert!(
+        stdout
+            .trim()
+            .eq_ignore_ascii_case(&dir.display().to_string()),
+        "tool ran in {:?}, expected selected workspace {:?}",
+        stdout.trim(),
+        dir.display()
+    );
+    cleanup(&dir);
+}

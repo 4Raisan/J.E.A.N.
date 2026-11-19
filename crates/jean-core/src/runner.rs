@@ -238,10 +238,10 @@ fn plan_invocation(ctx: &Context, tool: &ToolDef, request: &RunRequest) -> Resul
             .or_else(|| parent_env.get("PATHEXT").map(String::as_str)),
     )?;
 
-    let working_dir = if tool.working_dir.trim().is_empty() {
-        None
-    } else {
+    let working_dir = if !tool.working_dir.trim().is_empty() {
         Some(PathBuf::from(tool.working_dir.trim()))
+    } else {
+        workspace_working_dir(ctx)
     };
 
     let timeout = Duration::from_secs(
@@ -294,6 +294,24 @@ fn plan_invocation(ctx: &Context, tool: &ToolDef, request: &RunRequest) -> Resul
         redacted_request_json: request_json,
         env_notes,
     })
+}
+
+/// When a tool does not pin its own `working_dir`, default to the active `[workspace] root` so
+/// workspace-relative tools (`git.status`, probes, scripts) operate inside the selected workspace
+/// rather than inheriting JEAN's own launcher directory.
+fn workspace_working_dir(ctx: &Context) -> Option<PathBuf> {
+    let root = crate::intent::workspace_root(ctx)?;
+    if !root.is_dir() {
+        return None;
+    }
+    let display = root.to_string_lossy();
+    if let Some(stripped) = display.strip_prefix(r"\\?\") {
+        let plain = PathBuf::from(stripped);
+        if plain.is_dir() {
+            return Some(plain);
+        }
+    }
+    Some(root)
 }
 
 fn env_notes(report: &EnvReport) -> Vec<String> {

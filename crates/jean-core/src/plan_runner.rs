@@ -142,6 +142,9 @@ pub struct PlanReport {
     pub rejected: Vec<String>,
     pub state: TaskState,
     pub steps: Vec<StepOutcome>,
+    /// Outcomes from an earlier plan attempt that hit a deterministic step failure before bounded
+    /// recovery ran. Empty when the first plan completed without needing recovery.
+    pub recovered_from_steps: Vec<StepOutcome>,
     /// Who the authority for this run came from: `operator_run` or `prompt_each_step`. Recorded so a
     /// report can say whether a person was asked, and a later reader can tell that the answer to
     /// "why did nothing prompt?" is not "because the model answered it".
@@ -223,6 +226,26 @@ impl PlanReport {
                 out.push(format!("      note: {note}"));
             }
         }
+        if !self.recovered_from_steps.is_empty() {
+            out.push(format!(
+                "  recovered after earlier failed attempt ({} step(s)):",
+                self.recovered_from_steps.len()
+            ));
+            for step in &self.recovered_from_steps {
+                let verdict = step
+                    .verdict
+                    .as_ref()
+                    .map(|v| v.label())
+                    .unwrap_or("not run");
+                out.push(format!(
+                    "    {} [{}] {verdict} — {}",
+                    step.step_key, step.state, step.title
+                ));
+                if !step.evidence.is_empty() {
+                    out.push(format!("        evidence: {}", step.evidence));
+                }
+            }
+        }
         out.push(format!("outcome: {}", self.summary));
         for note in &self.notes {
             out.push(format!("  note: {note}"));
@@ -267,6 +290,30 @@ pub fn run(
     )
 }
 
+/// Plan and run, allowing one bounded recovery replan if a step fails deterministically (never on
+/// policy refusal, uncertain side effects, or cancellation).
+pub fn run_with_recovery(
+    ctx: &mut Context,
+    client: &dyn ModelClient,
+    goal: &str,
+    prompter: &mut dyn Prompter,
+    cancel: &CancelFlag,
+    progress: &mut dyn FnMut(&str),
+    authority: RunAuthority,
+) -> Result<PlanReport> {
+    let task_id = jean_protocol::ipc::new_task_id();
+    run_owned_impl(
+        ctx,
+        client,
+        (&task_id, goal),
+        prompter,
+        cancel,
+        progress,
+        authority,
+        true,
+    )
+}
+
 pub fn run_owned(
     ctx: &mut Context,
     client: &dyn ModelClient,
@@ -275,6 +322,29 @@ pub fn run_owned(
     cancel: &CancelFlag,
     progress: &mut dyn FnMut(&str),
     authority: RunAuthority,
+) -> Result<PlanReport> {
+    run_owned_impl(
+        ctx,
+        client,
+        submission,
+        prompter,
+        cancel,
+        progress,
+        authority,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_owned_impl(
+    ctx: &mut Context,
+    client: &dyn ModelClient,
+    submission: (&str, &str),
+    prompter: &mut dyn Prompter,
+    cancel: &CancelFlag,
+    progress: &mut dyn FnMut(&str),
+    authority: RunAuthority,
+    allow_recovery: bool,
 ) -> Result<PlanReport> {
     let (task_id, goal) = submission;
     if !ctx.config.model.planning_enabled() {
@@ -338,14 +408,120 @@ pub fn run_owned(
         plan_id: &plan_id,
         task_id: &parent,
     };
-    let report = execute(ctx, &rows, &planned, prompter, cancel, progress, &mandate).inspect_err(
-        |error| {
-            // The parent row exists and the plan is recorded, so an unexpected failure still has to
-            // be closed rather than left `running` for a later process to interpret.
-            close_unfinished(ctx, &parent, &error.to_string());
-        },
-    )?;
-    Ok(report)
+    let started = std::time::Instant::now();
+    let (outcomes, stopped) =
+        execute_steps(ctx, &rows, &planned, prompter, cancel, progress, &mandate).inspect_err(
+            |error| {
+                // The parent row exists and the plan is recorded, so an unexpected failure still has to
+                // be closed rather than left `running` for a later process to interpret.
+                close_unfinished(ctx, &parent, &error.to_string());
+            },
+        )?;
+
+    if allow_recovery && can_recover(&outcomes, stopped) && !cancel.sync_with_console() {
+        let observations = build_recovery_observations(ctx, &outcomes);
+        progress("a step failed deterministically; requesting one bounded recovery plan");
+        ctx.store
+            .append_event(
+                &parent,
+                &Event::new(
+                    EventKind::Note,
+                    "initial plan had a deterministic step failure; requesting bounded recovery",
+                ),
+            )
+            .ok();
+
+        match planner::ask_recovery(ctx, client, goal, &observations, cancel.atomic()) {
+            Ok(recovery_planned) => {
+                let _ = ctx.store.supersede_plan(&plan_id);
+                let recovery_plan_id = new_plan_id();
+                record_plan(ctx, &recovery_plan_id, &parent, &recovery_planned)?;
+                ctx.store.append_event(
+                    &parent,
+                    &plan_proposed_event(ctx, &recovery_plan_id, &recovery_planned),
+                )?;
+                for note in &recovery_planned.notes {
+                    ctx.store
+                        .append_event(&parent, &Event::new(EventKind::Note, note.clone()))?;
+                }
+                let recovery_mandate =
+                    RunMandate::mint(ctx, &recovery_plan_id, &parent, &recovery_planned, authority);
+                progress("recovery plan accepted");
+                for (index, step) in recovery_planned.plan.steps.iter().enumerate() {
+                    progress(&format!(
+                        "  {}. {} — {} [{state}]",
+                        index + 1,
+                        step.id,
+                        step.title,
+                        state = describe(&step.operation)
+                    ));
+                }
+                progress(&recovery_mandate.describe_line(recovery_planned.plan.steps.len()));
+
+                let recovery_rows = RunRows {
+                    plan_id: &recovery_plan_id,
+                    task_id: &parent,
+                };
+                let (recovery_outcomes, recovery_stopped) = execute_steps(
+                    ctx,
+                    &recovery_rows,
+                    &recovery_planned,
+                    prompter,
+                    cancel,
+                    progress,
+                    &recovery_mandate,
+                )
+                .inspect_err(|error| {
+                    close_unfinished(ctx, &parent, &error.to_string());
+                })?;
+
+                let mut report = finish(
+                    ctx,
+                    &recovery_rows,
+                    &recovery_planned,
+                    recovery_outcomes,
+                    recovery_stopped,
+                    started.elapsed(),
+                    &recovery_mandate,
+                    outcomes,
+                );
+                report.attempts = planned.attempts + recovery_planned.attempts;
+                return Ok(report);
+            }
+            Err(err) => {
+                let note = ctx.redactor.redact(&format!(
+                    "recovery plan unavailable: {err}"
+                ));
+                progress(&format!("  recovery skipped: {}", shorten(&note)));
+                let _ = ctx
+                    .store
+                    .append_event(&parent, &Event::new(EventKind::Note, note.clone()));
+                let mut report = finish(
+                    ctx,
+                    &rows,
+                    &planned,
+                    outcomes,
+                    stopped,
+                    started.elapsed(),
+                    &mandate,
+                    Vec::new(),
+                );
+                report.notes.push(note);
+                return Ok(report);
+            }
+        }
+    }
+
+    Ok(finish(
+        ctx,
+        &rows,
+        &planned,
+        outcomes,
+        stopped,
+        started.elapsed(),
+        &mandate,
+        Vec::new(),
+    ))
 }
 
 /// Validate and render only. Writes nothing at all — no task, no plan row, no audit line.
@@ -524,7 +700,7 @@ fn arguments_json(ctx: &Context, step: &PlanStep) -> String {
 /// `mandate` is the operator's authority for this run, or nothing when no operator stands behind
 /// it. It is handed to each step as a *candidate* answer to the approval question — never as an
 /// override of the policy engine, which is the one that decides whether it applies.
-fn execute(
+fn execute_steps(
     ctx: &mut Context,
     run: &RunRows,
     planned: &Planned,
@@ -532,9 +708,8 @@ fn execute(
     cancel: &CancelFlag,
     progress: &mut dyn FnMut(&str),
     mandate: &RunMandate,
-) -> Result<PlanReport> {
+) -> Result<(Vec<StepOutcome>, Option<PlanStepState>)> {
     let RunRows { plan_id, task_id } = *run;
-    let started = std::time::Instant::now();
     let plan = &planned.plan;
     let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(plan.steps.len());
     let mut states: BTreeMap<String, PlanStepState> = BTreeMap::new();
@@ -672,15 +847,63 @@ fn execute(
         outcomes.push(outcome);
     }
 
-    Ok(finish(
-        ctx,
-        run,
-        planned,
-        outcomes,
-        stopped,
-        started.elapsed(),
-        mandate,
-    ))
+    Ok((outcomes, stopped))
+}
+
+/// Recovery is only allowed for deterministic step failures — never after a policy refusal,
+/// an uncertain side effect (`NeedsAttention`), or cancellation.
+fn can_recover(outcomes: &[StepOutcome], stopped: Option<PlanStepState>) -> bool {
+    if stopped.is_some() {
+        return false;
+    }
+    if outcomes.iter().any(|o| {
+        matches!(
+            o.state,
+            PlanStepState::Cancelled | PlanStepState::NeedsAttention
+        ) || o.was_refused()
+    }) {
+        return false;
+    }
+    outcomes.iter().any(|o| o.state == PlanStepState::Failed)
+}
+
+/// Assemble redacted execution observations for bounded failed-step recovery.
+fn build_recovery_observations(ctx: &Context, outcomes: &[StepOutcome]) -> String {
+    let mut lines = Vec::new();
+    for outcome in outcomes {
+        let mut line = format!(
+            "- {} [{}] ({}): {}",
+            outcome.step_key,
+            outcome.state,
+            ctx.redactor.redact(&outcome.title),
+            ctx.redactor.redact(&outcome.evidence)
+        );
+        if outcome.state == PlanStepState::Failed {
+            if let Some(tid) = &outcome.task_id {
+                if let Ok(runs) = ctx.store.tool_runs(tid) {
+                    if let Some(last) = runs.last() {
+                        for (label, path_opt) in [
+                            ("stderr", last.stderr_path.as_deref()),
+                            ("stdout", last.stdout_path.as_deref()),
+                        ] {
+                            if let Some(path) = path_opt {
+                                if let Ok(raw) = std::fs::read_to_string(path) {
+                                    let trimmed = raw.trim();
+                                    if !trimmed.is_empty() {
+                                        let snippet: String =
+                                            ctx.redactor.redact(trimmed).chars().take(300).collect();
+                                        line.push_str(&format!("\n    {label}: {snippet}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 /// Which rows this run owns: the plan it recorded and the parent task it reports to.
@@ -1089,6 +1312,7 @@ fn unmet_dependency(
 }
 
 /// Decide the parent's state from the step rows, write it, and build the report.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     ctx: &Context,
     run: &RunRows,
@@ -1097,10 +1321,23 @@ fn finish(
     stopped: Option<PlanStepState>,
     elapsed: std::time::Duration,
     mandate: &RunMandate,
+    recovered_from_steps: Vec<StepOutcome>,
 ) -> PlanReport {
     let RunRows { plan_id, task_id } = *run;
     let state = parent_state(&outcomes, stopped, planned.plan.steps.len());
-    let summary = summarize(&outcomes, state);
+    let summary = if !recovered_from_steps.is_empty() && state == TaskState::Succeeded {
+        let failed_earlier = recovered_from_steps
+            .iter()
+            .filter(|o| o.state == PlanStepState::Failed)
+            .count();
+        format!(
+            "succeeded (recovered after {failed_earlier} failed step(s)): {} of {} recovery step(s) proven",
+            outcomes.iter().filter(|o| o.is_success()).count(),
+            outcomes.len()
+        )
+    } else {
+        summarize(&outcomes, state)
+    };
 
     // Running -> Verifying -> final. The verification stage is real: the verdicts above were produced
     // before this transition, not after it.
@@ -1138,6 +1375,7 @@ fn finish(
         rejected: planned.rejected.clone(),
         state,
         steps: outcomes,
+        recovered_from_steps,
         run_authority: mandate.authority().as_str(),
         covered_steps: mandate.covered(),
         summary,

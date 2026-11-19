@@ -89,7 +89,8 @@ pub use notify::{is_registered, register as register_notifications, Delivered};
 pub use paths::Paths;
 pub use plan_runner::{
     plan_lines, preview as preview_plan, render_preview, run as run_plan,
-    wording as summary_wording, CancelFlag, PlanReport, StepOutcome,
+    run_with_recovery as run_plan_with_recovery, wording as summary_wording, CancelFlag,
+    PlanReport, StepOutcome,
 };
 pub use planner::{Planned, Validation, MAX_PLANNING_ATTEMPTS};
 pub use reconcile::{reconcile, Reconciliation};
