@@ -569,6 +569,12 @@ class Overlay(QWidget):
         # Voice state
         self.foreground_cancel = None
         self.activity_lines = []
+        self.chat_history = []
+        self.voice_misses = 0
+        self.pending_dream_turns = 0
+        self.dream_running = False
+        self.last_request_spoken = False
+        self.last_full_spoken_reply = None
         self.wake_error = None
         self.last_local_step = None
         self.last_open_step = None
@@ -576,6 +582,18 @@ class Overlay(QWidget):
         data_dir = Path(os.environ.get("JEAN_DATA_DIR") or Path(os.environ["LOCALAPPDATA"]) / "JEAN")
         self.trash = WorkspaceTrash(data_dir / "workspace-trash")
         self.voice_settings = QSettings("JEAN", "Desktop")
+        saved_mode = self.voice_settings.value("mode", "smart", type=str)
+        self.mode = saved_mode if saved_mode in ("smart", "task", "chat") else "smart"
+        self.speak_replies = self.voice_settings.value("speak_replies", True, type=bool)
+        self.brief_speech = self.voice_settings.value("brief_speech", True, type=bool)
+        self.idle_dream_enabled = self.voice_settings.value("idle_dream", True, type=bool)
+        self.always_on_top = self.voice_settings.value("always_on_top", True, type=bool)
+        if not self.always_on_top:
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.Window
+                | Qt.WindowType.NoDropShadowWindowHint
+            )
         self.model_profiles = model_settings.read(self.voice_settings)
         self.model_dialog = None
         self.backend = self.model_profiles["listening"]["backend"]
@@ -1511,8 +1529,31 @@ class Overlay(QWidget):
         self._finish_voice(turn)
         self._speak_async(reply, False)
 
-    def _submit_request(self, mode, text, *, spoken=False):
-        desktop_request = voice_bench.normalize_tokens(site_request_text(text))
+    def _submit_request(self, mode, text, *, spoken=False, allow_task_escalation=True):
+        self.last_request_spoken = spoken
+        cleaned_cmd = voice_bench.normalize_tokens(site_request_text(text))
+        if cleaned_cmd in {"read the full reply", "read full reply", "read the full answer"}:
+            reply = self.last_full_spoken_reply
+            if reply:
+                self._speak_async(*reply, full=True)
+            else:
+                self._speak_async("There isn't a longer spoken reply yet.", False)
+            self._finish_busy_ui()
+            return
+        if cleaned_cmd in {"hear me", "do you hear me", "just say something", "say something"}:
+            reply = "Yes, I can hear you." if cleaned_cmd.endswith("hear me") else "I'm here. What would you like to do?"
+            self.show_result("JEAN", reply)
+            self._speak_async(reply, False)
+            self._finish_busy_ui()
+            return
+        if cleaned_cmd in {"new conversation", "clear chat", "reset chat", "fresh conversation"}:
+            self.chat_history.clear()
+            self.show_result("Conversation reset", "Starting a fresh conversation.")
+            self._finish_busy_ui()
+            if spoken:
+                self._speak_async("Starting a fresh conversation.", False)
+            return
+        desktop_request = cleaned_cmd
         if desktop_request in {
             "desktop windows", "list windows", "show open windows",
             "what s on my screen", "what is on my screen", "can you see what s on my screen",
@@ -2358,6 +2399,14 @@ class Overlay(QWidget):
     def _speak_async(self, text, task_result, *, full=False, force=False):
         if not text or self.voice_turn is not None:
             return
+        if not self.speak_replies and not force:
+            self.voice_reply = None
+            return
+        if not full and self.brief_speech:
+            shortened = self._short_spoken_reply(text)
+            if len(shortened) < len(" ".join(text.split())):
+                self.last_full_spoken_reply = (text, task_result)
+            text = shortened
         self.voice_reply = None
         self.stop_speech_playback()
         self._stop_wake_listener()
@@ -2365,7 +2414,7 @@ class Overlay(QWidget):
         argv.append(f"--rate={self.voice_rate.currentData()}")
         if self.voice_choice.currentData():
             argv.extend(["--voice", self.voice_choice.currentData()])
-        if task_result:
+        if task_result and not full:
             argv.append("--task-result")
         try:
             proc = subprocess.Popen(
@@ -2478,12 +2527,41 @@ class Overlay(QWidget):
         if not self.task_id.text() and not self.busy:
             self.task_id.setText(task_id)
 
+    @staticmethod
+    def _spoken_detail(title, detail):
+        spoken_titles = {
+            "JEAN", CHAT_SETUP_TITLE, "Where should the section go?",
+            "Local memory", "Memory saved", "Memory updated", "Memory forgotten",
+            "Dream cycle complete", "Dream log",
+            "Saved workflows", "Saved workflow", "Saved playbook",
+            "Workflow saved", "Workflow ran", "Workflow removed",
+            "Workspace trash", "Moved to workspace trash", "Restored from trash",
+            "Workspace trash cleaned", "Clarification needed", "Conversation reset",
+        }
+        if not detail or title not in spoken_titles:
+            return title + "."
+        # Strip tabular IDs/timestamps from memory/playbook listings when speaking aloud.
+        spoken_lines = []
+        for raw in detail.splitlines():
+            line = raw.strip()
+            if not line or line in {"created", "duplicate"}:
+                continue
+            if "\t" in line:
+                parts = [p.strip() for p in line.split("\t") if p.strip()]
+                line = parts[-1] if parts else line
+            spoken_lines.append(line)
+            if len(spoken_lines) >= 3:
+                break
+        spoken = ". ".join(spoken_lines).strip()
+        if not spoken:
+            return title + "."
+        if title in {"Memory saved", "Memory updated", "Memory forgotten", "Saved workflows"}:
+            return f"{title}. {spoken}"
+        return spoken
+
     def show_result(self, title, detail, *, log=True):
         if self.voice_reply is not None:
-            self.voice_reply[0] = (
-                detail if title in {"JEAN", CHAT_SETUP_TITLE, "Where should the section go?"} and detail
-                else title + "."
-            )
+            self.voice_reply[0] = self._spoken_detail(title, detail)
         if log:
             self._log_activity(f"{title}: {detail}")
         self.title.setText(title)
