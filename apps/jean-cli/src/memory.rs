@@ -1,7 +1,7 @@
 //! Explicit, offline history and memory commands. No model or voice worker is started.
 use clap::Subcommand;
-use jean_core::{memory, Context};
-use jean_store::{FactAddOutcome, SavedFact, SearchOptions};
+use jean_core::{build_model, dream, memory, CancelFlag, Context};
+use jean_store::{FactAddOutcome, MemoryNote, SavedFact, SearchOptions};
 use std::process::ExitCode;
 
 #[derive(Subcommand)]
@@ -52,6 +52,57 @@ pub enum Memory {
     },
     Forget {
         id: String,
+    },
+    /// Recall relevant saved facts, consolidated memory notes, playbooks, and episodes.
+    Recall {
+        query: String,
+        #[arg(long)]
+        scope: Option<String>,
+        /// Print a single spoken-friendly summary sentence instead of tabular lines.
+        #[arg(long)]
+        spoken: bool,
+    },
+    /// Run a memory consolidation ("dream") cycle over recent episodes and tasks.
+    Dream {
+        /// Also invoke the configured main model for read-only deep synthesis.
+        #[arg(long)]
+        deep: bool,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// List self-updated and dreamed semantic memory notes.
+    Notes {
+        #[arg(long)]
+        scope: Option<String>,
+        /// Include superseded and archived notes.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// List recent episodic observations.
+    Episodes {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// List recent dream consolidation cycles.
+    DreamLog {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Remove a consolidated/self-updated memory note by id.
+    ForgetNote {
+        id: String,
+    },
+    /// Record an observation and run self-updating preference/correction extraction.
+    Observe {
+        text: String,
+        #[arg(long, default_value = "observation")]
+        kind: String,
+        #[arg(long)]
+        scope: Option<String>,
     },
 }
 #[derive(Subcommand)]
@@ -164,8 +215,150 @@ pub fn facts(ctx: &mut Context, command: Memory) -> anyhow::Result<ExitCode> {
             let f = found(memory::forget_fact(ctx, &id)?)?;
             println!("forgotten {}", terminal(&f.id));
         }
+        Memory::Recall {
+            query,
+            scope,
+            spoken,
+        } => {
+            let recalled = dream::recall_context(
+                ctx,
+                &query,
+                scope.as_deref(),
+                dream::DEFAULT_RECALL_CHARS,
+            )?;
+            if spoken {
+                println!("{}", terminal(&recalled.render_spoken_summary()));
+            } else if recalled.is_empty() {
+                println!("No matching memories.");
+            } else {
+                for f in &recalled.facts {
+                    fact(f);
+                }
+                for n in &recalled.notes {
+                    print_note(n);
+                }
+                for pb in &recalled.playbooks {
+                    println!(
+                        "playbook\t{}\tverified={}\t{}",
+                        terminal(&pb.name),
+                        pb.verified_successes,
+                        terminal(&pb.description)
+                    );
+                }
+            }
+        }
+        Memory::Dream { deep, scope } => {
+            let cancel = CancelFlag::new();
+            let model = if deep && ctx.config.model.planning_enabled() {
+                Some(build_model(&ctx.config.model)?)
+            } else {
+                None
+            };
+            let report = dream::dream(
+                ctx,
+                model.as_deref(),
+                scope.as_deref(),
+                cancel.atomic(),
+            )?;
+            println!("{}", terminal(&report.cycle.summary));
+            for n in &report.updated_notes {
+                print_note(n);
+            }
+            for pb in &report.promoted_playbooks {
+                println!("promoted playbook\t{}", terminal(pb));
+            }
+        }
+        Memory::Notes { scope, all, limit } => {
+            let notes = ctx
+                .store
+                .list_memory_notes(scope.as_deref(), all, limit.min(100))?;
+            if notes.is_empty() {
+                println!("No consolidated memory notes yet.");
+            } else {
+                for n in &notes {
+                    print_note(n);
+                }
+            }
+        }
+        Memory::Episodes { scope, limit } => {
+            let eps = ctx
+                .store
+                .recent_episodes(scope.as_deref(), limit.min(100))?;
+            if eps.is_empty() {
+                println!("No episodes recorded yet.");
+            } else {
+                for ep in eps {
+                    println!(
+                        "{}\t[{}]\tconsolidated={}\tsalience={}\t{}",
+                        terminal(&ep.id),
+                        terminal(&ep.kind),
+                        ep.consolidated,
+                        ep.salience,
+                        terminal(&ep.summary)
+                    );
+                }
+            }
+        }
+        Memory::DreamLog { limit } => {
+            let cycles = ctx.store.recent_dream_cycles(limit.min(50))?;
+            if cycles.is_empty() {
+                println!("No dream cycles recorded yet.");
+            } else {
+                for c in cycles {
+                    println!(
+                        "{}\tmode={}\tcreated={}\tsuperseded={}\tplaybooks={}\t{}",
+                        terminal(&c.id),
+                        terminal(&c.mode),
+                        c.notes_created,
+                        c.notes_superseded,
+                        c.playbooks_promoted,
+                        terminal(&c.summary)
+                    );
+                }
+            }
+        }
+        Memory::ForgetNote { id } => {
+            let removed = ctx
+                .store
+                .forget_memory_note(&id)?
+                .ok_or_else(|| anyhow::anyhow!("memory note not found"))?;
+            println!("forgotten note {}", terminal(&removed.id));
+        }
+        Memory::Observe { text, kind, scope } => {
+            let updates = dream::extract_and_update_from_utterance(ctx, scope.as_deref(), &text)?;
+            if updates.is_empty() {
+                let _ = dream::observe_episode(
+                    ctx,
+                    &kind,
+                    scope.as_deref(),
+                    &text,
+                    "manual",
+                    60,
+                    None,
+                )?;
+                println!("recorded episode");
+            } else {
+                for ev in updates {
+                    println!("updated ({:?})", ev.kind);
+                    print_note(&ev.note);
+                }
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_note(n: &MemoryNote) {
+    println!(
+        "{}\t[{}]\tstatus={}\torigin={}\tsalience={}\trecalls={}\t{}",
+        terminal(&n.id),
+        terminal(&n.category),
+        terminal(&n.status),
+        terminal(&n.origin),
+        n.salience,
+        n.recall_count,
+        terminal(&n.text)
+    );
 }
 pub fn preferences(ctx: &mut Context, command: Preferences) -> anyhow::Result<ExitCode> {
     match command {

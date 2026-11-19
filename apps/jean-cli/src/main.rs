@@ -125,7 +125,7 @@ enum Command {
         #[command(subcommand)]
         command: memory::History,
     },
-    /// Manage explicitly saved facts (global only unless --scope is selected).
+    /// Manage explicitly saved facts, consolidated memories, and dreaming cycles.
     Memory {
         #[command(subcommand)]
         command: memory::Memory,

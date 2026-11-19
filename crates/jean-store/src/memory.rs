@@ -46,8 +46,8 @@ pub const SNIPPET_TOKENS: usize = 12;
 
 /// Markers around the matched word. Plain brackets, because a search result is read
 /// in a terminal and may be pasted into a bug report.
-const MARKER_OPEN: &str = "[";
-const MARKER_CLOSE: &str = "]";
+pub(crate) const MARKER_OPEN: &str = "[";
+pub(crate) const MARKER_CLOSE: &str = "]";
 
 /// The longest text an operator may save as a fact. The schema states the same
 /// bound (`CHECK (length(text) BETWEEN 1 AND 1000)`) so a hand-written row cannot
@@ -303,13 +303,27 @@ impl Store {
             "DELETE FROM tasks_fts;
              DELETE FROM events_fts;
              DELETE FROM saved_facts_fts;
+             DELETE FROM memory_episodes_fts;
+             DELETE FROM memory_notes_fts;
+             DELETE FROM playbooks_fts;
              INSERT INTO tasks_fts(rowid, goal, outcome_detail)
                  SELECT rowid, substr(jean_redact(goal), 1, 512),
                         substr(jean_redact(outcome_detail), 1, 512) FROM tasks;
              INSERT INTO events_fts(rowid, detail)
                  SELECT seq, substr(jean_event_text(kind, detail), 1, 512) FROM events;
              INSERT INTO saved_facts_fts(rowid, text)
-                 SELECT rowid, jean_redact(text) FROM saved_facts;",
+                 SELECT rowid, jean_redact(text) FROM saved_facts;
+             INSERT INTO memory_episodes_fts(rowid, summary, tags)
+                 SELECT rowid, substr(jean_redact(summary), 1, 512),
+                        substr(jean_redact(tags), 1, 512) FROM memory_episodes;
+             INSERT INTO memory_notes_fts(rowid, text, topic_key, category)
+                 SELECT rowid, substr(jean_redact(text), 1, 512),
+                        substr(jean_redact(topic_key), 1, 160), category FROM memory_notes;
+             INSERT INTO playbooks_fts(rowid, name, display_name, description, triggers_json)
+                 SELECT rowid, substr(jean_redact(name), 1, 80),
+                        substr(jean_redact(display_name), 1, 120),
+                        substr(jean_redact(description), 1, 512),
+                        substr(jean_redact(triggers_json), 1, 512) FROM playbooks;",
         )
         .map_err(StoreError::sqlite("rebuild history index"))?;
         tx.commit().map_err(StoreError::sqlite("commit rebuild"))?;
@@ -816,7 +830,7 @@ impl Store {
     }
 
     /// Turn what the operator typed into the string bound to `MATCH`.
-    fn search_expression(
+    pub(crate) fn search_expression(
         &self,
         options: &SearchOptions<'_>,
     ) -> std::result::Result<String, StoreError> {
@@ -865,7 +879,7 @@ impl Store {
 /// the answer is an error rather than an unbounded wait — and never a fallback
 /// scan. The thread is joined on drop, so a search that finishes in time cannot
 /// leave a watchdog armed over the next statement.
-struct SearchBudget {
+pub(crate) struct SearchBudget {
     done: std::sync::mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -874,7 +888,7 @@ struct SearchBudget {
 const MAX_SEARCH_MS: u64 = 2_000;
 
 impl SearchBudget {
-    fn install(conn: &Connection) -> Result<Self> {
+    pub(crate) fn install(conn: &Connection) -> Result<Self> {
         let interrupt = conn.get_interrupt_handle();
         let (done, wait) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::Builder::new()
@@ -911,12 +925,12 @@ impl Drop for SearchBudget {
 /// Restored on `Drop` rather than on the success path, because the point is that a
 /// query that errors halfway cannot leave the connection read-only and make every
 /// later write in this process fail for a reason nobody can see.
-struct QueryOnly<'a> {
+pub(crate) struct QueryOnly<'a> {
     conn: &'a Connection,
 }
 
 impl<'a> QueryOnly<'a> {
-    fn new(conn: &'a Connection) -> Result<Self> {
+    pub(crate) fn new(conn: &'a Connection) -> Result<Self> {
         conn.pragma_update(None, "query_only", "ON")
             .map_err(StoreError::sqlite("set query_only"))?;
         Ok(Self { conn })
@@ -956,7 +970,7 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedFact> {
     })
 }
 
-fn collect<T>(
+pub(crate) fn collect<T>(
     rows: impl Iterator<Item = std::result::Result<T, rusqlite::Error>>,
     context: &'static str,
 ) -> Result<Vec<T>> {
@@ -976,7 +990,7 @@ fn collect<T>(
 /// paths go through here. Without it a malformed query looks exactly like a search
 /// that found nothing, the most confusing possible answer, because "no results"
 /// teaches an operator to change the words rather than the flag.
-fn classify_sqlite_error(context: &'static str, error: rusqlite::Error) -> StoreError {
+pub(crate) fn classify_sqlite_error(context: &'static str, error: rusqlite::Error) -> StoreError {
     let message = error.to_string();
     if message.contains("fts5: syntax error") {
         StoreError::BadQuery {
@@ -994,11 +1008,11 @@ fn classify_sqlite_error(context: &'static str, error: rusqlite::Error) -> Store
 /// The shipped pattern floor, applied at the writer so a caller that skipped
 /// redaction still cannot store a credential. Patterns recognise shapes: a secret
 /// in an unknown shape passes, which is why this is a floor and not a guarantee.
-fn credential_floor() -> jean_protocol::Redactor {
+pub(crate) fn credential_floor() -> jean_protocol::Redactor {
     jean_protocol::Redactor::new(&jean_protocol::config::default_redact_patterns())
 }
 
-fn valid_fact_text(text: &str) -> std::result::Result<String, StoreError> {
+pub(crate) fn valid_fact_text(text: &str) -> std::result::Result<String, StoreError> {
     let trimmed = text.trim();
     if credential_floor().redact(trimmed) != trimmed {
         return Err(StoreError::Memory {
@@ -1030,7 +1044,7 @@ fn valid_fact_text(text: &str) -> std::result::Result<String, StoreError> {
     Ok(trimmed.to_owned())
 }
 
-fn valid_fact_scope(scope: &str) -> std::result::Result<String, StoreError> {
+pub(crate) fn valid_fact_scope(scope: &str) -> std::result::Result<String, StoreError> {
     let trimmed = scope.trim();
     if credential_floor().redact(trimmed) != trimmed {
         return Err(StoreError::Memory {
