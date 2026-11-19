@@ -45,6 +45,7 @@ pub mod context;
 pub mod decision;
 pub mod delegation;
 pub mod desktop;
+pub mod dream;
 pub mod env;
 pub mod error;
 pub mod health;
