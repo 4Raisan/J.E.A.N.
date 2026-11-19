@@ -63,6 +63,16 @@ fn file_path(root: &Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(root.join(name))
 }
 
+fn extract_json_object(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end >= start {
+            return &trimmed[start..=end];
+        }
+    }
+    trimmed
+}
+
 fn pending_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -266,7 +276,7 @@ pub(crate) fn run_with_model(
         } else {
             (|| -> anyhow::Result<Value> {
                 Ok(
-                    match serde_json::from_str::<Action>(&reply.content)
+                    match serde_json::from_str::<Action>(extract_json_object(&reply.content))
                         .context("Invalid action JSON")?
                     {
                         Action::List => {
@@ -328,6 +338,15 @@ pub(crate) fn run_with_model(
                             ctx.store
                                 .transition(&task_id, TaskState::Succeeded, Some(&summary))?;
                             ctx.store.set_outcome(&task_id, "proven", &summary)?;
+                            let _ = jean_core::dream::observe_episode(
+                                ctx,
+                                "task_success",
+                                Some(&root.display().to_string()),
+                                &format!("Workspace goal '{}': {summary}", goal.trim()),
+                                "workspace",
+                                72,
+                                Some(&task_id),
+                            );
                             println!("result: {summary}");
                             return Ok(Value::Null);
                         }

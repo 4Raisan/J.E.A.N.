@@ -433,36 +433,242 @@ fn route(
             prompt,
         );
     }
-    if let Some(workspace) = options.workspace {
+    let workspace_path = if let Some(workspace) = options.workspace {
         let workspace = workspace.canonicalize()?;
         anyhow::ensure!(
             workspace.is_dir(),
             "the selected workspace is not a directory"
         );
         ctx.config.workspace.root = workspace.display().to_string();
+        Some(workspace)
+    } else {
+        let configured = ctx.config.workspace.root.trim();
+        (!configured.is_empty())
+            .then(|| PathBuf::from(configured))
+            .filter(|p| p.is_dir())
+    };
+    let scope = workspace_path.as_ref().map(|p| p.display().to_string());
+
+    // 1) KNOWN TASK RECALL: check JEAN's procedural memory (`playbooks`) first.
+    if let Some(matched) = jean_core::playbooks::match_known_task(ctx, goal, scope.as_deref())? {
+        return crate::playbook::execute_playbook(
+            ctx,
+            &matched.record,
+            &matched.steps,
+            workspace_path.as_deref(),
+            prompt,
+            cancel,
+        );
     }
-    if let Some(task) = crate::desktop_goal::opening_request(goal) {
-        return crate::desktop_goal::run(ctx, task, prompt, cancel);
-    }
-    let result = crate::phase2::do_with_prompt(
+
+    // 2) NEW TASK AUTONOMOUS SOLVER: figure out the best grounded strategy across
+    //    deterministic tools, desktop UIA, workspace files, browser, coding agents, or planning.
+    let solver_model = if ctx.config.model.planning_enabled() {
+        jean_core::build_model(&ctx.config.model).ok()
+    } else {
+        None
+    };
+    let strategy = jean_core::solver::propose_strategy(
         ctx,
-        crate::phase2::DoOptions {
-            goal: goal.into(),
-            yes: false,
-            prompt_each: true,
-        },
-        prompt,
-        cancel,
-    );
-    if result.as_ref().err().is_some_and(|error| {
-        matches!(
-            error.downcast_ref::<jean_core::CoreError>(),
-            Some(jean_core::CoreError::PlanRejected { .. })
-        )
-    }) {
-        println!("next: For an open app, choose More → Work in an app. For a code change, select a workspace and use /delegate followed by the goal.");
+        solver_model.as_deref(),
+        goal,
+        workspace_path.as_deref(),
+        cancel.atomic(),
+    )?;
+
+    match strategy {
+        jean_core::solver::TaskStrategy::DirectSteps { rationale, steps } => {
+            println!("strategy: {rationale}");
+            let started = Instant::now();
+            let (code, summary) = crate::playbook::execute_steps(
+                ctx,
+                &steps,
+                workspace_path.as_deref(),
+                prompt,
+                cancel,
+            )?;
+            let elapsed_ms = started.elapsed().as_millis() as i64;
+            if code == ExitCode::SUCCESS {
+                let _ = jean_core::dream::observe_episode(
+                    ctx,
+                    "task_success",
+                    scope.as_deref(),
+                    &format!("Solved new task '{goal}': {summary}"),
+                    "solver,direct",
+                    72,
+                    None,
+                );
+                let _ = jean_core::playbooks::learn_from_verified_task(
+                    ctx,
+                    goal,
+                    scope.as_deref(),
+                    &steps,
+                    None,
+                    elapsed_ms,
+                );
+            } else {
+                let _ = jean_core::dream::observe_episode(
+                    ctx,
+                    "task_failure",
+                    scope.as_deref(),
+                    &format!("Direct task '{goal}' ended: {summary}"),
+                    "solver,direct",
+                    68,
+                    None,
+                );
+            }
+            Ok(code)
+        }
+        jean_core::solver::TaskStrategy::DesktopApp {
+            window,
+            goal: app_goal,
+            launch,
+            rationale,
+        } => {
+            println!("strategy: {rationale}");
+            crate::desktop_goal::run(
+                ctx,
+                crate::desktop_goal::Goal::new(window, app_goal, launch),
+                prompt,
+                cancel,
+            )
+        }
+        jean_core::solver::TaskStrategy::WorkspaceFiles {
+            goal: ws_goal,
+            rationale,
+        } => {
+            println!("strategy: {rationale}");
+            let root = workspace_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Select a workspace with Browse first."))?;
+            crate::workspace_goal::run(ctx, root, &ws_goal, prompt, cancel)
+        }
+        jean_core::solver::TaskStrategy::Browser {
+            url,
+            inspect,
+            expect_non_empty,
+            verify_video,
+            video_query,
+            rationale,
+        } => {
+            println!("strategy: {rationale}");
+            let started = Instant::now();
+            let request = jean_core::browser::BrowserRequest {
+                url: url.clone(),
+                inspect: inspect.clone(),
+                r#type: None,
+                click: None,
+                expect: None,
+                expect_non_empty: expect_non_empty.clone(),
+                verify_video,
+                video_query: video_query.clone(),
+                allow_audio: verify_video,
+            };
+            let report = jean_core::browser::run(ctx, &request, prompt)?;
+            let exit = crate::phase3::browser_exit(&report);
+            if let Some(pb) = &report.playback {
+                println!(
+                    "result: Playing {} ({:.2}s -> {:.2}s, {}x{})\n{}",
+                    pb.video_title, pb.start_secs, pb.end_secs, pb.video_width, pb.video_height, report.url
+                );
+                if let Some(path) = &report.screenshot {
+                    println!("Screenshot: {}", path.display());
+                }
+            } else if !report.title.is_empty() {
+                println!("result: {}\n{}", report.title, report.url);
+                if let Some(after) = &report.after {
+                    let clean: String = ctx.redactor.redact(after).chars().take(400).collect();
+                    if !clean.trim().is_empty() {
+                        println!("result: {clean}");
+                    }
+                } else {
+                    let clean: String = ctx
+                        .redactor
+                        .redact(&report.excerpt)
+                        .chars()
+                        .take(400)
+                        .collect();
+                    if !clean.trim().is_empty() {
+                        println!("result: {clean}");
+                    }
+                }
+                if let Some(path) = &report.screenshot {
+                    println!("Screenshot: {}", path.display());
+                }
+            } else {
+                println!("reason: {}", report.verdict.detail());
+            }
+            if exit == 0 {
+                let _ = jean_core::playbooks::learn_from_verified_task(
+                    ctx,
+                    goal,
+                    scope.as_deref(),
+                    &[jean_core::playbooks::PlaybookStep::Browser {
+                        url,
+                        inspect,
+                        expect_non_empty,
+                        verify_video,
+                        video_query,
+                    }],
+                    None,
+                    started.elapsed().as_millis() as i64,
+                );
+            }
+            Ok(ExitCode::from(exit as u8))
+        }
+        jean_core::solver::TaskStrategy::Delegate {
+            goal: del_goal,
+            worker,
+            rationale,
+        } => {
+            println!("strategy: {rationale}");
+            let worker = worker
+                .as_deref()
+                .map(|name| configured_worker_name(ctx, name))
+                .transpose()?;
+            crate::phase3::delegate_with_prompt(
+                ctx,
+                crate::phase3::DelegateOptions {
+                    goal: del_goal,
+                    workspace: workspace_path,
+                    worker,
+                    profile: options.profile,
+                    instruction: options.instruction,
+                    json: false,
+                },
+                prompt,
+            )
+        }
+        jean_core::solver::TaskStrategy::Clarify { question } => {
+            println!("clarify: {question}");
+            Ok(ExitCode::from(1))
+        }
+        jean_core::solver::TaskStrategy::StructuredPlan {
+            goal: plan_goal,
+            rationale,
+        } => {
+            println!("strategy: {rationale}");
+            let result = crate::phase2::do_with_prompt(
+                ctx,
+                crate::phase2::DoOptions {
+                    goal: plan_goal,
+                    yes: false,
+                    prompt_each: true,
+                },
+                prompt,
+                cancel,
+            );
+            if result.as_ref().err().is_some_and(|error| {
+                matches!(
+                    error.downcast_ref::<jean_core::CoreError>(),
+                    Some(jean_core::CoreError::PlanRejected { .. })
+                )
+            }) {
+                println!("next: For an open app, choose More → Work in an app. For a code change, select a workspace and use /delegate followed by the goal.");
+            }
+            result
+        }
     }
-    result
 }
 
 fn split_first(text: &str) -> (&str, &str) {
