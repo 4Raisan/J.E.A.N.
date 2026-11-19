@@ -23,7 +23,10 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 # The push-to-talk binding polls only its own keys (GetAsyncKeyState). No audio
 # enters the CLI: capture and playback stay in the voice worker process.
-windows = { workspace = true, features = ["Win32_Media_Speech"] }
+windows = { workspace = true, features = ["Win32_Media_Audio", "Win32_Media_Speech"] }
+
+[target.'cfg(windows)'.dependencies]
+tempfile = "3"
 
 [dev-dependencies]
 windows = { workspace = true }

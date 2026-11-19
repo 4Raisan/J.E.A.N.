@@ -120,6 +120,9 @@ enum Command {
         /// Speaking rate from -10 to 10.
         #[arg(long, default_value_t = 0, allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-10..=10))]
         rate: i32,
+        /// Write a synthesized WAV to stdout for playback by the desktop overlay.
+        #[arg(long, hide = true)]
+        wav_stdout: bool,
     },
     /// Search recorded history without launching a model or voice worker.
     History {
@@ -1015,9 +1018,10 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         task_result,
         voice,
         rate,
+        wav_stdout,
     } = command
     {
-        spoken_reply::speak_from_stdin(task_result, voice, rate)?;
+        spoken_reply::speak_from_stdin(task_result, voice, rate, wav_stdout)?;
         return Ok(ExitCode::SUCCESS);
     }
     let exe_dir = executable_directory();

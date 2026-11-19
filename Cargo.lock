@@ -1690,6 +1690,7 @@ dependencies = [
  "jean-tools",
  "serde",
  "serde_json",
+ "tempfile",
  "windows 0.62.2",
 ]
 

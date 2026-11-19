@@ -60,7 +60,7 @@ class LayoutEditor(QDialog):
 
 
 class AudioControls(QWidget):
-    def __init__(self, meter, open_devices, wake, voice, pace, switch_device):
+    def __init__(self, meter, open_devices, wake, voice, pace, switch_device, test_speaker=None):
         super().__init__()
         self.meter = meter
         self.rows = {}
@@ -105,7 +105,12 @@ class AudioControls(QWidget):
         self.error = QLabel()
         self.error.setWordWrap(True)
         self.error.hide()
-        grid.addWidget(self.error, 6, 0, 1, 3)
+        if test_speaker is not None:
+            test = QPushButton("Test speaker")
+            test.setObjectName("mini")
+            test.clicked.connect(test_speaker)
+            grid.addWidget(test, 6, 0, 1, 3)
+        grid.addWidget(self.error, 7, 0, 1, 3)
         self.poll = QTimer(self)
         self.poll.setInterval(750)
         self.poll.timeout.connect(self.refresh)

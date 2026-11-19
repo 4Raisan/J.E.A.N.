@@ -779,7 +779,7 @@ class Overlay(QWidget):
         self.sections = {
             "audio": ("Audio", AudioControls(self.playback_meter, self._open_audio_devices,
                                              self.wake_button, self.voice_choice, self.voice_rate,
-                                             self._switch_audio_device)),
+                                             self._switch_audio_device, self._test_speaker)),
             "models": ("Models", self.backend_btn),
             "setup": ("Task setup", self.task_options),
             "tasks": ("Task actions", task_actions),
@@ -1257,7 +1257,7 @@ class Overlay(QWidget):
             if not self.card.isVisible():
                 self.toggle_message()
             self.raise_()
-            self._sync_wake_listener()
+            self._speak_async("I'm listening.", False)
 
     def toggle_listen(self):
         if self.listening:
@@ -2335,14 +2335,34 @@ class Overlay(QWidget):
             lambda: self.voice_settings.setValue("voice", self.voice_choice.currentData())
         )
 
-    def _speak_async(self, text, task_result):
+    def _test_speaker(self):
+        if self.voice_turn is not None:
+            self.show_result("Speaker test waiting", "End recording and let JEAN finish the turn, then test again.")
+            return
+        self.show_result("Speaker test", "Listen for a short message on your selected Windows output.")
+        self._speak_async("This is the JEAN speaker test.", False, force=True)
+
+    @staticmethod
+    def _short_spoken_reply(text):
+        stripped = " ".join(text.split())
+        if len(stripped) <= 220:
+            return stripped
+        sentences = re.split(r"(?<=[.!?])\s+", stripped, maxsplit=2)
+        summary = " ".join(sentences[:2])
+        if len(summary) > 220:
+            summary = sentences[0]
+        if len(summary) > 220:
+            summary = summary[:217].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+        return summary
+
+    def _speak_async(self, text, task_result, *, full=False, force=False):
         if not text or self.voice_turn is not None:
             return
         self.voice_reply = None
         self.stop_speech_playback()
         self._stop_wake_listener()
-        argv = [str(EXE), "speak"]
-        argv.extend(["--rate", str(self.voice_rate.currentData())])
+        argv = [sys.executable, str(HERE / "speech_playback.py"), str(EXE)]
+        argv.append(f"--rate={self.voice_rate.currentData()}")
         if self.voice_choice.currentData():
             argv.extend(["--voice", self.voice_choice.currentData()])
         if task_result:
@@ -2355,6 +2375,7 @@ class Overlay(QWidget):
             self.bridge.result.emit("Speech unavailable", str(exc))
             return
         self.speaking_proc = proc
+        self._log_activity("Speech playback started")
         self.stop_speech.setEnabled(True)
         self.status.setText("●  SPEAKING")
 
@@ -2381,6 +2402,8 @@ class Overlay(QWidget):
             self.stop_speech.setEnabled(False)
         if error and not stopped_by_user:
             self.bridge.result.emit("Speech playback failed", error)
+        elif not stopped_by_user:
+            self._log_activity("Speech playback finished")
         self._update_status()
 
     def stop_speech_playback(self):
