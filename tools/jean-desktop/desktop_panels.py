@@ -1,11 +1,13 @@
 """Optional audio controls and desktop layout editor."""
 
 import json
+import threading
 
-from PyQt6.QtCore import QSignalBlocker, Qt, QTimer
+from PyQt6.QtCore import QSignalBlocker, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QGridLayout, QLabel,
-    QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QPlainTextEdit, QPushButton, QSlider, QTabWidget, QVBoxLayout, QWidget,
 )
 
 LAYOUT_KEY = "overlay/sections-v1"
@@ -66,6 +68,7 @@ class AudioControls(QWidget):
         self.rows = {}
         self.selectors = {}
         self.device_lists = {}
+        self._refresh_ticks = 0
         self.switch_device = switch_device
         grid = QGridLayout(self)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -117,16 +120,20 @@ class AudioControls(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.refresh()
+        self._refresh_ticks = 0
+        self.refresh(force_devices=True)
         self.poll.start()
 
     def hideEvent(self, event):
         self.poll.stop()
         super().hideEvent(event)
 
-    def refresh(self):
+    def refresh(self, *, force_devices=False):
+        refresh_devices = force_devices or (self._refresh_ticks % 4 == 0)
+        self._refresh_ticks += 1
         for capture, (label, slider, mute) in self.rows.items():
-            self._refresh_selector(capture)
+            if refresh_devices:
+                self._refresh_selector(capture)
             title = "Microphone" if capture else "Speaker"
             try:
                 if self.meter is None:

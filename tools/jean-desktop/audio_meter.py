@@ -74,6 +74,7 @@ class PlaybackMeter:
         self.ole.CoUninitialize.restype = None
         self.enumerator = POINTER()
         self.meters = None
+        self.default_meter = None
         self.complete = False
         self.refresh_at = 0.0
         self.initialized = False
@@ -123,9 +124,26 @@ class PlaybackMeter:
             release(collection)
             for meter in self.meters or ():
                 release(meter)
+            if getattr(self, "default_meter", None):
+                release(self.default_meter)
+                self.default_meter = None
             self.meters = meters if enumerated else None
             self.complete = enumerated and complete
-            if not enumerated:
+            if enumerated:
+                default_device = POINTER()
+                default_meter = POINTER()
+                try:
+                    get_default = method(self.enumerator, 4, HRESULT, ctypes.c_int,
+                                         ctypes.c_int, ctypes.POINTER(POINTER))
+                    if get_default(self.enumerator, 0, 1, ctypes.byref(default_device)) >= 0:
+                        activate = method(default_device, 3, HRESULT, POINTER, ctypes.c_ulong,
+                                          POINTER, ctypes.POINTER(POINTER))
+                        if activate(default_device, ctypes.byref(IID_METER), 1, None,
+                                    ctypes.byref(default_meter)) >= 0:
+                            self.default_meter = default_meter
+                finally:
+                    release(default_device)
+            else:
                 for meter in meters:
                     release(meter)
 
@@ -151,6 +169,27 @@ class PlaybackMeter:
         if not self.complete or read_failed:
             return None
         return 0.0
+
+    def wake_playback_peak(self):
+        """Playback level for Wake gating without deadlocking on unrelated unmeterable outputs.
+
+        Returns the maximum positive level across all meterable outputs. When all
+        meterable outputs read 0.0 but a secondary output device could not expose
+        IAudioMeterInformation, falls back to reading the default render endpoint's
+        own meter so an idle HDMI or virtual endpoint never permanently freezes Wake.
+        """
+        level = self.peak()
+        if level is not None:
+            return level
+        default_meter = getattr(self, "default_meter", None)
+        if not default_meter:
+            return None
+        value = ctypes.c_float()
+        read = method(default_meter, 3, HRESULT, ctypes.POINTER(ctypes.c_float))
+        if read(default_meter, ctypes.byref(value)) < 0:
+            self.refresh_at = 0.0
+            return None
+        return min(1.0, max(0.0, value.value))
 
     def _endpoint_id(self, device):
         value = POINTER()
@@ -314,6 +353,9 @@ class PlaybackMeter:
     def close(self):
         for meter in self.meters or ():
             release(meter)
+        if getattr(self, "default_meter", None):
+            release(self.default_meter)
+            self.default_meter = None
         release(self.enumerator)
         self.meters = None
         self.enumerator = POINTER()

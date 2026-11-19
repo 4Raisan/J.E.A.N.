@@ -856,6 +856,7 @@ class Overlay(QWidget):
         self.approval_listener_failed = None
         self.output_quiet_at = 0.0
         self.output_level = 0.0
+        self._last_wake_peak_at = 0.0
         self.hotkey_window = wintypes.HWND(int(self.winId()))
         self.hotkey_registered = ctypes.windll.user32.RegisterHotKey(
             self.hotkey_window, TALK_HOTKEY_ID, MOD_SHIFT | MOD_NOREPEAT, VK_CAPITAL
@@ -870,7 +871,9 @@ class Overlay(QWidget):
         )
         self.hotkey_timer = QTimer(self)
         self.hotkey_timer.timeout.connect(self._check_hotkey)
-        self.hotkey_timer.start(20)
+        # Only poll GetAsyncKeyState as a fallback when OS RegisterHotKey could not bind.
+        if not self.hotkey_registered:
+            self.hotkey_timer.start(50)
         self.wake_timer = QTimer(self)
         self.wake_timer.timeout.connect(self._sync_wake_listener)
         self.wake_timer.start(250)
@@ -885,18 +888,34 @@ class Overlay(QWidget):
         self.mic_level = max(0.0, min(1.0, float(value)))
 
     def tick(self):
-        blocked = self._playback_blocks_wake()
-        level = self.mic_level if self.listening else (
-            self.output_level if self.speaking_proc is not None else 0.0
-        )
+        speaking = self.speaking_proc is not None
+        wake_on = self.wake_button.isChecked()
+        blocked = False
+        if speaking:
+            blocked = self._playback_blocks_wake()
+        elif wake_on:
+            now = time.monotonic()
+            if now - self._last_wake_peak_at >= 0.2:
+                self._last_wake_peak_at = now
+                blocked = self._playback_blocks_wake()
+            else:
+                blocked = now < self.output_quiet_at
+        else:
+            self.output_level = 0.0
+        level = self.mic_level if self.listening else (self.output_level if speaking else 0.0)
         self.reactor.target = min(1.0, math.sqrt(level) * 1.8)
-        if self.wake_button.isChecked():
+        if wake_on:
             label = "Wake: Playback paused" if blocked else "Wake: On"
             if self.wake_button.text() != label:
                 self.wake_button.setText(label)
 
     def _playback_blocks_wake(self):
-        output = self.playback_meter.peak() if self.playback_meter is not None else None
+        if self.playback_meter is None:
+            output = None
+        elif hasattr(self.playback_meter, "wake_playback_peak"):
+            output = self.playback_meter.wake_playback_peak()
+        else:
+            output = self.playback_meter.peak()
         self.output_level = output or 0.0
         now = time.monotonic()
         if output is None or output > 0.0001:
@@ -1262,7 +1281,7 @@ class Overlay(QWidget):
         self._sync_wake_listener()
 
     def _sync_wake_listener(self):
-        if self._playback_blocks_wake() or not self._can_listen_for_stop():
+        if not self._can_listen_for_stop() or self._playback_blocks_wake():
             self._stop_wake_listener()
             return
         terminate_only = not self._wake_idle()
