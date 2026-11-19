@@ -42,12 +42,12 @@ from desktop_panels import AudioControls, LAYOUT_KEY, LayoutEditor, read_layout
 from audio_meter import PlaybackMeter
 from workspace_trash import WorkspaceTrash
 
-from PyQt6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QObject, QProcess, QProcessEnvironment, QSettings, QUrl,
+from PyQt6.QtCore import (Qt, QTimer, QPoint, QPointF, QRect, QRectF, QObject, QProcess, QProcessEnvironment, QSettings, QUrl,
                           QAbstractNativeEventFilter, pyqtSignal)
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPainterPath, QRadialGradient, QPen, QDesktopServices
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QLineEdit, QFrame,
-                             QGraphicsDropShadowEffect, QComboBox, QFileDialog,
+                             QComboBox, QFileDialog, QSizePolicy,
                              QMessageBox, QDialog, QInputDialog, QMenu, QPlainTextEdit)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -778,6 +778,8 @@ class Overlay(QWidget):
         self.activity = QLabel()
         self.activity.setTextFormat(Qt.TextFormat.PlainText)
         self.activity.setWordWrap(True)
+        self.activity.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.activity.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         self.poll_task = QTimer(self)
         self.poll_task.setInterval(1500)
         self.poll_task.timeout.connect(self._request_task_status)
@@ -836,6 +838,12 @@ class Overlay(QWidget):
             #mini:hover { background: #3a3560; }
             #mini:disabled { color: #6d7390; border-color: rgba(205,200,255,18); }
         """)
+        self.detail.ensurePolished()
+        self.detail.setMaximumHeight(self.detail.fontMetrics().lineSpacing() * 5 + 6)
+        self.talk.ensurePolished()
+        talk_fm = self.talk.fontMetrics()
+        talk_min = max(talk_fm.horizontalAdvance(text) for text in ("● Talk", "Opening mic…", "■ End recording")) + 24
+        self.talk.setMinimumWidth(talk_min)
         self.anim = QTimer(self)
         self.anim.timeout.connect(self.tick)
         self.anim.start(50)
@@ -940,7 +948,6 @@ class Overlay(QWidget):
             self.sections_box.addWidget(widget)
             widget.setVisible(key in self.open_sections)
             if key == "models":
-                self.more_menu.addAction(title, self.show_model_settings)
                 continue
             action = self.more_menu.addAction(title)
             action.setCheckable(True)
@@ -1125,6 +1132,35 @@ class Overlay(QWidget):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.card.isVisible():
+            return
+        card_rect = QRectF(self.card.geometry())
+        shadow_bounds = card_rect.adjusted(-16, -6, 16, 20)
+        if not shadow_bounds.intersects(QRectF(event.rect())):
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        # Paint a soft rounded drop shadow directly on the translucent surface
+        # instead of QGraphicsDropShadowEffect, which causes offscreen pixmap
+        # ghosting/duplication on Windows at fractional DPI during partial repaints.
+        for spread, dy, alpha in (
+            (12.0, 8.0, 10),
+            (9.0, 7.0, 16),
+            (6.0, 6.0, 22),
+            (3.5, 5.0, 28),
+            (1.5, 4.0, 34),
+        ):
+            rect = card_rect.adjusted(-spread, -spread * 0.35 + dy, spread, spread * 0.65 + dy)
+            painter.setBrush(QColor(0, 0, 0, alpha))
+            painter.drawRoundedRect(rect, 22.0 + spread * 0.5, 22.0 + spread * 0.5)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
+
     def toggle_message(self):
         anchor = self._ring_position()
         visible = self.card.isHidden()
@@ -1137,18 +1173,49 @@ class Overlay(QWidget):
     def _ring_position(self):
         return self.reactor.mapToGlobal(self.reactor.rect().center())
 
-    def _resize_around_ring(self, anchor):
+    def _fit_card_height(self):
+        if not self.card.isVisible():
+            return
+        self._resize_around_ring(self._ring_position() if self.isVisible() else None)
+
+    def _resize_around_ring(self, anchor=None):
+        if anchor is None and self.isVisible():
+            anchor = self._ring_position()
         self.sections_box.invalidate()
-        self.card.layout().invalidate()
+        card_layout = self.card.layout()
+        for index in range(card_layout.count()):
+            sub = card_layout.itemAt(index).layout()
+            if sub is not None:
+                sub.invalidate()
+        card_layout.invalidate()
         self.card.updateGeometry()
         self.layout().invalidate()
         self.layout().activate()
-        self.resize(self.sizeHint().expandedTo(self.minimumSizeHint()))
-        self.layout().activate()
-        if self.isVisible():
-            offset = anchor - self._ring_position()
-            if not offset.isNull():
-                self.move(self.pos() + offset)
+        hint = self.sizeHint().expandedTo(self.minimumSizeHint())
+        target_w = hint.width()
+        if self.card.isVisible():
+            margins = self.layout().contentsMargins()
+            card_w = max(self.card.minimumWidth(), target_w - margins.left() - margins.right())
+            target_w = max(target_w, card_w + margins.left() + margins.right())
+        target_h = self.heightForWidth(target_w) if self.hasHeightForWidth() else hint.height()
+        target_h = max(target_h, 1)
+        if self.isVisible() and anchor is not None:
+            ring_center_y = self.reactor.geometry().center().y()
+            new_x = anchor.x() - target_w // 2
+            new_y = anchor.y() - ring_center_y
+            target_rect = QRect(new_x, new_y, target_w, target_h)
+            if self.geometry() != target_rect:
+                self.setGeometry(target_rect)
+                self.layout().activate()
+                offset = anchor - self._ring_position()
+                if not offset.isNull():
+                    self.move(self.pos() + offset)
+                self.update()
+        else:
+            if self.width() != target_w or self.height() != target_h:
+                self.resize(target_w, target_h)
+                self.layout().activate()
+                self.update()
 
     # ---------- voice in ----------
 
@@ -1429,6 +1496,7 @@ class Overlay(QWidget):
         start = turn.released_at or ended_at or time.monotonic()
         self.status.setText("●  TRANSCRIBING")
         self.detail.setText(f"{turn.backend} is decoding the clip…")
+        self._fit_card_height()
 
         def work():
             try:
@@ -1662,6 +1730,7 @@ class Overlay(QWidget):
     def _run_chat(self, text):
         self.status.setText("●  CHATTING")
         self.detail.setText("jean chat is thinking (read-only)…")
+        self._fit_card_height()
 
         cancel = self.foreground_cancel = threading.Event()
 
@@ -2081,6 +2150,7 @@ class Overlay(QWidget):
                     del self.task_output[25]
                 if self.approval is None:
                     self.detail.setText(line[:600])
+                    self._fit_card_height()
 
     def _read_task_error(self):
         data = bytes(self.task_proc.readAllStandardError()).decode("utf-8", errors="replace")
@@ -2248,6 +2318,7 @@ class Overlay(QWidget):
         self.status_pending.discard(task_id)
         if task_id == self.task_id.text().strip() or task_id in self.spoken_status:
             self.activity.setText(status)
+            self._fit_card_height()
         if task_id in self.spoken_status:
             self.spoken_status.discard(task_id)
             self._speak_async(status, True)
@@ -2501,6 +2572,7 @@ class Overlay(QWidget):
     def show_transcript(self, text):
         if text:
             self.detail.setText(text[:600])
+            self._fit_card_height()
 
     def refresh(self):
         def work():
@@ -2567,6 +2639,7 @@ class Overlay(QWidget):
         self.title.setText(title)
         self.detail.setText(detail)
         self.detail.setToolTip(detail if len(detail) > 180 else "")
+        self._fit_card_height()
 
 
 if __name__ == "__main__":
