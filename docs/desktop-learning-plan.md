@@ -1,48 +1,52 @@
-# J.E.A.N. desktop learning
+# J.E.A.N. desktop learning, playbooks, and memory
 
-## Give J.E.A.N. a new task
+## Performing Known Tasks vs. Solving New Tasks
 
-Choose **More → Work in an app…**, enter the title of an open window, and describe
-the outcome. J.E.A.N. uses the main model and the current window's accessibility
-controls to pick the next action. It asks before sharing the control labels and
-task with the configured model. Each action uses native accessibility patterns
-and checks for a change before continuing. The run stops on missing or ambiguous
-controls, an unconfirmed change, or after six actions.
+### Known Tasks (Playbooks & Desktop Workflows)
+J.E.A.N. stores reusable procedures in SQLite (`playbooks` + `playbooks_fts` + `playbook_runs`, schema v6) alongside desktop overlay shortcuts:
 
-In Task mode, a request such as `Open Spotify and play a Michael Jackson song`
-can also launch the named app. Playback depends on the controls and verification
-state that the installed app exposes. For a coding task, select a workspace and
-use `/delegate` followed by the requested change.
+- **Voice & overlay commands**:
+  - `Remember workflow morning as open YouTube; check my mail; what time is it` (automatically mirrored into Rust SQLite playbooks).
+  - `Run workflow morning`, `Show workflow morning`, `Undo workflow morning`, `Forget workflow morning`, `List workflows`.
+  - `Remember workflow clips as search {query} on YouTube`, then `Run workflow clips with query window automation` (or simply `Search window automation on YouTube`).
+  - `List playbooks`, `Show playbook <name>`, `Run playbook <name>`, `Undo playbook <name>`, `Forget playbook <name>`.
+  - `Remember this as quick check` / `Open it again` / `Run that again`.
+- **CLI commands**:
+  - `jean playbook list | show | teach | run | undo | forget | match | history`
+- **Live resolution & verification**:
+  - Replaying a known playbook re-resolves apps, windows, and tools against the current desktop/machine and routes every step through JEAN's policy engine and independent verifier.
+  - Dispatch, `verified_success`, `failed`, `uncertain`, and `cancelled` runs are recorded separately in `playbook_runs`, and modifying a playbook preserves `previous_steps_json` so `undo` restores the prior version.
 
-J.E.A.N. learns reusable actions by storing structured local workflows. A workflow records an action and its arguments. A future workflow can also record how to resolve its target and how to verify the result. External coding agents can build and test this feature with synthetic data.
+### New Tasks (Autonomous Solver + Automatic Skill Capture)
+When a request does not match a known playbook, J.E.A.N.'s **New Task Solver** (`crates/jean-core/src/solver.rs`) inspects local capabilities, registered tools, workspace selection, and recalled memory lessons to pick a grounded execution route:
 
-## Try the first stage
+- **System & tool probes** (CPU/RAM processes, disk space, Git status, Windows version, file search) run directly through verified intents even when no model is configured.
+- **Desktop apps** (`Open Calculator and calculate 7 times 8`, `In Notepad, type hello`, or **More → Work in an app…**): runs a bounded UI Automation loop (up to 10 verified actions: `invoke`, `set_value`, `toggle`, `select`, `expand`, `collapse`, `set_focus`) with explicit per-task observation consent, redacted witness verification, and password readback limited to masked length.
+- **Workspace files** (**More → Work in a workspace…** or workspace file requests): reads, lists, or creates top-level workspace files with mandatory read-back verification and partial-write rollback.
+- **Controlled browser** (`/browse <url>` or webpage inspection): runs in an isolated profile with post-navigation/post-click origin allowlist revalidation.
+- **Coding tasks**: select a workspace and use `/delegate <goal>` or `Start with <worker>. <goal>`.
+- **Self-learning from results**: when a new task completes and passes independent verification, J.E.A.N. records a `task_success` episode and automatically captures a reusable playbook (`source = "learned_from_task"`) so future requests run as a **Known Task**.
 
-- Type `Remember workflow morning as open YouTube; check my mail; what time is it`.
-- Say or type `Run workflow morning`.
-- After a browser, Gmail, or clock action, say `Remember this as quick check`.
-- Say `Open it again` to reopen the most recent app or website in this session.
-- Use `List workflows` or `Forget workflow morning` to manage saved entries. Teaching the same name replaces its steps.
-- Use `Show workflow morning` to inspect the saved steps and `Undo workflow morning` to restore the previous revision.
-- Type `Remember workflow clips as search {query} on YouTube`, then say `Run workflow clips with query window automation`. A workflow can also use `open {url}` and accept `with url https://example.com`. Supply the input before any step runs.
-- Say `Remember that my project uses Rust`, `What do you remember about my project?`, or `List memories` to use the local Rust fact store. Saved facts are retrieved on request.
+### Memory, Self-Updating & Dreaming
+- **Explicit facts**: `Remember that my project uses Rust`, `What do you remember about Rust?`, `List memories`, `Forget memory <id>`.
+- **Self-updating semantic memory**: statements like `My editor is VS Code` followed later by `Actually, my editor is Cursor` (or `Update memory: ...`) automatically supersede the outdated note on the same `topic_key` while preserving audit lineage and rejecting credential-shaped text.
+- **Memory dreaming (consolidation)**:
+  - Say `Dream now` / `Consolidate memories` (or run `jean memory dream`) for offline deterministic consolidation: harvests recent tasks and episodes, extracts recurring failure lessons, decays/archives stale untouched notes, and promotes repeated verified task patterns into playbooks (`source = "dream_promoted"`).
+  - Say `Deep dream` (or run `jean memory dream --deep`) for read-only model-assisted synthesis over redacted episodes and active notes.
+  - The desktop overlay also runs automatic background idle dreaming when idle after accumulating new activity.
 
-Workflows persist across restarts on this Windows profile. Each contains up to five browser, Gmail, or clock actions and can reuse one input type. Up to eight revisions are retained. Saving runs zero actions. Replay stops when a handler reports failure. A browser or app handoff records that Windows accepted the launch request. Independent window readback is a later stage.
+---
 
-## Session 1 — Qoder, baseline and regression tests
+## Evaluation & Stage Plans (Historical & Ongoing)
 
+### Session 1 — Qoder, baseline and regression tests
 > Work on J.E.A.N.'s Windows desktop learning feature. J.E.A.N. is an orchestrator that can call installed apps and delegate implementation to existing coding agents. Read this plan, the overlay, and the Rust memory and desktop entry points. Use disposable profiles and synthetic workflows only. Write regression tests that cover teach-without-execute, same-name replacement, recall after restart, case-insensitive recall, forgetting, malformed saved records, and a failed middle step preventing the remaining steps. Test that ordinary Chat, Wake, clock, Gmail, and browser routes still work. Report commands, exit codes, and actual versus simulated checks. Preserve existing changes.
 
-## Session 2 — Codex, reusable workflows across contexts
+### Session 2 — Typed SQLite Playbooks across contexts (Shipped in Schema v6)
+Implemented in `crates/jean-store/src/cognitive.rs`, `crates/jean-core/src/playbooks.rs`, and `apps/jean-cli/src/playbook.rs`: typed multi-step playbook schema, explicit parameters (`{query}`, `{url}`, etc.), workspace scope, versioned updates with `undo`, per-step live re-resolution and verification, stop-on-failure semantics, and automatic desktop workflow mirroring.
 
-Design a typed workflow schema in the existing Rust controller and a migration for desktop-profile workflows. Support explicit inputs, workspace scope, stable app identities, versioned corrections, and per-step verification. Add a teach-by-demonstration route that saves only the selected observed actions, with a preview. On replay, resolve targets again against the current desktop and verify each step before continuing. Pause on a missing or ambiguous target and preserve progress. Use the decision model to suggest bindings for ambiguous inputs, then validate its suggestions against the current task and available actions.
+### Session 3 — Holdout evaluation
+> In a separate scratch profile, build an evaluation set independently of the implementation fixtures. Cover paraphrases, app aliases, follow-ups, changed input values, a second workspace, stale app identities, focus changes, corrections, cancellation, and restart. Measure retrieval success, verified completion, wrong-target or duplicate actions, p50/p95 latency, and sample counts. Compare exact retrieval first, then any proposed model-assisted approach on identical cases. Record failures with the shortest reproducible scenario.
 
-Acceptance requires teaching in one fixture and replaying in a second fixture with different window handles, screen position, and test input. A renamed or missing target must produce a recoverable stop. A crash between performing and verifying a step must preserve uncertainty without repeating the action.
-
-## Session 3 — Qoder, holdout evaluation
-
-> In a separate scratch profile, build an evaluation set independently of the implementation fixtures. Cover paraphrases, app aliases, follow-ups, changed input values, a second workspace, stale app identities, focus changes, corrections, cancellation, and restart. Measure retrieval success, verified completion, wrong-target or duplicate actions, p50/p95 latency, and sample counts. Compare exact retrieval first, then any proposed model-assisted approach on identical cases. Record failures with the shortest reproducible scenario. Use the requested Qwen model only after verifying its exact name in Qoder's model picker.
-
-## Session 4 — Codex, learning from results
-
-Record dispatch, verified success, failure, and uncertainty separately. A successful run can suggest an updated workflow. Promote the update only after a correction or independent verification and keep the previous version recoverable. Use the evaluation results to decide whether stronger retrieval or model assistance improves real completion.
+### Session 4 — Learning from results & Dream promotion (Shipped in `dream.rs` & `playbooks.rs`)
+`playbook_runs` records dispatch, `verified_success`, `failed`, `uncertain`, and `cancelled` separately. Verified new task completions capture learned playbooks, and `dream::dream()` promotes repeated verified task patterns into playbooks while keeping previous revisions recoverable via `undo`.

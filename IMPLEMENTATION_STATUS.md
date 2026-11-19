@@ -1,6 +1,8 @@
 # J.E.A.N. — Implementation Status
 
-**Current baseline, 2026-11-08:** Start with the [source review and execution plan](PLANNING/09-LUNA-EXECUTION-PLAN.md). Sections below preserve batch evidence. Checkpoint helpers and Phase 6 groundwork now exist in source. Their integration and current-tree validation are pending. The owner's voice comparison supports Wispr input for Milestone 5.5 while native recognition is evaluated separately.
+**Current baseline, 2026-11-19:** Schema v6 (`memory_episodes`, self-updating `memory_notes` with `topic_key` contradiction superseding, `dream_cycles` offline + deep consolidation, and typed versioned `playbooks` / `playbook_runs`), Known Task recall + New Task autonomous solver (`crates/jean-core/src/{dream.rs, playbooks.rs, solver.rs}`), and J.A.R.V.I.S. continuous desktop voice loop + rolling chat context + smart escalation (`tools/jean-desktop/jean-desktop.py`) are implemented and verified. Observed test totals on the current tree: **1,114 Rust workspace tests passed (0 failed)** across all 14 workspace members (including 25 live `native_desktop` UIA fixture tests), **`jean-voice --features sherpa` checks clean (0 errors)**, **9 Python desktop regression tests passed (0 failed, exit 0)**, and live `jean.exe` end-to-end checks passed against a disposable `JEAN_DATA_DIR`.
+
+**Previous baseline, 2026-11-08:** Start with the [source review and execution plan](PLANNING/09-LUNA-EXECUTION-PLAN.md). Sections below preserve batch evidence. Checkpoint helpers and Phase 6 groundwork now exist in source. Their integration and current-tree validation are pending. The owner's voice comparison supports Wispr input for Milestone 5.5 while native recognition is evaluated separately.
 
 > **Two parts.** Sections 0–7 are the Phase-0 batch, kept verbatim: its counts (391 tests,
 > 16,281 lines) describe that batch, not this one, and Phase 0's behavior is unchanged.
