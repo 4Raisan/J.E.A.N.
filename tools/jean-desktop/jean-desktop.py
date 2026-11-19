@@ -31,14 +31,14 @@ import threading
 import time
 import winreg
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
 import voice_bench
 import gemini_listening
 import model_settings
-from desktop_panels import AudioControls, LAYOUT_KEY, LayoutEditor, read_layout
+from desktop_panels import AudioControls, LAYOUT_KEY, LayoutEditor, SettingsDialog, read_layout
 from audio_meter import PlaybackMeter
 from workspace_trash import WorkspaceTrash
 
@@ -79,7 +79,23 @@ REQUEST_PREFIX = re.compile(
 ACTION_REQUEST = re.compile(
     r"(?:open|browse|navigate|go to|visit|search|look up|run|execute|build|test|"
     r"create|make|add|write|edit|fix|update|install|remove|delete|move|copy|launch|start|"
-    r"check|implement|find|delegate|play|watch|put on|clean|empty|restore)\b", re.IGNORECASE
+    r"check|implement|find|delegate|play|watch|put on|clean|empty|restore|"
+    r"switch to|focus|pause|resume|skip|summarize|list|show|recall|forget|undo|dream|consolidate)\b",
+    re.IGNORECASE,
+)
+STANDBY_PHRASES = {
+    "stop jean", "close jean", "stop gene", "close gene",
+    "jean stop", "jean close", "gene stop", "gene close",
+    "stop", "close", "stand by", "standby", "go to sleep", "sleep",
+    "thanks", "thank you", "thanks jean", "thank you jean",
+    "that s all", "thats all", "all good", "goodbye", "bye",
+    "never mind", "nevermind", "dismissed",
+}
+SLST = timezone(timedelta(hours=5, minutes=30))
+EXPLICIT_APPROVAL_OPERATIONS = (
+    "desktop_goal_observation",
+    "workspace_goal_access",
+    "browser_origin_access",
 )
 BROWSER_PHRASE = (
     r"\s+(?:(?:in|on|using|with)\s+)?(?:(?:my|the)\s+)?"
@@ -162,14 +178,8 @@ def clock_request(text):
 
 def clock_answer(scope):
     if scope == "sri-lanka":
-        # The Windows timezone database is available even without Python tzdata.
-        result = subprocess.run([
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            "[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::Now,"
-            "'Sri Lanka Standard Time').ToString('h:mm tt',"
-            "[Globalization.CultureInfo]::InvariantCulture)",
-        ], check=True, capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW)
-        return f"It's {result.stdout.strip()} in Sri Lanka."
+        now_sl = datetime.now(SLST)
+        return f"It's {now_sl.strftime('%I:%M %p').lstrip('0')} in Sri Lanka."
     return f"It's {datetime.now().astimezone().strftime('%I:%M %p').lstrip('0')}."
 
 
@@ -334,6 +344,8 @@ class VoiceTurn:
 
 class Bridge(QObject):
     task_retry = pyqtSignal(str)
+    task_auto_escalate = pyqtSignal(str)
+    dream_done = pyqtSignal(str)
     result = pyqtSignal(str, str)      # title, detail
     transcript = pyqtSignal(str)       # heard / reply / task text
     level = pyqtSignal(float)          # measured mic level 0..1
@@ -547,7 +559,12 @@ class Overlay(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("JEAN")
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Window)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Window
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.resize(370, 330)
         self.bridge = Bridge()
@@ -564,9 +581,12 @@ class Overlay(QWidget):
         self.bridge.latest_task.connect(self._show_latest_task)
         self.bridge.chat_setup.connect(self._on_chat_setup)
         self.bridge.task_retry.connect(self._offer_task_retry)
+        self.bridge.task_auto_escalate.connect(self._auto_escalate_to_task)
+        self.bridge.dream_done.connect(self._on_idle_dream_done)
         self.bridge.gmail_discovered.connect(self._on_gmail_discovered)
 
-        # Voice state
+        # Voice, conversation, and memory/dreaming state
+        self._closing = False
         self.foreground_cancel = None
         self.activity_lines = []
         self.chat_history = []
@@ -578,8 +598,8 @@ class Overlay(QWidget):
         self.wake_error = None
         self.last_local_step = None
         self.last_open_step = None
-        self.mode = "smart"
         data_dir = Path(os.environ.get("JEAN_DATA_DIR") or Path(os.environ["LOCALAPPDATA"]) / "JEAN")
+        self.data_dir = data_dir
         self.trash = WorkspaceTrash(data_dir / "workspace-trash")
         self.voice_settings = QSettings("JEAN", "Desktop")
         saved_mode = self.voice_settings.value("mode", "smart", type=str)
@@ -596,6 +616,7 @@ class Overlay(QWidget):
             )
         self.model_profiles = model_settings.read(self.voice_settings)
         self.model_dialog = None
+        self.settings_dialog = None
         self.backend = self.model_profiles["listening"]["backend"]
         self.listening = False
         self.capture_proc = None
@@ -617,8 +638,8 @@ class Overlay(QWidget):
             self.playback_meter = None
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 0, 16, 14)
-        outer.setSpacing(0)
+        outer.setContentsMargins(20, 4, 20, 18)
+        outer.setSpacing(8)
         orbrow = QHBoxLayout()
         orbrow.addStretch()
         self.reactor = Reactor()
@@ -628,11 +649,7 @@ class Overlay(QWidget):
         outer.addLayout(orbrow)
         self.card = QFrame()
         self.card.setObjectName("card")
-        shadow = QGraphicsDropShadowEffect(self.card)
-        shadow.setBlurRadius(28)
-        shadow.setColor(QColor(0, 0, 0, 95))
-        shadow.setOffset(0, 8)
-        self.card.setGraphicsEffect(shadow)
+        self.card.setMinimumWidth(368)
         box = QVBoxLayout(self.card)
         box.setContentsMargins(19, 16, 19, 16)
         box.setSpacing(8)
@@ -649,11 +666,14 @@ class Overlay(QWidget):
         self.title = QLabel("Here when you need me")
         self.title.setObjectName("title")
         self.title.setWordWrap(True)
+        self.title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         box.addWidget(self.title)
         self.detail = QLabel("Ask a question or tell J.E.A.N. what to do.")
         self.detail.setObjectName("detail")
         self.detail.setWordWrap(True)
-        self.detail.setMaximumHeight(self.detail.fontMetrics().lineSpacing() * 5)
+        self.detail.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         self.detail.setTextFormat(Qt.TextFormat.PlainText)
         box.addWidget(self.detail)
         controls = QHBoxLayout()
@@ -663,7 +683,7 @@ class Overlay(QWidget):
         self.talk.setToolTip("Start or stop microphone capture")
         self.talk.clicked.connect(self.toggle_listen)
         controls.addWidget(self.talk)
-        self.mode_btn = QPushButton("Mode: Smart")
+        self.mode_btn = QPushButton(f"Mode: {self.mode.capitalize()}")
         self.mode_btn.setObjectName("mini")
         self.mode_btn.setToolTip("Switch between Smart, Task, and Chat")
         self.mode_btn.clicked.connect(self.toggle_mode)
@@ -684,10 +704,11 @@ class Overlay(QWidget):
         more.setMenu(self.more_menu)
         controls.addWidget(more)
         box.addLayout(controls)
-        self.wake_button = QPushButton("Wake: On")
+        wake_saved = self.voice_settings.value("wake_enabled", True, type=bool)
+        self.wake_button = QPushButton("Wake: On" if wake_saved else "Wake: Off")
         self.wake_button.setObjectName("mini")
         self.wake_button.setCheckable(True)
-        self.wake_button.setChecked(True)
+        self.wake_button.setChecked(wake_saved)
         self.wake_button.setToolTip(
             "Local microphone detection while idle. Say Jean, Dean, Gene, or G."
         )
@@ -726,6 +747,8 @@ class Overlay(QWidget):
             button.setObjectName("mini")
         row = QHBoxLayout()
         self.entry = QLineEdit()
+        self.entry.setMinimumHeight(38)
+        self.entry.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.entry.setPlaceholderText("Ask J.E.A.N. or give it a task…")
         self.entry.returnPressed.connect(self.submit)
         row.addWidget(self.entry)
@@ -741,6 +764,12 @@ class Overlay(QWidget):
         workspace_row = QHBoxLayout()
         self.workspace = QLineEdit()
         self.workspace.setPlaceholderText("Configured workspace")
+        saved_ws = self.voice_settings.value("workspace", "", type=str)
+        if saved_ws and Path(saved_ws).is_dir():
+            self.workspace.setText(saved_ws)
+        self.workspace.editingFinished.connect(
+            lambda: self.voice_settings.setValue("workspace", self.workspace.text().strip())
+        )
         workspace_row.addWidget(self.workspace)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._choose_workspace)
@@ -749,11 +778,20 @@ class Overlay(QWidget):
         agent_row = QHBoxLayout()
         self.worker = QLineEdit()
         self.worker.setPlaceholderText("Worker (optional)")
+        self.worker.setText(self.voice_settings.value("worker", "", type=str))
+        self.worker.editingFinished.connect(
+            lambda: self.voice_settings.setValue("worker", self.worker.text().strip())
+        )
         agent_row.addWidget(self.worker)
         self.profile = QComboBox()
         self.profile.addItem("Default profile", "")
         self.profile.addItem("Quick prototype", "quick-prototype")
         self.profile.addItem("Polished UI", "polished-ui")
+        saved_profile = self.voice_settings.value("profile", "", type=str)
+        self.profile.setCurrentIndex(max(0, self.profile.findData(saved_profile)))
+        self.profile.currentIndexChanged.connect(
+            lambda: self.voice_settings.setValue("profile", self.profile.currentData())
+        )
         agent_row.addWidget(self.profile)
         options.addLayout(agent_row)
         self.instruction = QLineEdit()
@@ -828,7 +866,7 @@ class Overlay(QWidget):
             #title { font-size: 17px; font-weight: 700; }
             #detail { color: #adb5cd; font-size: 12px; }
             #note { color: #8f9ab5; font-size: 10px; }
-            QLineEdit { color: #f8f7ff; background: rgba(255,255,255,14); border: 1px solid rgba(205,200,255,38); border-radius: 14px; padding: 10px 12px; font-size: 12px; }
+            QLineEdit { color: #f8f7ff; background: rgba(255,255,255,14); border: 1px solid rgba(205,200,255,38); border-radius: 14px; padding: 8px 12px; font-size: 12px; }
             QLineEdit:focus { border: 1px solid #a79aff; }
             #toggle { background: rgba(24,28,44,230); color: #e7e2ff; border: 1px solid rgba(205,200,255,50); border-radius: 15px; padding: 7px 18px; font-size: 11px; }
             #toggle:hover { background: #403b68; }
@@ -881,6 +919,9 @@ class Overlay(QWidget):
         self.trash_timer.timeout.connect(self._expire_trash)
         self.trash_timer.start(60 * 60 * 1000)
         QTimer.singleShot(1000, self._expire_trash)
+        self.dream_timer = QTimer(self)
+        self.dream_timer.timeout.connect(self._maybe_idle_dream)
+        self.dream_timer.start(10 * 60 * 1000)
 
     # ---------- reactor drive ----------
 
@@ -930,12 +971,15 @@ class Overlay(QWidget):
         self.voice_settings.setValue("yolo", enabled)
         self._log_activity(f"YOLO {'enabled' if enabled else 'disabled'}")
         if (enabled and self.approval is not None
-                and self.approval.property("operation") not in ("desktop_goal_observation", "workspace_goal_access")):
+                and self.approval.property("operation") not in EXPLICIT_APPROVAL_OPERATIONS):
             self._answer_approval("task approved", self.approval)
 
-    def toggle_mode(self):
-        anchor = self._ring_position()
-        self.mode = {"smart": "task", "task": "chat", "chat": "smart"}[self.mode]
+    def set_mode(self, mode):
+        if mode not in ("smart", "task", "chat"):
+            return
+        anchor = self._ring_position() if self.isVisible() else None
+        self.mode = mode
+        self.voice_settings.setValue("mode", mode)
         self.mode_btn.setText(f"Mode: {self.mode.capitalize()}")
         self.entry.setPlaceholderText({
             "smart": "Ask J.E.A.N. or give it a task…",
@@ -943,6 +987,126 @@ class Overlay(QWidget):
             "chat": "Ask J.E.A.N. a question…",
         }[self.mode])
         self._resize_around_ring(anchor)
+
+    def toggle_mode(self):
+        self.set_mode({"smart": "task", "task": "chat", "chat": "smart"}[self.mode])
+
+    def set_workspace_path(self, path):
+        self.workspace.setText(path)
+        self.voice_settings.setValue("workspace", path)
+
+    def set_speak_replies(self, enabled):
+        self.speak_replies = bool(enabled)
+        self.voice_settings.setValue("speak_replies", self.speak_replies)
+        if not self.speak_replies:
+            self.stop_speech_playback()
+        if self.settings_dialog is not None:
+            self.settings_dialog.brief_check.setEnabled(self.speak_replies)
+
+    def set_brief_speech(self, enabled):
+        self.brief_speech = bool(enabled)
+        self.voice_settings.setValue("brief_speech", self.brief_speech)
+
+    def set_idle_dream_enabled(self, enabled):
+        self.idle_dream_enabled = bool(enabled)
+        self.voice_settings.setValue("idle_dream", self.idle_dream_enabled)
+
+    def set_always_on_top(self, enabled):
+        self.always_on_top = bool(enabled)
+        self.voice_settings.setValue("always_on_top", self.always_on_top)
+        was_visible = self.isVisible()
+        anchor = self._ring_position() if was_visible else None
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Window
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        if self.always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        if was_visible:
+            self.show()
+            self._resize_around_ring(anchor)
+
+    def center_on_screen(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.center().x() - self.width() // 2, screen.center().y() - self.height() // 2)
+
+    def listening_summary(self):
+        return model_settings.LISTENERS.get(self.backend, self.backend)
+
+    def show_settings(self):
+        if self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(self)
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def open_config_folder(self):
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.data_dir)))
+        except OSError as exc:
+            self.show_result("Config folder unavailable", str(exc))
+
+    def prompt_remember_fact(self):
+        if self.busy or self.voice_turn is not None:
+            return
+        fact, accepted = QInputDialog.getText(
+            self, "Remember a local fact", "What should J.E.A.N. remember? (never enter passwords or keys)"
+        )
+        if accepted and fact.strip():
+            self.busy = True
+            self._handle_memory("remember that " + fact.strip())
+
+    def load_settings_status(self, callback, *, cancel=None):
+        def work():
+            sections = []
+            for label, argv in (
+                ("Model", [str(EXE), "model", "status"]),
+                ("Browser", [str(EXE), "browser", "status"]),
+                ("Desktop UIA", [str(EXE), "desktop", "status"]),
+                ("MCP", [str(EXE), "mcp", "status"]),
+            ):
+                if self._closing or (cancel is not None and cancel.is_set()):
+                    return
+                out, err = self._jean(
+                    argv, timeout=10, cancel=cancel, use_saved_models=(label == "Model")
+                )
+                summary_lines = [
+                    line.strip()
+                    for line in (out or err).splitlines()
+                    if line.strip() and not line.startswith(" ")
+                ][:4]
+                sections.append(f"[{label}]\n" + ("\n".join(summary_lines) or "(unavailable)"))
+            if not self._closing and (cancel is None or not cancel.is_set()):
+                callback("\n\n".join(sections))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def load_settings_memory(self, callback, *, cancel=None):
+        def work():
+            if self._closing or (cancel is not None and cancel.is_set()):
+                return
+            mem_out, mem_err = self._jean(
+                [str(EXE), "memory", "list"], timeout=10, cancel=cancel, use_saved_models=False
+            )
+            if self._closing or (cancel is not None and cancel.is_set()):
+                return
+            pb_out, pb_err = self._jean(
+                [str(EXE), "playbook", "list"], timeout=10, cancel=cancel, use_saved_models=False
+            )
+            if self._closing or (cancel is not None and cancel.is_set()):
+                return
+            text = (
+                "=== Saved Memories ===\n"
+                + ((mem_out or mem_err).strip() or "No saved memories yet.")
+                + "\n\n=== Known Playbooks ===\n"
+                + ((pb_out or pb_err).strip() or "No saved playbooks yet.")
+            )
+            callback(text)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_audio_devices(self, capture):
         try:
@@ -975,6 +1139,11 @@ class Overlay(QWidget):
         self.more_menu.addSeparator()
         self.more_menu.addAction("Work in an app…", self._work_in_app)
         self.more_menu.addAction("Work in a workspace…", self._work_in_workspace)
+        self.more_menu.addAction("Dream && consolidate memory", self._trigger_dream_menu)
+        self.more_menu.addAction("Known playbooks", self._show_playbooks_menu)
+        self.more_menu.addSeparator()
+        self.more_menu.addAction("Settings…", self.show_settings)
+        self.more_menu.addAction("Models…", self.show_model_settings)
         self.more_menu.addAction("Edit layout…", self._edit_layout)
 
     def _work_in_app(self):
@@ -1000,6 +1169,18 @@ class Overlay(QWidget):
             self.entry.clear()
             self.busy = True
             self._run_task("/workspace " + goal.strip())
+
+    def _trigger_dream_menu(self):
+        if self.busy or self.voice_turn is not None:
+            return
+        self.busy = True
+        self._handle_memory("dream now")
+
+    def _show_playbooks_menu(self):
+        if self.busy or self.voice_turn is not None:
+            return
+        self.busy = True
+        self._handle_workflow("list playbooks")
 
     def _toggle_section(self, key, visible):
         anchor = self._ring_position()
@@ -1096,6 +1277,8 @@ class Overlay(QWidget):
         self.model_profiles = profiles
         self.backend = profiles["listening"]["backend"]
         self._update_models_tooltip()
+        if self.settings_dialog is not None:
+            self.settings_dialog.sync_from_overlay()
         for role in profiles:
             dialog.refresh_key(role, reset=True)
             dialog.forget[role].setChecked(False)
@@ -1277,6 +1460,7 @@ class Overlay(QWidget):
     def _set_wake_enabled(self, enabled):
         if not enabled:
             self.voice_session = False
+        self.voice_settings.setValue("wake_enabled", bool(enabled))
         self.wake_button.setText("Wake: On" if enabled else "Wake: Off")
         self._sync_wake_listener()
 
@@ -1548,21 +1732,29 @@ class Overlay(QWidget):
         if turn.asr_fallback:
             self._log_activity("Project 2 model unavailable. Retried this recording with Project 9.")
         if error or not transcript:
+            if turn.conversational and not error and self.voice_misses < 1:
+                self.voice_misses += 1
+                self.show_result("Didn't catch that", "Go ahead — I'm still listening.")
+                self._finish_voice(turn)
+                self._speak_async("Didn't catch that. Go ahead.", False)
+                return
             if turn.conversational:
                 self.voice_session = False
+                self.voice_misses = 0
             self.show_result("Transcription failed", error or "empty transcript")
             self._finish_voice(turn)
-            self._speak_async("I couldn't understand that. Please try again.", False)
+            self._speak_async(
+                "I couldn't understand that. Say Jean when you want to try again."
+                if turn.conversational else "I couldn't understand that. Please try again.",
+                False,
+            )
             return
-        if turn.conversational and voice_bench.normalize_tokens(transcript) in {
-            "stop jean", "close jean", "stop gene", "close gene",
-            "jean stop", "jean close", "gene stop", "gene close",
-            "stop", "close",
-        }:
+        self.voice_misses = 0
+        if turn.conversational and voice_bench.normalize_tokens(transcript) in STANDBY_PHRASES:
             self.voice_session = False
-            self.show_result("Conversation ended", "Say JEAN to start again.")
+            self.show_result("Standing by", "Say JEAN whenever you need me.")
             self._finish_voice(turn)
-            self._speak_async("Okay. Say JEAN when you need me.", False)
+            self._speak_async("Standing by. Say Jean whenever you need me.", False)
             return
         address = WAKE_ADDRESS.match(transcript)
         if address and voice_bench.normalize_tokens(transcript[address.end():]) == "terminate":
@@ -1573,8 +1765,9 @@ class Overlay(QWidget):
             transcript = transcript[address.end():].strip()
             if not transcript:
                 self._finish_voice(turn)
-                if not self._playback_blocks_wake():
-                    self._activate_talk()
+                self.voice_session = True
+                self.show_result("JEAN", "Yes? I'm listening.")
+                self._speak_async("Yes? I'm listening.", False)
                 return
         self.show_result("Heard you", f"{transcript}\n{turn.backend} · {elapsed_ms} ms to text")
         if self._answer_approval(transcript, turn.approval):
@@ -1707,13 +1900,22 @@ class Overlay(QWidget):
         elif mode == "task" and command.lower() == "/browse":
             self._browse(task_id.strip())
         elif mode == "chat":
-            self._run_chat(text)
+            self._run_chat(text, allow_task_escalation=allow_task_escalation)
         else:
             self._run_task(text)
 
+    def _emit_safe(self, signal, *args):
+        if self._closing:
+            return
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            # Widget/Bridge was already destroyed during interpreter or app shutdown.
+            pass
+
     def _finish_busy(self):
         # Safe from a worker thread: the connected GUI slot owns all widgets.
-        self.bridge.work_finished.emit()
+        self._emit_safe(self.bridge.work_finished)
 
     def _finish_busy_ui(self):
         self.foreground_cancel = None
@@ -1746,15 +1948,32 @@ class Overlay(QWidget):
 
     # ---------- chat (read-only) ----------
 
-    def _run_chat(self, text):
+    def _format_chat_context(self):
+        if not self.chat_history:
+            return ""
+        lines = []
+        budget = 3000
+        for speaker, content in self.chat_history[-10:]:
+            entry = f"{speaker}: {content[:500]}"
+            if sum(len(item) + 1 for item in lines) + len(entry) > budget:
+                break
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def _run_chat(self, text, *, allow_task_escalation=True):
         self.status.setText("●  CHATTING")
         self.detail.setText("jean chat is thinking (read-only)…")
         self._fit_card_height()
 
+        context_text = self._format_chat_context()
+        can_escalate = allow_task_escalation and self.mode == "smart"
         cancel = self.foreground_cancel = threading.Event()
 
         def work():
-            reply, error = self._jean([str(EXE), "chat", text], timeout=180, cancel=cancel)
+            argv = [str(EXE), "chat", text]
+            if context_text:
+                argv.extend(["--context", context_text])
+            reply, error = self._jean(argv, timeout=180, cancel=cancel)
             if cancel.is_set():
                 self._finish_busy()
                 return
@@ -1767,15 +1986,31 @@ class Overlay(QWidget):
                 self.bridge.result.emit("Chat failed", error)
                 self.bridge.speak_requested.emit("I couldn't get a response from the main model.", False)
             elif re.search(r'\brun as["”]? (?:a )?task\b', reply, re.IGNORECASE):
+                if can_escalate:
+                    self._finish_busy()
+                    self.bridge.task_auto_escalate.emit(text)
+                    return
                 self.bridge.task_retry.emit(text)
             else:
+                clean_reply = reply.strip() or "(empty reply)"
+                self.chat_history.append(("User", text[:500]))
+                self.chat_history.append(("JEAN", clean_reply[:500]))
+                self.chat_history[:] = self.chat_history[-20:]
+                self.pending_dream_turns += 1
                 self.bridge.chat_setup.emit("")
-                self.bridge.result.emit("JEAN", reply.strip() or "(empty reply)")
-                self.bridge.transcript.emit(f"JEAN: {reply.strip()}")
-                self.bridge.speak_requested.emit(reply.strip(), False)
+                self.bridge.result.emit("JEAN", clean_reply)
+                self.bridge.transcript.emit(f"JEAN: {clean_reply}")
+                self.bridge.speak_requested.emit(clean_reply, False)
             self._finish_busy()
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _auto_escalate_to_task(self, text):
+        if self.busy or self.voice_turn is not None:
+            return
+        self._log_activity(f"Smart mode escalated to task: {text}")
+        self.busy = True
+        self._submit_request("task", text, spoken=self.last_request_spoken, allow_task_escalation=False)
 
     def _offer_task_retry(self, text):
         if not self.entry.text().strip():
@@ -1798,7 +2033,7 @@ class Overlay(QWidget):
     def _choose_workspace(self):
         directory = QFileDialog.getExistingDirectory(self, "Choose task workspace", self.workspace.text())
         if directory:
-            self.workspace.setText(directory)
+            self.set_workspace_path(directory)
 
     def _open_requested_site(self, text, *, spoken=False):
         address = web_request(text)
@@ -1901,7 +2136,36 @@ class Overlay(QWidget):
 
     def _handle_workflow(self, text):
         text = site_request_text(text).rstrip(".").strip()
-        if text.casefold() in {"list workflows", "show my workflows"}:
+        lower = text.casefold()
+        if lower in {"list playbooks", "show playbooks", "show my playbooks", "what tasks do you know"}:
+            self._run_task("/playbook list")
+            return True
+        playbook_cmd = re.fullmatch(
+            r"(?P<verb>run|undo|forget|show)\s+playbook\s+(?P<rest>.+)",
+            text, re.IGNORECASE,
+        )
+        if playbook_cmd:
+            verb = playbook_cmd["verb"].casefold()
+            rest = playbook_cmd["rest"].strip()
+            if verb == "show":
+                def work():
+                    try:
+                        output, error = self._jean(
+                            [str(EXE), "playbook", "show", "--", rest],
+                            timeout=5, use_saved_models=False,
+                        )
+                        if error:
+                            self.bridge.result.emit("Playbook unavailable", error)
+                        else:
+                            self.bridge.result.emit("Saved playbook", output.strip())
+                    finally:
+                        self._finish_busy()
+
+                threading.Thread(target=work, daemon=True).start()
+                return True
+            self._run_task(f"/playbook {verb} {rest}")
+            return True
+        if lower in {"list workflows", "show my workflows"}:
             self.voice_settings.beginGroup("workflows")
             try:
                 names = self.voice_settings.childKeys()
@@ -1973,26 +2237,114 @@ class Overlay(QWidget):
     def _save_workflow(self, key, revisions):
         self.voice_settings.setValue(key, json.dumps({"version": 1, "revisions": revisions}))
         self.voice_settings.sync()
+        name = key.removeprefix("workflows/")
+        latest = revisions[-1] if revisions else []
+        if name and latest:
+            self._mirror_workflow_to_playbook(name, latest)
+
+    def _mirror_workflow_to_playbook(self, name, steps):
+        """Mirror desktop workflows into JEAN's Rust SQLite playbooks table in the background."""
+        pb_steps = []
+        pb_params = []
+        for kind, value in steps:
+            if kind == "clock":
+                pb_steps.append({"kind": "clock", "scope": value})
+            elif kind == "gmail":
+                pb_steps.append({"kind": "gmail"})
+            elif kind == "browser":
+                pb_steps.append({"kind": "open_url", "url": value})
+            elif kind == "input":
+                if value == "query":
+                    pb_steps.append({
+                        "kind": "open_url",
+                        "url": "https://www.youtube.com/results?search_query={query}",
+                    })
+                    pb_params.append({"name": "query", "kind": "text", "required": True})
+                elif value == "url":
+                    pb_steps.append({"kind": "open_url", "url": "{url}"})
+                    pb_params.append({"name": "url", "kind": "url", "required": True})
+        if not pb_steps:
+            return
+        argv = [
+            str(EXE), "playbook", "teach", name,
+            "--description", f"Desktop workflow {name}",
+            "--trigger", f"run workflow {name}",
+            "--trigger", name,
+            "--steps-json", json.dumps(pb_steps),
+            "--params-json", json.dumps(pb_params),
+            "--source", "migrated",
+        ]
+        threading.Thread(
+            target=lambda: self._jean(argv, timeout=5, use_saved_models=False),
+            daemon=True,
+        ).start()
 
     def _handle_memory(self, text):
         text = WAKE_ADDRESS.sub("", text.strip())
-        remember = re.fullmatch(r"remember that\s+(.+)", text, re.IGNORECASE)
-        search = re.fullmatch(r"(?:recall|what do you remember about)\s+(.+?)\??",
-                              text, re.IGNORECASE)
+        stripped = REQUEST_PREFIX.sub("", text).strip()
+        lower = stripped.casefold().rstrip("?.!")
+        remember = re.fullmatch(
+            r"(?:remember that|remember my|save to memory:?)\s+(.+)",
+            stripped, re.IGNORECASE,
+        )
+        observe = re.fullmatch(
+            r"(?:update (?:my )?memory:?|actually,|correction:)\s*(.+)",
+            stripped, re.IGNORECASE,
+        )
+        search = re.fullmatch(
+            r"(?:recall|what do you remember about)\s+(.+?)\??",
+            stripped, re.IGNORECASE,
+        )
+        forget_fact = re.fullmatch(r"forget memory\s+(\S+)", stripped, re.IGNORECASE)
+        forget_note = re.fullmatch(r"forget note\s+(\S+)", stripped, re.IGNORECASE)
+        use_saved_models = False
+        timeout = 10
+
         if remember:
-            args = ["add", "--", remember[1]]
+            value = remember[1].strip()
+            if stripped.casefold().startswith("remember my "):
+                value = "My " + value
+            args = ["add", "--", value]
+            title = "Memory saved"
+        elif observe:
+            args = ["observe", "--", stripped]
+            title = "Memory updated"
         elif search:
-            args = ["search", "--limit", "5", "--", search[1]]
-        elif text.casefold().rstrip("?.") == "list memories":
+            args = ["recall", "--spoken", "--", search[1].strip()]
+            title = "Local memory"
+        elif lower in {"list memories", "show memories", "show my memories", "what do you remember"}:
             args = ["list", "--limit", "10"]
+            title = "Local memory"
+        elif lower in {"list memory notes", "show memory notes", "consolidated memories"}:
+            args = ["notes", "--limit", "15"]
+            title = "Local memory"
+        elif lower in {"dream now", "dream", "consolidate memories", "consolidate your memory", "update your memory"}:
+            args = ["dream"]
+            title = "Dream cycle complete"
+            timeout = 20
+        elif lower in {"deep dream", "deep consolidate", "dream deep"}:
+            args = ["dream", "--deep"]
+            title = "Dream cycle complete"
+            use_saved_models = True
+            timeout = 90
+        elif lower in {"dream log", "memory dream log", "show dream log"}:
+            args = ["dream-log", "--limit", "10"]
+            title = "Dream log"
+        elif forget_fact:
+            args = ["forget", "--", forget_fact[1]]
+            title = "Memory forgotten"
+        elif forget_note:
+            args = ["forget-note", "--", forget_note[1]]
+            title = "Memory forgotten"
         else:
             return False
-        title = "Memory saved" if remember else "Local memory"
 
         def work():
             try:
                 output, error = self._jean(
-                    [str(EXE), "memory", *args], timeout=5, use_saved_models=False
+                    [str(EXE), "memory", *args],
+                    timeout=timeout,
+                    use_saved_models=use_saved_models,
                 )
                 if error:
                     self.bridge.result.emit("Memory request failed", error)
@@ -2003,6 +2355,32 @@ class Overlay(QWidget):
 
         threading.Thread(target=work, daemon=True).start()
         return True
+
+    def _maybe_idle_dream(self):
+        if (not self.idle_dream_enabled or self.dream_running or self.pending_dream_turns < 3
+                or self.busy or self.voice_turn is not None or self.task_proc is not None
+                or self.speaking_proc is not None or self.approval is not None):
+            return
+        self.dream_running = True
+
+        def work():
+            try:
+                output, error = self._jean(
+                    [str(EXE), "memory", "dream"],
+                    timeout=20,
+                    use_saved_models=False,
+                )
+                summary = output.strip().splitlines()[0] if output.strip() else error
+                self.bridge.dream_done.emit(summary or "")
+            finally:
+                self.dream_running = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_idle_dream_done(self, summary):
+        self.pending_dream_turns = 0
+        if summary:
+            self._log_activity(f"Idle dream: {summary}")
 
     def _run_workflow(self, name, steps):
         results = []
@@ -2179,7 +2557,7 @@ class Overlay(QWidget):
         process = self.task_proc
         if process is None or self.cancel_sent:
             return
-        if self.yolo.isChecked() and event["operation"] not in ("desktop_goal_observation", "workspace_goal_access"):
+        if self.yolo.isChecked() and event["operation"] not in EXPLICIT_APPROVAL_OPERATIONS:
             self._log_activity(f'YOLO approved {event["operation"]}: {event["summary"]}')
             self._send_task_input({"kind": "approve", "id": event["id"], "allow": True})
             return
@@ -2363,6 +2741,13 @@ class Overlay(QWidget):
             return
         if self.active_task_id:
             self._request_task_status()
+        self.pending_dream_turns += 1
+        clarify = next((line.removeprefix("clarify: ").strip() for line in self.task_output
+                        if line.startswith("clarify: ")), "")
+        if clarify:
+            self.show_result("Clarification needed", clarify)
+            self._speak_async(clarify, False)
+            return
         if code == 0:
             title = "Task completed"
         elif code == 130:
@@ -2374,7 +2759,7 @@ class Overlay(QWidget):
             output = (output + "\n" + self.task_error.strip()).strip()
         result_lines = [
             line for line in self.task_output
-            if line.startswith(("result:", "result ", "verification:", "verdict ", "outcome ", "reason:"))
+            if line.startswith(("result:", "result ", "verification:", "verdict ", "outcome ", "reason:", "playbook:"))
         ]
         summary = ("\n".join(result_lines[-5:]) or self.task_error.strip()
                    or output[-600:] or f"Exit code {code}")
@@ -2574,11 +2959,16 @@ class Overlay(QWidget):
             self.show_result("Task in progress", "Wait for the task to finish before closing.")
             event.ignore()
             return
+        self._closing = True
+        if self.settings_dialog is not None:
+            self.settings_dialog.close()
         self.stop_speech_playback()
         if self.foreground_cancel is not None:
             self.foreground_cancel.set()
         self.wake_timer.stop()
         self.hotkey_timer.stop()
+        self.trash_timer.stop()
+        self.dream_timer.stop()
         self._stop_wake_listener()
         if self.hotkey_registered:
             QApplication.instance().removeNativeEventFilter(self.hotkey_filter)
@@ -2595,23 +2985,25 @@ class Overlay(QWidget):
 
     def refresh(self):
         def work():
+            if self._closing:
+                return
             output, error = self._jean([str(EXE), "model", "status"], timeout=15)
+            if self._closing:
+                return
             if not error:
                 for line in output.splitlines():
                     parts = line.split(None, 1)
                     if len(parts) == 2 and parts[0] == "provider":
-                        self.bridge.chat_setup.emit(output.strip() if parts[1].strip() == "none" else "")
+                        self._emit_safe(
+                            self.bridge.chat_setup,
+                            output.strip() if parts[1].strip() == "none" else "",
+                        )
                         break
-            try:
-                result = subprocess.run([str(EXE), "status"], cwd=ROOT, capture_output=True,
-                                        text=True, encoding="utf-8", errors="replace", timeout=15,
-                                        creationflags=NO_WINDOW)
-                rows = [line for line in result.stdout.splitlines() if line.startswith("t-")]
-                if result.returncode == 0 and rows:
-                    self.bridge.latest_task.emit(rows[0].split()[0])
-            except (OSError, subprocess.TimeoutExpired):
-                # An unavailable activity history does not prevent a new request.
-                return
+            status_out, status_err = self._jean([str(EXE), "status"], timeout=15, use_saved_models=False)
+            if not self._closing and not status_err:
+                rows = [line for line in status_out.splitlines() if line.startswith("t-")]
+                if rows:
+                    self._emit_safe(self.bridge.latest_task, rows[0].split()[0])
         threading.Thread(target=work, daemon=True).start()
 
     def _show_latest_task(self, task_id):
@@ -2651,6 +3043,8 @@ class Overlay(QWidget):
         return spoken
 
     def show_result(self, title, detail, *, log=True):
+        if title == "Dream cycle complete":
+            self.pending_dream_turns = 0
         if self.voice_reply is not None:
             self.voice_reply[0] = self._spoken_detail(title, detail)
         if log:

@@ -546,6 +546,416 @@ class DesktopRegressionTests(unittest.TestCase):
             self.assertEqual(trash.purge(everything=True), 2)
             self.assertEqual(trash.list(), [])
 
+    def test_17_unmeterable_secondary_output_does_not_deadlock_wake(self):
+        meter = audio_meter.PlaybackMeter.__new__(audio_meter.PlaybackMeter)
+        meter.refresh_at = float("inf")
+        meter.meters = ["m1"]
+        meter.default_meter = "m_default"
+        meter.complete = False  # An unrelated secondary output was unmeterable.
+
+        with mock.patch.object(audio_meter, "method") as method_mock:
+            def fake_zero(_m, out_ptr):
+                ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_float))[0] = 0.0
+                return 0
+
+            method_mock.return_value = fake_zero
+            # Conservative peak() still reports None for unknown secondary device...
+            self.assertIsNone(meter.peak())
+            # ...while wake_playback_peak() checks the default speaker and sees silence (0.0).
+            self.assertEqual(meter.wake_playback_peak(), 0.0)
+
+            def fake_playing(_m, out_ptr):
+                ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_float))[0] = 0.25
+                return 0
+
+            method_mock.return_value = fake_playing
+            self.assertAlmostEqual(meter.wake_playback_peak(), 0.25, places=5)
+
+            meter.default_meter = None
+            method_mock.return_value = fake_zero
+            self.assertIsNone(meter.wake_playback_peak())
+
+    def test_18_nonblocking_clock_chat_context_and_smart_task_escalation(self):
+        # Sri Lanka clock computes in pure Python without spawning PowerShell.
+        with mock.patch.object(JEAN_DESKTOP.subprocess, "run") as run_mock:
+            answer = JEAN_DESKTOP.clock_answer("sri-lanka")
+            self.assertIn("in Sri Lanka.", answer)
+            run_mock.assert_not_called()
+
+        overlay = JEAN_DESKTOP.Overlay()
+        try:
+            # Rolling chat context passed on second turn and cleared by "new conversation".
+            calls = []
+            done = threading.Event()
+
+            def fake_chat_jean(argv, timeout, cancel=None, env=None, use_saved_models=True):
+                calls.append(list(argv))
+                done.set()
+                return "Hello Rashen, standing by.", ""
+
+            with (
+                mock.patch.object(overlay, "_jean", side_effect=fake_chat_jean),
+                mock.patch.object(overlay, "_speak_async"),
+            ):
+                overlay.mode = "chat"
+                overlay.busy = True
+                overlay._run_chat("Hi JEAN")
+                self.assertTrue(done.wait(timeout=3))
+                self.app.processEvents()
+                self.assertEqual(len(overlay.chat_history), 2)
+
+                done.clear()
+                overlay.busy = True
+                overlay._run_chat("What did I just say?")
+                self.assertTrue(done.wait(timeout=3))
+                self.app.processEvents()
+                self.assertIn("--context", calls[1])
+                ctx_val = calls[1][calls[1].index("--context") + 1]
+                self.assertIn("User: Hi JEAN", ctx_val)
+
+                overlay.busy = True
+                overlay._submit_request("chat", "new conversation")
+                self.assertEqual(overlay.chat_history, [])
+
+            # Smart-mode auto-escalation when chat reply indicates "run as a task".
+            escalated = []
+            esc_done = threading.Event()
+
+            def fake_escalate_jean(argv, timeout, cancel=None, env=None, use_saved_models=True):
+                return "I can help with that — please run as a task.", ""
+
+            def on_escalate(task_text):
+                escalated.append(task_text)
+                esc_done.set()
+
+            with (
+                mock.patch.object(overlay, "_jean", side_effect=fake_escalate_jean),
+                mock.patch.object(overlay, "_run_task", side_effect=on_escalate),
+                mock.patch.object(overlay, "_speak_async"),
+            ):
+                overlay.mode = "smart"
+                overlay.busy = True
+                overlay._run_chat("check my memory pressure")
+                deadline = JEAN_DESKTOP.time.monotonic() + 3.0
+                while not esc_done.is_set() and JEAN_DESKTOP.time.monotonic() < deadline:
+                    self.app.processEvents()
+                    JEAN_DESKTOP.time.sleep(0.01)
+                self.assertEqual(escalated, ["check my memory pressure"])
+
+            # Wake and polite prefixes are stripped for task delegation commands.
+            with mock.patch.object(overlay, "_run_task") as run_task_mock:
+                overlay._submit_request("task", "Jean, please start with Codex. Fix the test")
+                run_task_mock.assert_called_once_with("start with Codex. Fix the test")
+        finally:
+            overlay.close()
+
+    def test_19_jarvis_voice_flow_spoken_memory_dreaming_and_playbooks(self):
+        overlay = JEAN_DESKTOP.Overlay()
+        try:
+            # 1) Spoken replies read real memory content cleanly without raw IDs.
+            overlay.voice_reply = ["fallback"]
+            overlay.show_result("Local memory", "f-abc123\tscope=global\tcreated=1 updated=1\tOperator prefers Rust")
+            self.assertEqual(overlay.voice_reply[0], "Operator prefers Rust")
+
+            overlay.voice_reply = ["fallback"]
+            overlay.show_result("Dream cycle complete", "Dream cycle (deterministic): scanned 4 episodes; created 2 notes.")
+            self.assertIn("scanned 4 episodes", overlay.voice_reply[0])
+            overlay.voice_reply = None
+
+            # 2) Memory recall, self-update, offline dream, deep dream, and playbooks routing.
+            calls = []
+            done = threading.Event()
+
+            def fake_jean(argv, timeout, cancel=None, env=None, use_saved_models=True):
+                calls.append((list(argv), use_saved_models))
+                done.set()
+                return "Dream cycle complete.", ""
+
+            with (
+                mock.patch.object(overlay, "_jean", side_effect=fake_jean),
+                mock.patch.object(overlay, "_speak_async"),
+            ):
+                for phrase, expected_sub, expected_models in (
+                    ("Jean, what do you remember about Rust?", "recall", False),
+                    ("Update memory: Actually, my editor is Cursor", "observe", False),
+                    ("Jean, dream now", "dream", False),
+                    ("deep dream", "dream", True),
+                ):
+                    calls.clear()
+                    done.clear()
+                    self.assertTrue(overlay._handle_memory(phrase), f"unhandled: {phrase}")
+                    self.assertTrue(done.wait(timeout=3))
+                    self.app.processEvents()
+                    self.assertIn(expected_sub, calls[0][0])
+                    self.assertEqual(calls[0][1], expected_models)
+
+                # Wait for background work_finished signal to settle before idle dream check.
+                self.app.processEvents()
+                # Idle dreaming triggers off-thread after 3+ turns when idle.
+                calls.clear()
+                done.clear()
+                overlay.busy = False
+                overlay.dream_running = False
+                overlay.pending_dream_turns = 3
+                overlay._maybe_idle_dream()
+                self.assertTrue(done.wait(timeout=3))
+                self.app.processEvents()
+                self.assertIn("dream", calls[0][0])
+                self.assertEqual(overlay.pending_dream_turns, 0)
+
+            with mock.patch.object(overlay, "_run_task") as run_task_mock:
+                self.assertTrue(overlay._handle_workflow("Jean, list playbooks"))
+                run_task_mock.assert_called_once_with("/playbook list")
+                run_task_mock.reset_mock()
+                self.assertTrue(overlay._handle_workflow("run playbook morning-check"))
+                run_task_mock.assert_called_once_with("/playbook run morning-check")
+
+            # 3) JARVIS conversational voice turn: empty miss retries once; standby phrase ends cleanly.
+            with (
+                mock.patch.object(overlay, "_speak_async") as speak_mock,
+            ):
+                t1 = JEAN_DESKTOP.VoiceTurn("smart", "project9-whisper", None, tempfile.TemporaryDirectory(), conversational=True)
+                overlay.voice_turn = t1
+                overlay.voice_session = True
+                overlay._on_decoded(t1, "", "", 100)
+                self.assertTrue(overlay.voice_session, "first empty miss should keep conversation open for one retry")
+                self.assertEqual(overlay.voice_misses, 1)
+
+                t2 = JEAN_DESKTOP.VoiceTurn("smart", "project9-whisper", None, tempfile.TemporaryDirectory(), conversational=True)
+                overlay.voice_turn = t2
+                overlay._on_decoded(t2, "Thank you Jean", "", 100)
+                self.assertFalse(overlay.voice_session, "thank you should gracefully enter standby")
+                self.assertIn("Standing by", speak_mock.call_args[0][0])
+        finally:
+            overlay.close()
+
+    def test_20_overlay_repaint_safety_and_non_clipping_resizes(self):
+        from PyQt6.QtCore import Qt
+
+        overlay = JEAN_DESKTOP.Overlay()
+        try:
+            # No QGraphicsDropShadowEffect offscreen proxy on the translucent window card.
+            self.assertIsNone(overlay.card.graphicsEffect())
+            self.assertTrue(bool(overlay.windowFlags() & Qt.WindowType.NoDropShadowWindowHint))
+            self.assertTrue(bool(overlay.detail.alignment() & Qt.AlignmentFlag.AlignTop))
+
+            overlay.toggle_message()
+            overlay.show()
+            self.app.processEvents()
+            initial_card_w = overlay.card.width()
+
+            # Simulate listening -> speaking with multi-line replies that previously clipped text
+            # and pushed the card upward into the Reactor animation area.
+            overlay.talk.setText("■ End recording")
+            overlay.show_result(
+                "Microphone is listening",
+                "Speak now or say “Stop JEAN” to end the conversation.",
+            )
+            self.app.processEvents()
+            self.assertEqual(overlay.card.width(), initial_card_w)
+
+            overlay.talk.setText("● Talk")
+            overlay.status.setText("●  SPEAKING")
+            for text in (
+                "JEAN. Glad to hear you're happy, sir. I'll keep the systems running smoothly — just give me the word when you need something done.",
+                "Line one verifies a longer five-line spoken reply while JEAN speaks aloud on Windows. "
+                "Line two checks that the card expands smoothly downward without shifting the ring or overlapping the reactor. "
+                "Line three ensures crisp text.",
+            ):
+                overlay.show_result("JEAN", text)
+                self.app.processEvents()
+                reactor_bottom = overlay.reactor.y() + overlay.reactor.height()
+                self.assertGreaterEqual(
+                    overlay.card.y(),
+                    reactor_bottom + 4,
+                    "card must stay cleanly separated below the animating Reactor",
+                )
+                needed_detail_h = min(
+                    overlay.detail.heightForWidth(overlay.detail.width()),
+                    overlay.detail.maximumHeight(),
+                )
+                self.assertGreaterEqual(
+                    overlay.detail.height(),
+                    needed_detail_h,
+                    "multi-line detail text must not be vertically clipped",
+                )
+                self.assertGreaterEqual(
+                    overlay.entry.height(),
+                    38,
+                    "input QLineEdit must not be vertically squished",
+                )
+                self.assertEqual(
+                    overlay.card.width(),
+                    initial_card_w,
+                    "long wrapped replies must not jitter the card width",
+                )
+
+            # Opening and closing a section preserves reactor gap and clean sizing.
+            overlay._toggle_section("activity", True)
+            self.app.processEvents()
+            self.assertGreaterEqual(
+                overlay.card.y(),
+                overlay.reactor.y() + overlay.reactor.height() + 4,
+            )
+            overlay._toggle_section("activity", False)
+            self.app.processEvents()
+            self.assertGreaterEqual(
+                overlay.detail.height(),
+                min(overlay.detail.heightForWidth(overlay.detail.width()), overlay.detail.maximumHeight()),
+            )
+        finally:
+            overlay.close()
+
+    def test_21_browser_origin_approval_and_youtube_bing_routing(self):
+        overlay = JEAN_DESKTOP.Overlay()
+        try:
+            # 1) Unlisted browser origin approval is NEVER auto-approved by YOLO mode.
+            sent_inputs = []
+            overlay.task_proc = object()
+            overlay.cancel_sent = False
+            overlay.yolo.setChecked(True)
+            with mock.patch.object(overlay, "_send_task_input", side_effect=sent_inputs.append):
+                overlay._ask_approval({
+                    "id": 21,
+                    "summary": "allow unlisted browser origin https://www.youtube.com (outside [browser] allowed_origins; redirects to other origins remain blocked)",
+                    "operation": "browser_origin_access",
+                    "tool": "browser.local",
+                    "tier": "normal",
+                    "capabilities": ["network_egress_new_domain", "browser.drive"],
+                    "timeout_ms": 30000,
+                })
+                self.assertEqual(sent_inputs, [], "YOLO must not auto-approve browser_origin_access")
+                self.assertIsNotNone(overlay.approval)
+                self.assertIn("https://www.youtube.com", overlay.approval.text())
+                self.assertIn("AWAITING APPROVAL", overlay.status.text())
+                overlay._answer_approval("task approved", overlay.approval)
+                self.app.processEvents()
+                self.assertEqual(sent_inputs, [{"kind": "approve", "id": 21, "allow": True}])
+            overlay.task_proc = None
+
+            # 2) YouTube playback and Bing search route through _run_task (controlled browser + approval + verification).
+            with (
+                mock.patch.object(overlay, "_run_task") as run_task_mock,
+                mock.patch.object(JEAN_DESKTOP.QDesktopServices, "openUrl") as open_url_mock,
+            ):
+                for phrase in (
+                    "Play Me at the zoo on YouTube",
+                    "Open YouTube and play lofi beats",
+                    "Play https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                    "Search rust programming on Bing",
+                    "Open Bing",
+                ):
+                    run_task_mock.reset_mock()
+                    open_url_mock.reset_mock()
+                    overlay._submit_request("task", phrase)
+                    run_task_mock.assert_called_once_with(phrase)
+                    open_url_mock.assert_not_called()
+
+                run_task_mock.reset_mock()
+                overlay._browse("--verify-video https://www.youtube.com/watch?v=jNQXAC9IVRw")
+                run_task_mock.assert_called_once_with(
+                    "/browse --verify-video https://www.youtube.com/watch?v=jNQXAC9IVRw"
+                )
+        finally:
+            overlay.close()
+
+    def test_22_gui_efficiency_settings_persistence_and_yolo_guard(self):
+        from PyQt6.QtCore import QSettings
+
+        with tempfile.TemporaryDirectory(prefix="jean-gui-settings-") as tmp:
+            ini_path = Path(tmp) / "desktop.ini"
+            def make_settings(*_args, **_kwargs):
+                return QSettings(str(ini_path), QSettings.Format.IniFormat)
+
+            with mock.patch.object(JEAN_DESKTOP, "QSettings", side_effect=make_settings):
+                overlay = JEAN_DESKTOP.Overlay()
+                try:
+                    # 1) Efficiency: when OS RegisterHotKey succeeds, the 50 Hz fallback polling timer stays stopped.
+                    if overlay.hotkey_registered:
+                        self.assertFalse(
+                            overlay.hotkey_timer.isActive(),
+                            "hotkey polling timer should stay off when RegisterHotKey succeeded",
+                        )
+
+                    # 2) Efficiency: when Wake is Off and not speaking, tick() does not poll COM playback meter.
+                    fake_meter = mock.MagicMock()
+                    overlay.playback_meter = fake_meter
+                    overlay.speaking_proc = None
+                    overlay.wake_button.setChecked(False)
+                    overlay.tick()
+                    fake_meter.wake_playback_peak.assert_not_called()
+                    fake_meter.peak.assert_not_called()
+
+                    # 3) Safety: toggling YOLO on while a browser_origin_access dialog is open must NOT auto-approve it.
+                    sent_inputs = []
+                    overlay.task_proc = object()
+                    overlay.cancel_sent = False
+                    overlay.yolo.setChecked(False)
+                    with mock.patch.object(overlay, "_send_task_input", side_effect=sent_inputs.append):
+                        overlay._ask_approval({
+                            "id": 99,
+                            "summary": "allow unlisted browser origin https://www.bing.com",
+                            "operation": "browser_origin_access",
+                            "tool": "browser.local",
+                            "tier": "normal",
+                            "capabilities": ["network_egress_new_domain", "browser.drive"],
+                            "timeout_ms": 30000,
+                        })
+                        overlay.yolo.setChecked(True)
+                        self.app.processEvents()
+                        self.assertEqual(
+                            sent_inputs,
+                            [],
+                            "_set_yolo must never auto-approve an open browser_origin_access dialog",
+                        )
+                        if overlay.approval is not None:
+                            overlay.approval.reject()
+                            self.app.processEvents()
+                    overlay.task_proc = None
+
+                    # 4) Unified SettingsDialog: clean 4 tabs, persists preferences, respects quiet mode & idle dream toggle.
+                    overlay.show_settings()
+                    self.app.processEvents()
+                    dlg = overlay.settings_dialog
+                    self.assertIsNotNone(dlg)
+                    self.assertEqual(dlg.tabs.count(), 4)
+                    self.assertEqual(
+                        [dlg.tabs.tabText(i).replace("&&", "&") for i in range(4)],
+                        ["General", "Voice & Audio", "Safety & Tools", "Memory & Playbooks"],
+                    )
+                    overlay.set_mode("task")
+                    overlay.set_speak_replies(False)
+                    overlay.set_brief_speech(False)
+                    overlay.set_idle_dream_enabled(False)
+                    overlay.set_workspace_path(tmp)
+
+                    # Quiet mode suppresses spoken output unless force=True (speaker test).
+                    with mock.patch.object(JEAN_DESKTOP.subprocess, "Popen") as popen_mock:
+                        overlay._speak_async("Hello silent mode", False)
+                        popen_mock.assert_not_called()
+
+                    # Idle dream disabled suppresses idle dreaming even with 3+ pending turns.
+                    with mock.patch.object(overlay, "_jean") as jean_mock:
+                        overlay.pending_dream_turns = 5
+                        overlay._maybe_idle_dream()
+                        jean_mock.assert_not_called()
+
+                    dlg.close()
+                finally:
+                    overlay.close()
+
+                # 5) Restarting Overlay loads all persisted settings cleanly.
+                overlay2 = JEAN_DESKTOP.Overlay()
+                try:
+                    self.assertEqual(overlay2.mode, "task")
+                    self.assertFalse(overlay2.speak_replies)
+                    self.assertFalse(overlay2.brief_speech)
+                    self.assertFalse(overlay2.idle_dream_enabled)
+                    self.assertFalse(overlay2.wake_button.isChecked())
+                    self.assertEqual(overlay2.workspace.text(), tmp)
+                finally:
+                    overlay2.close()
+
 
 if __name__ == "__main__":
     unittest.main()
