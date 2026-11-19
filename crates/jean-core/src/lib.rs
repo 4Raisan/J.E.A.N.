@@ -65,6 +65,7 @@ pub mod reconcile;
 pub mod resolve;
 pub mod runner;
 pub mod signals;
+pub mod solver;
 pub mod speech;
 pub mod task_worker;
 pub mod verify;
