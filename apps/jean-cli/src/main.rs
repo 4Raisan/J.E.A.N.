@@ -598,7 +598,7 @@ enum BrowserCommand {
     /// The browser is a child J.E.A.N. starts, in its own empty profile, with a debugging endpoint on
     /// loopback that this process created; it is closed on every path out, including a panic.
     Run {
-        /// The page to open. Must be covered by `[browser] allowed_origins`.
+        /// The page to open. Unlisted http/https origins prompt for approval scoped to that origin.
         url: String,
 
         /// Read this element's text before doing anything to the page.
@@ -617,6 +617,19 @@ enum BrowserCommand {
         /// reports `unverifiable`, because nothing was declared that could have failed.
         #[arg(long)]
         expect: Option<String>,
+
+        /// Prove that this selector renders non-empty readable text after the page loads.
+        #[arg(long)]
+        expect_non_empty: Option<String>,
+
+        /// Independently verify that an HTML5 `<video>` element actually plays (selecting a video
+        /// link first on YouTube search/home pages, then checking decoded frames and advancing time).
+        #[arg(long)]
+        verify_video: bool,
+
+        /// Optional query/title hint when selecting a video on a YouTube search or home page.
+        #[arg(long)]
+        video_query: Option<String>,
 
         /// Print the observed report as JSON.
         #[arg(long)]
@@ -1302,6 +1315,9 @@ impl From<Option<BrowserCommand>> for phase3::BrowserAction {
                 r#type,
                 click,
                 expect,
+                expect_non_empty,
+                verify_video,
+                video_query,
                 json,
             }) => phase3::BrowserAction::Run {
                 url,
@@ -1309,6 +1325,9 @@ impl From<Option<BrowserCommand>> for phase3::BrowserAction {
                 r#type,
                 click,
                 expect,
+                expect_non_empty,
+                verify_video,
+                video_query,
                 json,
             },
         }

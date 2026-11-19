@@ -38,7 +38,7 @@
 //! and by the job object around the process.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jean_policy::{
     AuditEvent, AuditWriter, Decision, Operation, OperationKind, Policy, Prompter, Scope,
@@ -82,6 +82,28 @@ pub struct BrowserRequest {
     pub click: Option<String>,
     /// The check: this element must show exactly this text afterwards.
     pub expect: Option<(String, String)>,
+    /// Prove that this selector shows non-empty readable text after the workflow settles.
+    pub expect_non_empty: Option<String>,
+    /// Independently prove that an HTML5 `<video>` element actually plays (selecting an organic
+    /// `/watch?v=` result first on YouTube search/home pages, then checking decoded frames and
+    /// advancing `currentTime`).
+    pub verify_video: bool,
+    /// Optional title/query hint when selecting a video on a YouTube search or home page.
+    pub video_query: Option<String>,
+    /// Allow audible playback (unmuted when headed, autoplay permitted).
+    pub allow_audio: bool,
+}
+
+/// Independent playback proof read back from an HTML5 `<video>` element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaybackEvidence {
+    pub video_title: String,
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub duration_secs: f64,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub ready_state: u32,
 }
 
 /// What one workflow produced, in the order it happened.
@@ -96,8 +118,10 @@ pub struct BrowserReport {
     pub truncated: bool,
     /// What `inspect` showed before the interaction, when one was asked for.
     pub before: Option<String>,
-    /// What `expect`'s selector showed after it.
+    /// What `expect` or `expect_non_empty`'s selector showed after it.
     pub after: Option<String>,
+    /// Verified HTML5 video playback telemetry when `verify_video` succeeded.
+    pub playback: Option<PlaybackEvidence>,
     pub verdict: Verdict,
     pub screenshot: Option<PathBuf>,
     pub state: TaskState,
@@ -217,6 +241,7 @@ pub fn run(
             truncated: false,
             before: None,
             after: None,
+            playback: None,
             verdict: Verdict::Unverifiable(text),
             screenshot: None,
             state: TaskState::Failed,
@@ -278,7 +303,14 @@ fn drive(
         "{}",
     )?;
 
-    let mut browser = match jean_browser::OwnedBrowser::start(config, executable, &profile, &[]) {
+    let allow_audio = request.allow_audio || request.verify_video;
+    let mut browser = match jean_browser::OwnedBrowser::start_with_audio(
+        config,
+        executable,
+        &profile,
+        &[],
+        allow_audio,
+    ) {
         Ok(browser) => browser,
         Err(e) => {
             let reason = e.to_string();
@@ -375,14 +407,16 @@ fn workflow(
     steps: &mut Vec<String>,
     artifact_dir: &Path,
 ) -> Unsettled {
-    let stalled = |steps: &mut Vec<String>, reason: String| Unsettled {
-        url: request.url.clone(),
-        pid: None,
+    let browser_pid = browser.pid();
+    let stalled = |steps: &mut Vec<String>, url: String, reason: String| Unsettled {
+        url,
+        pid: Some(browser_pid),
         title: String::new(),
         excerpt: String::new(),
         truncated: false,
         before: None,
         after: None,
+        playback: None,
         verdict: Verdict::Unverifiable(reason.clone()),
         screenshot: None,
         steps: {
@@ -392,14 +426,31 @@ fn workflow(
     };
 
     if let Err(e) = browser.navigate(config, &request.url) {
-        return stalled(steps, format!("navigation failed: {e}"));
+        return stalled(steps, request.url.clone(), format!("navigation failed: {e}"));
     }
-    note(ctx, task_id, steps, format!("navigated to {}", request.url));
+    let mut active_url = match browser.revalidate_origin(config) {
+        Ok(now) if !now.starts_with("file://") => now,
+        Ok(_) => request.url.clone(),
+        Err(e) => {
+            return stalled(
+                steps,
+                request.url.clone(),
+                format!("post-navigation origin check failed: {e}"),
+            );
+        }
+    };
+    note(ctx, task_id, steps, format!("navigated to {active_url}"));
 
-    let title = browser.title().unwrap_or_default();
-    let (excerpt, truncated) = match browser.content(config.max_page_bytes) {
+    let mut title = browser.title().unwrap_or_default();
+    let (mut excerpt, mut truncated) = match browser.content(config.max_page_bytes) {
         Ok(pair) => pair,
-        Err(e) => return stalled(steps, format!("the page could not be read: {e}")),
+        Err(e) => {
+            return stalled(
+                steps,
+                active_url,
+                format!("the page could not be read: {e}"),
+            );
+        }
     };
     note(
         ctx,
@@ -419,20 +470,28 @@ fn workflow(
                 );
                 Some(text)
             }
-            Err(e) => return stalled(steps, format!("the inspection failed: {e}")),
+            Err(e) => return stalled(steps, active_url, format!("the inspection failed: {e}")),
         },
         None => None,
     };
 
     if let Some((selector, text)) = &request.r#type {
         if let Err(e) = browser.fill(selector, text) {
-            return stalled(steps, format!("typing into {selector} failed: {e}"));
+            return stalled(
+                steps,
+                active_url,
+                format!("typing into {selector} failed: {e}"),
+            );
         }
         note(ctx, task_id, steps, format!("typed into {selector}"));
     }
     if let Some(selector) = &request.click {
         if let Err(e) = browser.click(selector) {
-            return stalled(steps, format!("the click on {selector} failed: {e}"));
+            return stalled(
+                steps,
+                active_url,
+                format!("the click on {selector} failed: {e}"),
+            );
         }
         note(
             ctx,
@@ -443,17 +502,190 @@ fn workflow(
         std::thread::sleep(settle_delay(Duration::from_secs(
             config.action_timeout_secs,
         )));
-        if let Err(e) = browser.revalidate_origin(config) {
-            return stalled(steps, format!("navigation after click failed origin check: {e}"));
+        match browser.revalidate_origin(config) {
+            Ok(now) if !now.starts_with("file://") => active_url = now,
+            Ok(_) => {}
+            Err(e) => {
+                return stalled(
+                    steps,
+                    active_url,
+                    format!("navigation after click failed origin check: {e}"),
+                );
+            }
         }
     }
 
-    if let Err(e) = browser.revalidate_origin(config) {
-        return stalled(steps, format!("page origin check failed: {e}"));
+    match browser.revalidate_origin(config) {
+        Ok(now) if !now.starts_with("file://") => active_url = now,
+        Ok(_) => {}
+        Err(e) => return stalled(steps, active_url, format!("page origin check failed: {e}")),
     }
 
+    let (verdict, after, playback, shot) = if request.verify_video {
+        if jean_browser::is_youtube_url(&active_url) && !active_url.contains("/watch?") {
+            let select_timeout = Duration::from_secs(config.action_timeout_secs.max(25));
+            match browser.select_youtube_video(config, request.video_query.as_deref(), select_timeout)
+            {
+                Ok(Some((watch_url, chosen_title))) => {
+                    active_url = watch_url;
+                    note(
+                        ctx,
+                        task_id,
+                        steps,
+                        format!("selected YouTube video {:?} -> {}", chosen_title, active_url),
+                    );
+                    if let Ok(fresh_title) = browser.title() {
+                        if !fresh_title.is_empty() {
+                            title = fresh_title;
+                        }
+                    }
+                    if let Ok(pair) = browser.content(config.max_page_bytes) {
+                        excerpt = pair.0;
+                        truncated = pair.1;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return stalled(
+                        steps,
+                        active_url,
+                        format!("selecting a YouTube video failed: {e}"),
+                    );
+                }
+            }
+        }
+        let (verdict, playback) = match verify_video_playback(
+            ctx,
+            config,
+            task_id,
+            &active_url,
+            browser,
+            steps,
+        ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return stalled(
+                        steps,
+                        active_url,
+                        format!("video playback verification failed: {e}"),
+                    );
+                }
+            };
+        match browser.revalidate_origin(config) {
+            Ok(now) if !now.starts_with("file://") => active_url = now,
+            Ok(_) => {}
+            Err(e) => {
+                return stalled(
+                    steps,
+                    active_url,
+                    format!("post-playback origin check failed: {e}"),
+                );
+            }
+        }
+        if let Some(ev) = &playback {
+            if !ev.video_title.is_empty() {
+                title = ev.video_title.clone();
+            }
+        } else if let Ok(fresh_title) = browser.title() {
+            if !fresh_title.is_empty() {
+                title = fresh_title;
+            }
+        }
+        let shot = capture_screenshot(ctx, task_id, browser, steps, artifact_dir);
+        let after = playback.as_ref().map(|ev| {
+            format!(
+                "playing {:.2}s->{:.2}s ({}x{}, readyState={})",
+                ev.start_secs, ev.end_secs, ev.video_width, ev.video_height, ev.ready_state
+            )
+        });
+        (verdict, after, playback, shot)
+    } else {
+        let shot = capture_screenshot(ctx, task_id, browser, steps, artifact_dir);
+        // The check runs against a fresh read, after the interaction. Nothing the click reported is
+        // used: a dispatched event says the browser heard, not that the page changed.
+        let (verdict, after) = match (&request.expect, &request.expect_non_empty) {
+            (Some((selector, expected)), _) => match browser.text_of(selector) {
+                Ok(text) => {
+                    let shown = text.trim().to_owned();
+                    let verdict = if shown == expected.trim() {
+                        Verdict::Proven(format!("{selector} shows {shown:?} after the interaction"))
+                    } else {
+                        Verdict::NotProven(format!(
+                            "{selector} shows {shown:?}, not the {expected:?} the check asked for"
+                        ))
+                    };
+                    (verdict, Some(shown))
+                }
+                Err(e) => (
+                    Verdict::Unverifiable(format!("{selector} could not be read afterwards: {e}")),
+                    None,
+                ),
+            },
+            (None, Some(selector)) => match browser.text_of(selector) {
+                Ok(text) => {
+                    let shown = text.trim().to_owned();
+                    let snippet: String = shown.chars().take(400).collect();
+                    let verdict = if !shown.is_empty() {
+                        Verdict::Proven(format!(
+                            "{selector} shows non-empty content ({} chars)",
+                            shown.chars().count()
+                        ))
+                    } else {
+                        Verdict::NotProven(format!("{selector} rendered empty"))
+                    };
+                    (verdict, Some(snippet))
+                }
+                Err(e) => (
+                    Verdict::Unverifiable(format!("{selector} could not be read afterwards: {e}")),
+                    None,
+                ),
+            },
+            (None, None) => (
+                Verdict::Unverifiable(
+                    "no expectation was given, so the page was read and nothing was proven"
+                        .to_owned(),
+                ),
+                None,
+            ),
+        };
+        (verdict, after, None, shot)
+    };
+
+    ctx.store
+        .append_event(
+            task_id,
+            &Event::new(
+                EventKind::VerificationRecorded,
+                format!("{}: {}", verdict.label(), verdict.detail()),
+            ),
+        )
+        .ok();
+    steps.push(format!("verification: {}", verdict.detail()));
+
+    Unsettled {
+        url: active_url,
+        pid: Some(browser.pid()),
+        title,
+        excerpt,
+        truncated,
+        before,
+        after,
+        playback,
+        verdict,
+        screenshot: shot,
+        steps: std::mem::take(steps),
+    }
+}
+
+fn capture_screenshot(
+    ctx: &mut Context,
+    task_id: &str,
+    browser: &mut jean_browser::OwnedBrowser,
+    steps: &mut Vec<String>,
+    artifact_dir: &Path,
+) -> Option<PathBuf> {
     let screenshot = artifact_dir.join("page.png");
-    let shot = match browser.screenshot(&screenshot) {
+    match browser.screenshot(&screenshot) {
         Ok(bytes) => {
             note(
                 ctx,
@@ -467,58 +699,109 @@ fn workflow(
             steps.push(format!("the screenshot could not be taken: {e}"));
             None
         }
-    };
-
-    // The check runs against a fresh read, after the interaction. Nothing the click reported is used:
-    // a dispatched event says the browser heard, not that the page changed.
-    let (verdict, after) = match &request.expect {
-        Some((selector, expected)) => match browser.text_of(selector) {
-            Ok(text) => {
-                let shown = text.trim().to_owned();
-                let verdict = if shown == expected.trim() {
-                    Verdict::Proven(format!("{selector} shows {shown:?} after the interaction"))
-                } else {
-                    Verdict::NotProven(format!(
-                        "{selector} shows {shown:?}, not the {expected:?} the check asked for"
-                    ))
-                };
-                (verdict, Some(shown))
-            }
-            Err(e) => (
-                Verdict::Unverifiable(format!("{selector} could not be read afterwards: {e}")),
-                None,
-            ),
-        },
-        None => (
-            Verdict::Unverifiable(
-                "no expectation was given, so the page was read and nothing was proven".to_owned(),
-            ),
-            None,
-        ),
-    };
-    ctx.store
-        .append_event(
-            task_id,
-            &Event::new(
-                EventKind::VerificationRecorded,
-                format!("{}: {}", verdict.label(), verdict.detail()),
-            ),
-        )
-        .ok();
-    steps.push(format!("verification: {}", verdict.detail()));
-
-    Unsettled {
-        url: request.url.clone(),
-        pid: Some(browser.pid()),
-        title,
-        excerpt,
-        truncated,
-        before,
-        after,
-        verdict,
-        screenshot: shot,
-        steps: std::mem::take(steps),
     }
+}
+
+/// Independently verify that an HTML5 `<video>` element has decoded frames, is not paused/ended/ad,
+/// and genuinely advances its `currentTime` by at least 0.25 seconds over a 1.5 second window.
+fn verify_video_playback(
+    ctx: &mut Context,
+    config: &BrowserConfig,
+    task_id: &str,
+    active_url: &str,
+    browser: &mut jean_browser::OwnedBrowser,
+    steps: &mut Vec<String>,
+) -> std::result::Result<(Verdict, Option<PlaybackEvidence>), jean_browser::BrowserError> {
+    let budget = if jean_browser::is_youtube_url(active_url) {
+        Duration::from_secs(config.action_timeout_secs.max(35))
+    } else {
+        Duration::from_secs(config.action_timeout_secs.max(4))
+    };
+    let deadline = Instant::now() + budget;
+    let mut last_state: Option<jean_browser::MediaPlaybackState> = None;
+    let mut start_attempts: u32 = 0;
+
+    while Instant::now() < deadline {
+        browser.revalidate_origin(config)?;
+        let state = browser.probe_media_playback()?;
+        last_state = Some(state.clone());
+
+        if state.ad_showing {
+            let _ = browser.try_start_video_playback();
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        if state.has_video
+            && !state.paused
+            && !state.ended
+            && state.ready_state >= 2
+            && state.video_width > 0
+            && state.video_height > 0
+        {
+            let t0 = state.current_time;
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(500));
+                browser.revalidate_origin(config)?;
+            }
+            let after = browser.probe_media_playback()?;
+            last_state = Some(after.clone());
+
+            if after.has_video
+                && !after.paused
+                && !after.ended
+                && !after.ad_showing
+                && after.ready_state >= 2
+                && after.video_width > 0
+                && after.video_height > 0
+                && after.current_time >= t0 + 0.25
+            {
+                let evidence = PlaybackEvidence {
+                    video_title: after.title.clone(),
+                    start_secs: t0,
+                    end_secs: after.current_time,
+                    duration_secs: after.duration,
+                    video_width: after.video_width,
+                    video_height: after.video_height,
+                    ready_state: after.ready_state,
+                };
+                let summary = format!(
+                    "video {:?} is playing ({:.2}s -> {:.2}s, {}x{}, readyState={})",
+                    evidence.video_title,
+                    evidence.start_secs,
+                    evidence.end_secs,
+                    evidence.video_width,
+                    evidence.video_height,
+                    evidence.ready_state
+                );
+                note(ctx, task_id, steps, summary.clone());
+                return Ok((Verdict::Proven(summary), Some(evidence)));
+            }
+        } else if state.has_video && state.paused && !state.ended && start_attempts < 6 {
+            start_attempts += 1;
+            let _ = browser.try_start_video_playback();
+        }
+
+        std::thread::sleep(Duration::from_millis(450));
+    }
+
+    let detail = match last_state {
+        Some(s) => format!(
+            "video did not play within {}s (has_video={}, paused={}, ended={}, ready_state={}, \
+             current_time={:.2}s, video_size={}x{}, ad_showing={})",
+            budget.as_secs(),
+            s.has_video,
+            s.paused,
+            s.ended,
+            s.ready_state,
+            s.current_time,
+            s.video_width,
+            s.video_height,
+            s.ad_showing
+        ),
+        None => format!("no video telemetry could be read within {}s", budget.as_secs()),
+    };
+    Ok((Verdict::NotProven(detail), None))
 }
 
 /// What the workflow observed, before the run row and the task row are closed out.
@@ -530,6 +813,7 @@ struct Unsettled {
     truncated: bool,
     before: Option<String>,
     after: Option<String>,
+    playback: Option<PlaybackEvidence>,
     verdict: Verdict,
     screenshot: Option<PathBuf>,
     steps: Vec<String>,
@@ -546,6 +830,7 @@ impl Unsettled {
             truncated: self.truncated,
             before: self.before,
             after: self.after,
+            playback: self.playback,
             verdict: self.verdict,
             screenshot: self.screenshot,
             state: TaskState::Running,
@@ -670,6 +955,12 @@ fn browser_operation(ctx: &Context, executable: &Path, request: &BrowserRequest)
     if let Some((selector, expected)) = &request.expect {
         arguments.push(format!("expect:{selector}={expected}"));
     }
+    if let Some(selector) = &request.expect_non_empty {
+        arguments.push(format!("expect_non_empty:{selector}"));
+    }
+    if request.verify_video {
+        arguments.push("verify_video".to_owned());
+    }
     Operation {
         kind: OperationKind::DriveBrowser,
         tool_id: Some("browser.local".to_owned()),
@@ -694,6 +985,9 @@ fn open_task(ctx: &mut Context, operation: &Operation, request: &BrowserRequest)
         "inspect": request.inspect,
         "click": request.click,
         "expect": request.expect,
+        "expect_non_empty": request.expect_non_empty,
+        "verify_video": request.verify_video,
+        "video_query": request.video_query,
         "capability": BROWSER_CAPABILITY,
         "tier": operation.tier.as_str(),
     }))

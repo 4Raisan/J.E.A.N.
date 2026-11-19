@@ -71,7 +71,6 @@ const SAFETY_ARGS: &[&str] = &[
     "--metrics-recording-only",
     "--no-first-run",
     "--no-default-browser-check",
-    "--mute-audio",
     "--hide-scrollbars",
     "--password-store=basic",
     "--use-mock-keychain",
@@ -208,6 +207,33 @@ impl Origin {
     }
 }
 
+/// Live playback telemetry read from an HTML5 `<video>` element in the active tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaPlaybackState {
+    pub has_video: bool,
+    pub paused: bool,
+    pub ended: bool,
+    pub ready_state: u32,
+    pub current_time: f64,
+    pub duration: f64,
+    pub muted: bool,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub title: String,
+    pub ad_showing: bool,
+}
+
+/// Whether `url` points to a YouTube host over HTTP(S).
+pub fn is_youtube_url(url: &str) -> bool {
+    Origin::of(url).is_some_and(|origin| {
+        origin.is_http_or_https()
+            && matches!(
+                origin.host.as_str(),
+                "www.youtube.com" | "youtube.com" | "m.youtube.com"
+            )
+    })
+}
+
 /// The debugging endpoint, once it has been read and checked.
 fn endpoint_is_loopback(url: &str) -> bool {
     let Some(origin) = Origin::of(url) else {
@@ -244,6 +270,18 @@ impl OwnedBrowser {
         profile: &Path,
         extra_args: &[String],
     ) -> Result<Self> {
+        Self::start_with_audio(config, executable, profile, extra_args, false)
+    }
+
+    /// Start the browser with explicit control over whether audio playback and autoplay are
+    /// enabled (headless runs remain muted).
+    pub fn start_with_audio(
+        config: &BrowserConfig,
+        executable: &Path,
+        profile: &Path,
+        extra_args: &[String],
+        allow_audio: bool,
+    ) -> Result<Self> {
         if !executable.is_file() {
             return Err(BrowserError::MissingExecutable(executable.to_path_buf()));
         }
@@ -263,6 +301,12 @@ impl OwnedBrowser {
         ];
         if config.headless {
             args.push("--headless=new".to_owned());
+        }
+        if config.headless || !allow_audio {
+            args.push("--mute-audio".to_owned());
+        }
+        if allow_audio {
+            args.push("--autoplay-policy=no-user-gesture-required".to_owned());
         }
         args.extend(SAFETY_ARGS.iter().map(|a| (*a).to_owned()));
         args.extend(extra_args.iter().cloned());
@@ -421,6 +465,229 @@ impl OwnedBrowser {
         }
         self.revalidate_origin(config)?;
         Ok(())
+    }
+
+    /// Evaluate a read-only JS expression in the active tab and return its JSON value.
+    pub fn eval_json(&mut self, expression: &str) -> Result<serde_json::Value> {
+        // `headless_chrome::Tab::evaluate` does not set `returnByValue: true`, so JS objects come
+        // back as `object_id` with `value: None`. Serializing to JSON inside the page guarantees a
+        // primitive string result that always round-trips through `remote.value`.
+        let wrapped = format!(
+            "(() => {{ const __v = ({expression}); return __v === undefined ? 'null' : JSON.stringify(__v); }})()"
+        );
+        let remote = self
+            .tab()?
+            .evaluate(&wrapped, false)
+            .map_err(|e| BrowserError::Action {
+                reason: format!("page evaluation failed: {e}"),
+            })?;
+        let Some(raw) = remote.value.and_then(|v| v.as_str().map(str::to_owned)) else {
+            return Ok(serde_json::Value::Null);
+        };
+        serde_json::from_str(&raw).map_err(|e| BrowserError::Action {
+            reason: format!("page evaluation returned invalid JSON: {e}"),
+        })
+    }
+
+    /// Click an element with a real pointer event, waiting up to `timeout` for it to appear.
+    pub fn click_with_timeout(&mut self, selector: &str, timeout: Duration) -> Result<()> {
+        let tab = self.tab()?;
+        let element = tab
+            .wait_for_element_with_custom_timeout(selector, timeout)
+            .map_err(|e| BrowserError::Action {
+                reason: format!("{selector} did not become clickable: {e}"),
+            })?;
+        element.click()?;
+        Ok(())
+    }
+
+    /// Read live HTML5 `<video>` playback state directly from the DOM.
+    pub fn probe_media_playback(&mut self) -> Result<MediaPlaybackState> {
+        const JS: &str = r#"(() => {
+            const videos = Array.from(document.querySelectorAll('video'));
+            const v = videos.find(el => el.readyState > 0 || el.videoWidth > 0 || el.currentSrc || el.src) || videos[0];
+            const ad = Boolean(document.querySelector('.ad-showing, .ytp-ad-player-overlay'));
+            const titleEl = document.querySelector('h1.ytd-watch-metadata yt-formatted-string, ytd-watch-metadata h1, h1.title yt-formatted-string');
+            const title = ((titleEl && titleEl.innerText) ? titleEl.innerText : (document.title || '')).trim();
+            if (!v) {
+                return {
+                    has_video: false, paused: true, ended: false, ready_state: 0,
+                    current_time: 0, duration: 0, muted: false, video_width: 0, video_height: 0,
+                    title, ad_showing: ad
+                };
+            }
+            return {
+                has_video: true,
+                paused: Boolean(v.paused),
+                ended: Boolean(v.ended),
+                ready_state: Number(v.readyState || 0),
+                current_time: Number.isFinite(v.currentTime) ? Number(v.currentTime) : 0,
+                duration: Number.isFinite(v.duration) ? Number(v.duration) : 0,
+                muted: Boolean(v.muted),
+                video_width: Number(v.videoWidth || 0),
+                video_height: Number(v.videoHeight || 0),
+                title,
+                ad_showing: ad
+            };
+        })()"#;
+        let val = self.eval_json(JS)?;
+        Ok(MediaPlaybackState {
+            has_video: val["has_video"].as_bool().unwrap_or(false),
+            paused: val["paused"].as_bool().unwrap_or(true),
+            ended: val["ended"].as_bool().unwrap_or(false),
+            ready_state: val["ready_state"].as_u64().unwrap_or(0) as u32,
+            current_time: val["current_time"].as_f64().unwrap_or(0.0),
+            duration: val["duration"].as_f64().unwrap_or(0.0),
+            muted: val["muted"].as_bool().unwrap_or(false),
+            video_width: val["video_width"].as_u64().unwrap_or(0) as u32,
+            video_height: val["video_height"].as_u64().unwrap_or(0) as u32,
+            title: val["title"].as_str().unwrap_or_default().to_owned(),
+            ad_showing: val["ad_showing"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// When positioned on a YouTube search or homepage, locate the best organic playable video
+    /// link staying on an allowed origin, click it with a real pointer event, and wait for the
+    /// `/watch?v=` route while revalidating the origin.
+    pub fn select_youtube_video(
+        &mut self,
+        config: &BrowserConfig,
+        query: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<(String, String)>> {
+        let current = self.revalidate_origin(config)?;
+        if !is_youtube_url(&current) || current.contains("/watch?") {
+            return Ok(None);
+        }
+        let query_json = serde_json::to_string(query.unwrap_or("")).unwrap_or_else(|_| "\"\"".to_owned());
+        let find_js = format!(
+            r#"(() => {{
+                const q = {query_json}.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+                const selectors = [
+                    'ytd-video-renderer a#video-title[href*="/watch?v="]',
+                    'ytd-rich-item-renderer a#video-title-link[href*="/watch?v="]',
+                    'a#video-title[href*="/watch?v="]',
+                    'a[href*="/watch?v="]'
+                ];
+                let candidates = [];
+                for (const sel of selectors) {{
+                    const found = Array.from(document.querySelectorAll(sel)).filter(a =>
+                        a.href && a.href.includes('/watch?v=') &&
+                        !a.closest('ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-promoted-video-renderer') &&
+                        a.offsetWidth > 0 && a.offsetHeight > 0 &&
+                        ((a.innerText || a.title || a.getAttribute('aria-label') || '').trim().length > 0)
+                    );
+                    if (found.length > 0) {{ candidates = found; break; }}
+                }}
+                if (!candidates.length) return null;
+                let chosen = candidates[0];
+                if (q.length > 0) {{
+                    let bestScore = -1;
+                    for (const a of candidates.slice(0, 8)) {{
+                        const text = ((a.innerText || a.title || a.getAttribute('aria-label') || '')).toLowerCase();
+                        let score = 0;
+                        for (const tok of q) {{ if (text.includes(tok)) score += 1; }}
+                        if (score > bestScore) {{ bestScore = score; chosen = a; }}
+                    }}
+                }}
+                for (const old of document.querySelectorAll('[data-jean-video-target]')) {{
+                    old.removeAttribute('data-jean-video-target');
+                }}
+                chosen.setAttribute('data-jean-video-target', '1');
+                chosen.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+                return {{
+                    href: chosen.href,
+                    title: (chosen.innerText || chosen.title || chosen.getAttribute('aria-label') || '').trim()
+                }};
+            }})()"#
+        );
+
+        let deadline = Instant::now() + timeout;
+        let mut selected: Option<(String, String)> = None;
+        while Instant::now() < deadline {
+            self.revalidate_origin(config)?;
+            if let Ok(val) = self.eval_json(&find_js) {
+                if let Some(href) = val["href"].as_str() {
+                    if !href.is_empty() {
+                        let title = val["title"].as_str().unwrap_or_default().to_owned();
+                        selected = Some((href.to_owned(), title));
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(350));
+        }
+
+        let Some((href, title)) = selected else {
+            return Err(BrowserError::Action {
+                reason: "no playable YouTube video link appeared on the page before timeout"
+                    .to_owned(),
+            });
+        };
+        Self::ensure_origin_allowed(config, &href)?;
+        self.click_with_timeout("a[data-jean-video-target='1']", Duration::from_secs(5))?;
+
+        let nav_deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < nav_deadline {
+            let now_url = self.revalidate_origin(config)?;
+            if now_url.contains("/watch?") {
+                return Ok(Some((now_url, title)));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let final_url = self.revalidate_origin(config)?;
+        Ok(Some((final_url, title)))
+    }
+
+    /// Click YouTube's skip-ad button if visible, or start playback if the video is paused.
+    pub fn try_start_video_playback(&mut self) -> Result<bool> {
+        let skip_visible = self
+            .eval_json(
+                r#"(() => {
+                    const btn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button-modern');
+                    if (!btn) return false;
+                    const style = getComputedStyle(btn);
+                    return btn.offsetWidth > 0 && btn.offsetHeight > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                })()"#,
+            )
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if skip_visible {
+            let _ = self.click_with_timeout(
+                ".ytp-skip-ad-button, .ytp-ad-skip-button-modern",
+                Duration::from_secs(2),
+            );
+            return Ok(true);
+        }
+        let state = self.probe_media_playback()?;
+        if state.has_video && state.paused && !state.ended {
+            let mut acted = false;
+            if self
+                .click_with_timeout(".ytp-play-button", Duration::from_secs(1))
+                .is_ok()
+            {
+                acted = true;
+            } else if self
+                .click_with_timeout("video", Duration::from_secs(1))
+                .is_ok()
+            {
+                acted = true;
+            }
+            // Fallback for plain HTML5 <video> elements where clicking the surface does not toggle play.
+            let _ = self.eval_json(
+                r#"(() => {
+                    const v = document.querySelector('video');
+                    if (v && v.paused && !v.ended && typeof v.play === 'function') {
+                        try { const p = v.play(); if (p && typeof p.catch === 'function') p.catch(() => {}); } catch (_) {}
+                        return true;
+                    }
+                    return false;
+                })()"#,
+            );
+            return Ok(acted || state.has_video);
+        }
+        Ok(false)
     }
 
     /// The document's own title.

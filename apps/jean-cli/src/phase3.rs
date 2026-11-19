@@ -658,6 +658,9 @@ pub enum BrowserAction {
         r#type: Option<String>,
         click: Option<String>,
         expect: Option<String>,
+        expect_non_empty: Option<String>,
+        verify_video: bool,
+        video_query: Option<String>,
         json: bool,
     },
 }
@@ -684,6 +687,9 @@ pub fn cmd_browser(ctx: &mut Context, action: BrowserAction) -> anyhow::Result<E
             r#type,
             click,
             expect,
+            expect_non_empty,
+            verify_video,
+            video_query,
             json,
         } => {
             let request = jean_core::browser::BrowserRequest {
@@ -692,6 +698,10 @@ pub fn cmd_browser(ctx: &mut Context, action: BrowserAction) -> anyhow::Result<E
                 r#type: r#type.as_deref().map(|s| pair(s, "--type")).transpose()?,
                 click,
                 expect: expect.as_deref().map(|s| pair(s, "--expect")).transpose()?,
+                expect_non_empty,
+                verify_video,
+                video_query,
+                allow_audio: verify_video,
             };
             cmd_browser_run(ctx, &request, json)
         }
@@ -775,6 +785,22 @@ fn cmd_browser_run(
         if let Some(after) = &report.after {
             field(&mut out, "after", after)?;
         }
+        if let Some(pb) = &report.playback {
+            field(
+                &mut out,
+                "playback",
+                format!(
+                    "{:?} ({:.2}s -> {:.2}s / {:.1}s, {}x{}, readyState={})",
+                    pb.video_title,
+                    pb.start_secs,
+                    pb.end_secs,
+                    pb.duration_secs,
+                    pb.video_width,
+                    pb.video_height,
+                    pb.ready_state
+                ),
+            )?;
+        }
         field(&mut out, "verdict", report.summary_line())?;
         if report.truncated {
             note(
@@ -810,10 +836,26 @@ fn browser_json(report: &jean_core::browser::BrowserReport) -> String {
         .map(|s| quote(s))
         .collect::<Vec<_>>()
         .join(", ");
+    let playback = match &report.playback {
+        Some(pb) => format!(
+            "{{\"video_title\": {}, \"start_secs\": {:.3}, \"end_secs\": {:.3}, \
+             \"duration_secs\": {:.3}, \"video_width\": {}, \"video_height\": {}, \
+             \"ready_state\": {}}}",
+            quote(&pb.video_title),
+            pb.start_secs,
+            pb.end_secs,
+            pb.duration_secs,
+            pb.video_width,
+            pb.video_height,
+            pb.ready_state
+        ),
+        None => "null".to_owned(),
+    };
     format!(
         "{{\n  \"task_id\": {},\n  \"url\": {},\n  \"pid\": {},\n  \"title\": {},\n  \
-         \"before\": {},\n  \"after\": {},\n  \"verdict\": {},\n  \"detail\": {},\n  \
-         \"state\": {},\n  \"exit_status\": {},\n  \"screenshot\": {},\n  \"steps\": [{}]\n}}",
+         \"before\": {},\n  \"after\": {},\n  \"playback\": {},\n  \"verdict\": {},\n  \
+         \"detail\": {},\n  \"state\": {},\n  \"exit_status\": {},\n  \"screenshot\": {},\n  \
+         \"steps\": [{}]\n}}",
         quote(&report.task_id),
         quote(&report.url),
         report
@@ -823,6 +865,7 @@ fn browser_json(report: &jean_core::browser::BrowserReport) -> String {
         quote(&report.title),
         text(report.before.as_deref()),
         text(report.after.as_deref()),
+        playback,
         quote(report.verdict.label()),
         quote(report.verdict.detail()),
         quote(report.state.as_str()),
